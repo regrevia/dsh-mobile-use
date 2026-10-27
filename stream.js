@@ -250,6 +250,100 @@ export class LiveStream {
     this.bytes = 0
     this.framesSeen = 0
     this.lastAt = 0
+    /** 最新的 JPEG 帧（桥接器解出来的）。 @type {Buffer|null} */
+    this.jpeg = null
+    this.jpegAt = 0
+    this.jpegSeq = 0
+    this.jpegChild = null
+    this.jpegPending = Buffer.alloc(0)
+    this.jpegWaiters = new Set()
+    this.jpegOpenAt = 0
+    /** 最近一次有人要 JPEG 的时间：JPEG 观看者也该把推流钉住，否则每轮轮询都要重开录屏。 */
+    this.jpegWantedAt = 0
+  }
+
+  /** 有人要看 JPEG 帧时才起解码器：不看不花 CPU。 @returns {boolean} 是否可用（解码器起来后 300 ms 内有帧）。 */
+  enableJpeg() {
+    this.jpegWantedAt = Date.now()
+    if (this.jpegChild !== null) return true
+    if (this.stopping) return false
+    if (Date.now() - this.jpegOpenAt < 2000) return false
+    this.jpegOpenAt = Date.now()
+    this.start()
+    const child = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
+      '-flags', 'low_delay',
+      '-f', 'h264', '-i', 'pipe:0',
+      /* 12 fps 够看清手指动作；720 高在侧栏里不糊，编码开销只有几十毫秒。 */
+      '-vf', 'fps=15,scale=-2:720',
+      /* mjpeg 复用器会把 20 KB 级的帧攒在 avio 缓冲里，不加这个要等进程退出才吐一帧。 */
+      '-flush_packets', '1',
+      '-fps_mode', 'passthrough',
+      '-f', 'mjpeg', '-q:v', '7',
+      'pipe:1',
+    ], { stdio: ['pipe', 'pipe', 'pipe'] })
+    this.jpegChild = child
+    child.stdout.on('data', (chunk) => this.feedJpeg(chunk))
+    child.stderr.on('data', (buf) => {
+      const text = String(buf).trim()
+      if (text !== '') this.error = text.slice(-300)
+    })
+    child.on('error', (error) => {
+      if (this.jpegChild === child) this.jpegChild = null
+      this.error = 'JPEG 桥接起不来：' + String(error?.message ?? error)
+    })
+    child.on('exit', (code) => {
+      if (this.jpegChild === child) this.jpegChild = null
+      if (code !== 0 && code !== null && !this.stopping) this.error = 'JPEG 桥接退出码 ' + String(code)
+    })
+    return true
+  }
+
+  /** 按 SOI/EOI 切 MJPEG 字节流。 @param {Buffer} chunk - 解码器输出。 @returns {void} */
+  feedJpeg(chunk) {
+    this.jpegPending = Buffer.concat([this.jpegPending, chunk])
+    if (this.jpegPending.length > 8_000_000) this.jpegPending = this.jpegPending.subarray(-4_000_000)
+    for (;;) {
+      const start = this.jpegPending.indexOf(Buffer.from([0xff, 0xd8]))
+      if (start < 0) {
+        this.jpegPending = Buffer.alloc(0)
+        return
+      }
+      const end = this.jpegPending.indexOf(Buffer.from([0xff, 0xd9]), start + 2)
+      if (end < 0) {
+        if (start > 0) this.jpegPending = this.jpegPending.subarray(start)
+        return
+      }
+      const frame = this.jpegPending.subarray(start, end + 2)
+      this.jpegPending = this.jpegPending.subarray(end + 2)
+      this.jpeg = Buffer.from(frame)
+      this.jpegAt = Date.now()
+      this.jpegSeq += 1
+      for (const waiter of [...this.jpegWaiters]) waiter(this.jpeg)
+      this.jpegWaiters.clear()
+    }
+  }
+
+  /** 有比 since 更新的帧就立刻给，否则等到超时。 @param {number} since - 客户端已有的序号。 @param {number} ms - 最多等多久。 @returns {Promise<Buffer|null>} 帧或 null。 */
+  nextJpeg(since, ms) {
+    if (this.jpeg !== null && this.jpegSeq > since && Date.now() - this.jpegAt < 1200) return Promise.resolve(this.jpeg)
+    return new Promise((resolve) => {
+      let done = false
+      const finish = (value) => {
+        if (done) return
+        done = true
+        this.jpegWaiters.delete(finish)
+        resolve(value)
+      }
+      this.jpegWaiters.add(finish)
+      const timer = setTimeout(() => finish(this.jpeg !== null && Date.now() - this.jpegAt < 2500 ? this.jpeg : null), Math.max(120, ms))
+      timer.unref?.()
+    })
+  }
+
+  /** 桥接帧是不是新鲜的（拿来判断该不该回退到 screencap）。 @returns {boolean} 新鲜为 true。 */
+  jpegFresh() {
+    return this.jpeg !== null && Date.now() - this.jpegAt < 1200
   }
 
   /** 观众都走了：留一段宽限再停，重开侧栏就不用重新起流。 @returns {void} */
@@ -257,7 +351,7 @@ export class LiveStream {
     if (this.idleTimer !== null) return
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null
-      if (this.clients.size === 0 && this.waiting.size === 0) this.stop()
+      if (this.clients.size === 0 && this.waiting.size === 0 && Date.now() - this.jpegWantedAt > IDLE_GRACE_MS) this.stop()
     }, IDLE_GRACE_MS)
     this.idleTimer.unref?.()
   }
@@ -405,6 +499,14 @@ export class LiveStream {
         this.broadcast(packFrame(FRAME_META, Buffer.from(JSON.stringify({ codec: config.codec, width: config.width, height: config.height }))))
       }
     }
+    const jpegChild = this.jpegChild
+    if (jpegChild !== null) {
+      try {
+        jpegChild.stdin.write(chunk)
+      } catch {
+        /* 桥接断了就丢了，主链路重开时会重建 */
+      }
+    }
     this.ensureRemuxer()
     const remuxer = this.remuxer
     if (remuxer === null) return
@@ -454,6 +556,24 @@ export class LiveStream {
     /* code=null 表示被信号杀掉，是我们自己的 kill，不是故障。 */
     if (code !== 0 && code !== null && this.error === '' && !this.stopping && !this.intentional) this.error = `ffmpeg 退出码 ${String(code)}`
     })
+  }
+
+  /** 收掉 JPEG 解码器。 @returns {void} */
+  closeJpeg() {
+    const child = this.jpegChild
+    this.jpegChild = null
+    this.jpeg = null
+    this.jpegAt = 0
+    this.jpegPending = Buffer.alloc(0)
+    for (const waiter of [...this.jpegWaiters]) waiter(null)
+    this.jpegWaiters.clear()
+    if (child === null) return
+    try {
+      child.stdin.end()
+      child.kill('SIGKILL')
+    } catch {
+      /* 已经退了 */
+    }
   }
 
   /** 关掉 ffmpeg，等下一次录屏重开。 @returns {void} */
@@ -606,6 +726,7 @@ export class LiveStream {
       this.restartTimer = null
     }
     this.closeRemuxer()
+    this.closeJpeg()
     const child = this.recorder
     this.recorder = null
     if (child !== null) {
@@ -642,6 +763,10 @@ export class LiveStream {
       lastAt: this.lastAt,
       firstFrameAt: this.firstFrameAt,
       error: this.error,
+      jpegFrames: this.jpegSeq,
+      jpegAt: this.jpegAt,
+      jpegLive: this.jpegChild !== null,
+      jpegBytes: this.jpeg === null ? 0 : this.jpeg.length,
     }
   }
 }

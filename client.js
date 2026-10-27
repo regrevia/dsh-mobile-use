@@ -10,7 +10,7 @@
  */
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。 */
-window.__ADBM_BUILD = '142'
+window.__ADBM_BUILD = '146'
 
 window.__ModuleLoader__.load({
   id: 'dsh-adb',
@@ -38,6 +38,15 @@ window.__ModuleLoader__.load({
         'state.sent': '已发送',
         'state.failed': '发送失败',
         'ph.note': '说一下这是什么',
+        'ph.text': '输入文字',
+        'act.text': '输入',
+        'act.fit': '适应',
+        'key.back': '返回',
+        'key.home': '主屏',
+        'key.enter': '回车',
+        'key.del': '删除',
+        'key.tab': '制表',
+        'state.sending': '发送中',
       },
       en: {
         'type.label': 'Live ADB',
@@ -51,6 +60,15 @@ window.__ModuleLoader__.load({
         'state.sent': 'Sent',
         'state.failed': 'Send failed',
         'ph.note': 'Say what this is',
+        'ph.text': 'Type text',
+        'act.text': 'Type',
+        'act.fit': 'Fit',
+        'key.back': 'Back',
+        'key.home': 'Home',
+        'key.enter': 'Enter',
+        'key.del': 'Del',
+        'key.tab': 'Tab',
+        'state.sending': 'Sending',
       },
     }
     const LANG = /^zh/i.test(typeof navigator === 'undefined' ? '' : navigator.language ?? '') ? 'zh' : 'en'
@@ -65,7 +83,7 @@ window.__ModuleLoader__.load({
         void fetch(`${ROUTE}/diag`, { // ui-copy-ignore
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ pid: PID, ...body }),
+          body: JSON.stringify({ pid: PID, build: String(window.__ADBM_BUILD ?? ''), ...body }),
         })
       } catch {}
     }
@@ -78,7 +96,14 @@ window.__ModuleLoader__.load({
       '.adbm-btn[disabled]{opacity:.45;cursor:default}',
       '.adbm-said{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}',
       '.adbm-stage{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}',
-      '.adbm-frame{position:relative;display:inline-flex;max-width:100%;max-height:100%;line-height:0}',
+      '.adbm-frame{position:relative;display:inline-flex;max-width:100%;max-height:100%;line-height:0;transform-origin:0 0}',
+      '.adbm-keys{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-top:4px}',
+      '.adbm-key{font:inherit;font-size:12px;padding:2px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-subtle);background:transparent;color:inherit;cursor:pointer}',
+      '.adbm-key:disabled{opacity:.4;cursor:default}',
+      '.adbm-text{flex:1 1 120px;min-width:0}',
+      '.adbm-log{flex:none;font-size:12px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.adbm-mark{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:999px;border:2px solid var(--dsw-alias-label-success);pointer-events:none;animation:adbm-ping .9s ease-out forwards}',
+      '@keyframes adbm-ping{from{transform:scale(.5);opacity:1}to{transform:scale(2.4);opacity:0}}',
       '.adbm-img{display:block;max-width:100%;max-height:100%;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
       '.adbm-video{display:block;max-width:100%;max-height:100%;background:#000;border-radius:6px;object-fit:contain}',
       '.adbm-ink{position:absolute;inset:0;touch-action:none}',
@@ -291,15 +316,23 @@ window.__ModuleLoader__.load({
       const [streaming, setStreaming] = React.useState(false)
       /* jpeg = 抓帧长轮询，mse = 持续推流；后者起来后前者自动停。 */
       const [engine, setEngine] = React.useState('jpeg')
+      const [zoom, setZoom] = React.useState(1)
+      const [pan, setPan] = React.useState({ x: 0, y: 0 })
+      const [draft, setDraft] = React.useState('')
+      const [ops, setOps] = React.useState([])
+      const [marks, setMarks] = React.useState([])
+      const seenOps = React.useRef(new Set())
       const imgRef = React.useRef(null) // ui-copy-ignore
       const videoRef = React.useRef(null) // ui-copy-ignore
       const frameRef = React.useRef(null) // ui-copy-ignore
+      const stageRef = React.useRef(null) // ui-copy-ignore
       const canvasRef = React.useRef(null) // ui-copy-ignore
       const strokes = React.useRef([])
       /* 点下去先在本地画一个圈：设备那一帧要 0.7 s 才回来，圈让手感立刻有回应。 */
       const taps = React.useRef([]) // ui-copy-ignore
       const drawing = React.useRef(null) // ui-copy-ignore
       const gesture = React.useRef(null) // ui-copy-ignore
+      const panDrag = React.useRef(null) // ui-copy-ignore
       const wheel = React.useRef({ dy: 0, x: 0, y: 0, timer: 0 }) // ui-copy-ignore
 
       /* 画布按显示尺寸重建，人画的线才和画面同尺度。 */
@@ -370,6 +403,38 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         report({ body: true, sessionId })
       }, [sessionId])
+
+      /* 对话里刚点了哪里：让这一栏和聊天记录对得上，不用回头读文字。 */
+      React.useEffect(() => {
+        if (serial === '') return undefined
+        let live = true
+        const tick = () => {
+          fetch(`${ROUTE}/actions?serial=${encodeURIComponent(serial)}`, { cache: 'no-store' })
+            .then((response) => response.json())
+            .then((body) => {
+              if (!live) return
+              const rows = Array.isArray(body?.actions) ? body.actions : []
+              setOps(rows)
+              /* 对话里刚动的那个点，在画面上画一圈，看一眼就知道 agent 摸哪儿了。 */
+              const fresh = []
+              for (const row of rows) {
+                const text = String(row)
+                if (seenOps.current.has(text)) continue
+                seenOps.current.add(text)
+                const hit = /@(\d+),(\d+)/.exec(text)
+                if (hit !== null) fresh.push({ id: `${text}#${Date.now()}`, x: Number(hit[1]), y: Number(hit[2]) })
+              }
+              if (seenOps.current.size > 200) seenOps.current = new Set(rows.map(String))
+              if (fresh.length === 0) return
+              setMarks((old) => [...old.slice(-3), ...fresh])
+              window.setTimeout(() => setMarks((old) => old.filter((each) => !fresh.some((row) => row.id === each.id))), 1000)
+            })
+            .catch(() => {})
+        }
+        tick()
+        const timer = window.setInterval(tick, 2000)
+        return () => { live = false; window.clearInterval(timer) }
+      }, [serial])
 
       React.useEffect(() => {
         const frame = frameRef.current
@@ -550,11 +615,68 @@ window.__ModuleLoader__.load({
        * @param {{ x: number, y: number }} point - 画布坐标。
        * @returns {{ x: number, y: number }} 设备坐标。
        */
+      /* 画面元素：MSE 用 video，抓帧用 img；谁可见用谁。 */
+      const pictureEl = () => (engine === 'mse' ? videoRef.current : imgRef.current)
+
+      /* 真正画出画面的矩形。缩放/平移都作用在 .adbm-frame 上，这里拿到的就是变换后的框；
+         留边（object-fit:contain / max-width:100%）也算进去了，所以不再假设「铺满画布」。 */
+      const pictureRect = () => {
+        const media = pictureEl()
+        const box = media === null ? null : media.getBoundingClientRect()
+        if (box !== null && box.width > 1 && box.height > 1) return box
+        return canvasRef.current.getBoundingClientRect()
+      }
+
+      /* 设备是竖是横：wm size 报物理方向，画面可能是另一个方向，横竖不一致就是转过 90°。 */
+      const turned = () => screen.w > 0 && screen.h > 0 && frameSize.w > 0 && frameSize.h > 0
+        && (screen.w > screen.h) !== (frameSize.w > frameSize.h)
+
+      /**
+       * 画布坐标换成设备坐标。
+       * @param {{ x: number, y: number }} point - 画布坐标。
+       * @returns {{ x: number, y: number }} 设备坐标。
+       */
       const devicePoint = (point) => {
-        const box = canvasRef.current.getBoundingClientRect()
-        if (box.width < 1 || screen.w < 1) return { x: 0, y: 0 }
-        const scale = deviceWidth() / box.width
-        return { x: Math.round(point.x * scale), y: Math.round(point.y * scale) }
+        if (screen.w < 1 || screen.h < 1) return { x: 0, y: 0 }
+        const rect = pictureRect()
+        if (rect.width < 1 || rect.height < 1) return { x: 0, y: 0 }
+        const u = Math.min(1, Math.max(0, (point.x - rect.left) / rect.width))
+        const v = Math.min(1, Math.max(0, (point.y - rect.top) / rect.height))
+        const x = turned() ? Math.round(v * screen.w) : Math.round(u * screen.w)
+        const y = turned() ? Math.round(u * screen.h) : Math.round(v * screen.h)
+        return { x, y }
+      }
+
+      /* 平移边界：放大后画面不许整块跑出舞台，否则一块空白还照样能点。 */
+      const clampPan = (next, z) => {
+        const stage = stageRef.current
+        const canvas = canvasRef.current
+        if (stage === null || canvas === null) return next
+        const box = canvas.getBoundingClientRect()
+        const base = stage.getBoundingClientRect()
+        const w = (box.width / (z === 0 ? 1 : z)) * z
+        const h = (box.height / (z === 0 ? 1 : z)) * z
+        const minX = Math.min(0, base.width - w)
+        const minY = Math.min(0, base.height - h)
+        return { x: Math.min(0, Math.max(minX, next.x)), y: Math.min(0, Math.max(minY, next.y)) }
+      }
+
+      /* 缩放锚在指针上：放大了点键盘上的小键才点得准。 */
+      const zoomTo = (next, anchor) => {
+        const clamped = Math.min(4, Math.max(1, next))
+        if (clamped === zoom) return
+        if (clamped === 1) {
+          setZoom(1)
+          setPan({ x: 0, y: 0 })
+          return
+        }
+        const box = stageRef.current === null ? null : stageRef.current.getBoundingClientRect()
+        const origin = anchor ?? (box === null ? { x: 0, y: 0 } : { x: box.width / 2, y: box.height / 2 })
+        const ratio = clamped / zoom
+        const x = Math.round(origin.x - (origin.x - pan.x) * ratio)
+        const y = Math.round(origin.y - (origin.y - pan.y) * ratio)
+        setZoom(clamped)
+        setPan(clampPan({ x, y }, clamped))
       }
 
       const onDown = (event) => {
@@ -566,6 +688,10 @@ window.__ModuleLoader__.load({
           paint()
           return
         }
+        if (zoom > 1 && event.shiftKey) {
+          panDrag.current = { start: point, pan }
+          return
+        }
         gesture.current = { start: point, last: point, at: Date.now() }
         taps.current = [{ x: point.x, y: point.y }]
         paint()
@@ -574,6 +700,11 @@ window.__ModuleLoader__.load({
 
       const onMove = (event) => {
         const point = pointOf(event)
+        if (panDrag.current !== null) {
+          const { start, pan: from } = panDrag.current
+          setPan(clampPan({ x: from.x + (point.x - start.x), y: from.y + (point.y - start.y) }, zoom))
+          return
+        }
         if (mode === 'mark') {
           if (drawing.current === null) return
           drawing.current.push(point)
@@ -584,6 +715,7 @@ window.__ModuleLoader__.load({
       }
 
       const onUp = () => {
+        if (panDrag.current !== null) { panDrag.current = null; return }
         if (mode === 'mark') {
           drawing.current = null
           return
@@ -622,6 +754,24 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({ serial: typeQueue.serial, text }),
         }).catch(() => setStatus(L('state.failed')))
       }
+      /* 中文没法用 keyevent 打进去：交给宿主用剪贴板粘贴，前端只发一段文本。 */
+      const commitText = () => {
+        const text = draft
+        if (text === '' || serial === '') return
+        setDraft('')
+        setStatus(L('state.sending'))
+        fetch(`${ROUTE}/text`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ serial, text }),
+        }).then((response) => {
+          if (!response.ok) throw new Error('text ' + String(response.status))
+          return response.json()
+        }).then((body) => {
+          setStatus(body?.ok === false ? L('state.failed') : '')
+          if (body?.ok === false) setDraft(text)
+        }).catch(() => setStatus(L('state.failed')))
+      }
       const sendKey = (key) => {
         fetch(`${ROUTE}/key`, {
           method: 'POST',
@@ -651,6 +801,10 @@ window.__ModuleLoader__.load({
         if (mode === 'mark' || serial === '') return
         event.preventDefault()
         const point = pointOf(event)
+        if (event.ctrlKey || event.metaKey) {
+          zoomTo(zoom * (event.deltaY < 0 ? 1.15 : 1 / 1.15), point)
+          return
+        }
         wheel.current.dy += event.deltaY
         wheel.current.x = point.x
         wheel.current.y = point.y
@@ -801,8 +955,8 @@ window.__ModuleLoader__.load({
             }, devices.map((each) => h('option', { key: each, value: each }, each)))
             : null,
         ),
-        h('div', { className: 'adbm-stage' },
-          h('div', { className: 'adbm-frame', ref: frameRef }, // ui-copy-ignore
+        h('div', { className: 'adbm-stage', ref: stageRef }, // ui-copy-ignore
+          h('div', { className: 'adbm-frame', ref: frameRef, style: zoom === 1 ? undefined : { transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` } }, // ui-copy-ignore
             serial === ''
               ? null
               : h('video', {
@@ -846,6 +1000,30 @@ window.__ModuleLoader__.load({
           onChange: (event) => setNote(event.target.value),
           onKeyDown: (event) => { if (event.key === 'Enter') void send() },
         }),
+        h('div', { className: 'adbm-keys' },
+          h('input', {
+            className: 'adbm-input adbm-text',
+            value: draft,
+            placeholder: L('ph.text'),
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: (event) => { if (event.key === 'Enter') { event.preventDefault(); commitText() } },
+          }),
+          h('button', { className: 'adbm-key', disabled: serial === '' || draft === '', onClick: commitText }, L('act.text')),
+          h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('BACK') }, L('key.back')),
+          h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('HOME') }, L('key.home')),
+          h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('ENTER') }, L('key.enter')),
+          h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('DEL') }, L('key.del')),
+          h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('TAB') }, L('key.tab')),
+          h('button', { className: 'adbm-key', disabled: serial === '' || zoom === 1, onClick: () => zoomTo(1) }, L('act.fit')),
+          h('button', { className: 'adbm-key', disabled: serial === '', 'data-on': zoom >= 2 ? '1' : '0', onClick: () => zoomTo(2) }, '2×'),
+          h('button', { className: 'adbm-key', disabled: serial === '', 'data-on': zoom >= 3 ? '1' : '0', onClick: () => zoomTo(3) }, '3×'),
+        ),
+        ops.length === 0 ? null : h('div', { className: 'adbm-log' }, ops.slice(-2).join(' · ')),
+        ...marks.map((mark) => h('span', {
+          key: mark.id,
+          className: 'adbm-mark',
+          style: { left: `${screen.w > 0 ? (mark.x / screen.w) * 100 : 50}%`, top: `${screen.h > 0 ? (mark.y / screen.h) * 100 : 50}%` },
+        })),
       )
     }
 

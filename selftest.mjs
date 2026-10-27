@@ -7,6 +7,7 @@
  *   node selftest.mjs --serial emulator-5554
  */
 
+import fs from 'node:fs'
 import { apply } from './index.js'
 
 const argv = process.argv.slice(2)
@@ -284,6 +285,35 @@ try {
   else bad('采样字段不对', JSON.stringify(watch.value).slice(0, 120))
 } catch (error) {
   bad('adb_watch 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+/* 页面侧的接口：没有 CDP 也能确认直播链路和「刚做了什么」是通的。 */
+const BASE = process.env.DSH_ADB_BASE ?? `http://127.0.0.1:${process.env.DSH_PORT ?? '55409'}/dsh-adb`
+const probe = async (path, init) => {
+  const response = await fetch(`${BASE}${path}`, { ...init, cache: 'no-store' })
+  return { code: response.status, headers: response.headers, body: await response.json().catch(() => null) }
+}
+try {
+  const diag = await probe('/diag')
+  if (diag.code === 200 && Array.isArray(diag.body?.diag)) ok('/diag 可读', `watchers=${diag.body.watchers} 事件=${diag.body.diag.length}`)
+  else bad('/diag 形状不对', `${diag.code} ${JSON.stringify(diag.body).slice(0, 90)}`)
+} catch (error) {
+  bad('/diag 请求失败', String(error?.message ?? error).slice(0, 80))
+}
+try {
+  const ops = await probe('/actions')
+  if (ops.code === 200 && Array.isArray(ops.body?.actions)) ok('/actions 可读', `${ops.body.actions.length} 条`)
+  else bad('/actions 形状不对', `${ops.code} ${JSON.stringify(ops.body).slice(0, 90)}`)
+} catch (error) {
+  bad('/actions 请求失败', String(error?.message ?? error).slice(0, 80))
+}
+try {
+  const build = await probe('/state')
+  const want = String(fs.readFileSync(new URL('./client.rev', import.meta.url), 'utf8')).trim()
+  if (build.code === 200 && build.body?.build === want) ok('页面版本对齐', `build=${build.body.build}`)
+  else bad('页面版本不一致', `state=${build.body?.build} client.rev=${want}`)
+} catch (error) {
+  bad('/state 请求失败', String(error?.message ?? error).slice(0, 80))
 }
 
 console.log('\n=== 完成 ===\n')

@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=137'
+import { LiveStream, packFrame } from './stream.js?v=138'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-adb'
@@ -1335,13 +1335,31 @@ export function setupMirror(ctx, tools) {
         void mirror.start()
         const since = Number(url.searchParams.get('since') ?? '') || 0
         const wait = Math.min(2500, Math.max(0, Number(url.searchParams.get('wait') ?? '') || 0))
+        /* H.264 桥接：screenrecord 已经在跑，让 ffmpeg 把它解成 JPEG 喂进同一个帧池。
+           实测 screencap 一帧 867 ms，桥接后是解码延迟（几十毫秒），帧率上限也不再是 1 fps。 */
+        const stream = streamFor(serial)
+        void stream.enableJpeg()
+        const pump = () => {
+          const jpeg = stream.jpeg
+          if (jpeg !== null && stream.jpegAt > mirror.latestAt) mirror.accept(Buffer.from(jpeg))
+        }
+        let pumpTimer = null
+        if (stream.jpegChild !== null) {
+          pump()
+          pumpTimer = setInterval(pump, 40)
+          pumpTimer.unref?.()
+        }
         let frame = null
-        if (wait > 0) {
-          if (mirror.seq === 0) frame = await mirror.firstFrame(4000)
-          if (frame === null) frame = await mirror.nextFrame(since, wait)
-        } else {
-          frame = await mirror.firstFrame(4000)
-          if (frame !== null && Date.now() - mirror.latestAt > 1200) frame = (await mirror.snapshot()) ?? frame
+        try {
+          if (wait > 0) {
+            if (mirror.seq === 0) frame = await mirror.firstFrame(4000)
+            if (frame === null) frame = await mirror.nextFrame(since, wait)
+          } else {
+            frame = await mirror.firstFrame(4000)
+            if (frame !== null && Date.now() - mirror.latestAt > 1200) frame = (await mirror.snapshot()) ?? frame
+          }
+        } finally {
+          if (pumpTimer !== null) clearInterval(pumpTimer)
         }
         if (frame === null) return json({ error: '画面还没起来' }, 503)
         res.writeHead(200, {
@@ -1349,6 +1367,7 @@ export function setupMirror(ctx, tools) {
           'cache-control': 'no-store',
           'x-adb-seq': String(mirror.seq),
           'x-adb-at': String(mirror.latestAt),
+          'x-adb-engine': stream.jpegFresh() ? 'h264' : 'capture',
         })
         return res.end(frame)
       }
@@ -1431,7 +1450,14 @@ export function setupMirror(ctx, tools) {
         const serial = String(body.serial ?? '')
         const text = String(body.text ?? '').slice(0, 400)
         if (serial === '' || text === '') return json({ ok: false, reason: '缺少参数' })
-        if (/[^\x20-\x7e]/.test(text)) return json({ ok: false, reason: 'adb input 只吃 ASCII：中文请在设备上输入，或复制粘贴' })
+        if (/[^\x20-\x7e]/.test(text)) {
+          /* 中文没有 input text 可用：剪贴板 + 长按粘贴，由宿主传下来。 */
+          try {
+            return json(await tools.typeText(serial, text))
+          } catch (error) {
+            return json({ ok: false, reason: String(error && error.message ? error.message : error).slice(0, 200) })
+          }
+        }
         /* adb input 的坑：空格要写成 %s，其余空格类字符一律换掉，否则整句被截断。 */
         const escaped = text.replace(/\\/g, '\\\\').replace(/ /g, '%s').replace(/\s+/g, '%s').replace(/['"]/g, '')
         return json(await input(serial, ['text', escaped]))
@@ -1444,6 +1470,20 @@ export function setupMirror(ctx, tools) {
 
       if (path === '/want' && req.method === 'GET') {
         return json({ session: wantSession, at: wantAt, title: wantTitle, pages: events.size })
+      }
+
+      if (path === '/actions') {
+        const ops = typeof tools.recentActions === 'function' ? tools.recentActions(120_000) : []
+        return json({ at: Date.now(), actions: ops.slice(-5) })
+      }
+
+      if (path === '/diag' && req.method === 'GET') {
+        /* 页面报上来的现场：没有 CDP 也能看见它看到的构建号、渲染异常、交互结果。 */
+        return json({
+          at: Date.now(),
+          watchers: [...clients.values()].filter((each) => Date.now() - each.at < 120000).length,
+          diag: diag.slice(-20),
+        })
       }
 
       if (path === '/diag' && req.method === 'POST') {

@@ -22,7 +22,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=144'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=148'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=114'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -540,7 +540,7 @@ function u2Fetch(port, path, body, timeoutMs = 8000) {
       method: payload ? 'POST' : 'GET',
       timeout: timeoutMs,
       headers: payload
-        ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }
+        ? { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(payload) }
         : {},
     }, (res) => {
       const chunks = []
@@ -651,6 +651,59 @@ async function u2Dump(serial) {
   }
   if (data.error) throw new Error(`u2 dump 失败：${oneLine(data.error.message, 120)}`)
   return extractXml(String(data.result ?? ''))
+}
+
+/**
+ * 非 ASCII 输入的兜底：写剪贴板 → 长按输入框 → 点「粘贴」。
+ * u2 的 setText 只接受 UiObject 选择器、实测改不动真实输入框，剪贴板是这台机器上唯一走通的路径。
+ * @param {string} serial - 设备。
+ * @param {string} text - 要输入的文字。
+ * @returns {Promise<{ ok: boolean, steps: string[], field: string }>} 粘贴结果。
+ */
+async function typeViaClipboard(serial, text) {
+  const steps = []
+  const port = await u2Port(serial)
+  const sent = await u2Fetch(port, '/jsonrpc/0', {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'setClipboard',
+    params: [text, 'dsh-adb'],
+  }, 6000)
+  let data
+  try {
+    data = JSON.parse(sent.text)
+  } catch {
+    throw new Error(`写剪贴板返回异常：${oneLine(sent.text, 120)}`)
+  }
+  if (data.error) throw new Error(`写剪贴板失败：${oneLine(data.error.message, 120)}`)
+  steps.push('写剪贴板')
+  const dump = async () => parseNodes(await u2Dump(serial))
+  const focusedField = (nodes) => nodes.find((node) => node.focused && /EditText|AutoComplete|SearchView/.test(node.cls))
+    ?? nodes.find((node) => node.focused && node.x2 > node.x1 && node.y2 > node.y1)
+  const first = await dump()
+  const field = focusedField(first)
+  if (field === undefined) throw new Error('没有聚焦的输入框：先用 adb_tap 点一下输入框再输入')
+  const x = Math.round((field.x1 + field.x2) / 2)
+  const y = Math.round((field.y1 + field.y2) / 2)
+  const held = await sh(serial, `input swipe ${x} ${y} ${x} ${y} 800`, 12_000)
+  if (!held.ok) throw new Error(`长按输入框失败：${oneLine(held.out || held.err, 160)}`)
+  steps.push(`长按 ${x},${y}`)
+  let item
+  for (let i = 0; i < 10 && item === undefined; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    const list = await dump()
+    item = list.find((node) => node.clickable && /^(粘贴|Paste)$/i.test((node.text || node.desc).trim()))
+      ?? list.find((node) => /^(粘贴|Paste)$/i.test((node.text || node.desc).trim()))
+  }
+  if (item === undefined) throw new Error('长按后没有出现「粘贴」：这个输入框不吃剪贴板')
+  const tx = Math.round((item.x1 + item.x2) / 2)
+  const ty = Math.round((item.y1 + item.y2) / 2)
+  const hit = await sh(serial, `input tap ${tx} ${ty}`, 8000)
+  if (!hit.ok) throw new Error(`点「粘贴」失败：${oneLine(hit.out || hit.err, 160)}`)
+  steps.push(`点粘贴 ${tx},${ty}`)
+  await new Promise((resolve) => setTimeout(resolve, 260))
+  const after = focusedField(await dump())
+  return { ok: true, steps, field: after?.text ?? '' }
 }
 
 /**
@@ -1191,6 +1244,7 @@ export function apply(ctx, config) {
     resolveSerial: serial,
     uiInRect,
     recentActions,
+    typeText: typeViaClipboard,
   })
   ctx.effect(() => () => {
     mirror.stopAll()
@@ -1471,7 +1525,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_input',
-    description: '往 Android 设备输入：text 输入文字（只支持 ASCII，空格自动转义）、key 按键（如 ENTER/BACK/DEL/HOME）、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文输入 adb 原生不支持，会明确报错。',
+    description: '往 Android 设备输入：text 输入文字（ASCII 直发，中文走剪贴板粘贴约 1.5 s）、key 按键（如 ENTER/BACK/DEL/HOME）、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文要求先点中输入框让它获得焦点。',
     parameters: {
       type: 'object',
       properties: {
@@ -1508,12 +1562,20 @@ export function apply(ctx, config) {
         messages.push('已清空输入框')
       }
       if (args.text !== undefined) {
-        const encoded = shellInputText(String(args.text))
-        if (!encoded.ok) throw new Error(encoded.reason)
-        const r = await sh(device, `input text ${encoded.value}`, 15_000)
-        if (!r.ok) throw new Error(`输入失败：${oneLine(r.out || '命令超时', 200)}`)
-        lastActions.push({ at: Date.now(), what: `输入文字 ${String(args.text).length} 字` })
-        messages.push(`已输入 ${String(args.text).length} 个字符`)
+        const wanted = String(args.text)
+        const encoded = shellInputText(wanted)
+        if (!encoded.ok) {
+          /* 中文没有 input text 可用：写剪贴板再长按粘贴，走的是系统输入法自己的通道。 */
+          const pasted = await typeViaClipboard(device, wanted)
+          lastActions.push({ at: Date.now(), what: `粘贴文字 ${wanted.length} 字` })
+          messages.push(`已粘贴 ${wanted.length} 个字符（${pasted.steps.join(' → ')}）`)
+          if (pasted.field !== '') messages.push(`输入框现在是「${oneLine(pasted.field, 40)}」`)
+        } else {
+          const r = await sh(device, `input text ${encoded.value}`, 15_000)
+          if (!r.ok) throw new Error(`输入失败：${oneLine(r.out || '命令超时', 200)}`)
+          lastActions.push({ at: Date.now(), what: `输入文字 ${wanted.length} 字` })
+          messages.push(`已输入 ${wanted.length} 个字符`)
+        }
       }
       if (args.key !== undefined) {
         const key = String(args.key).trim()
@@ -2527,6 +2589,8 @@ ctx.effect(() => ctx.tools.register({
       }
       const r = await sh(device, cmd, 12_000)
       if (!r.ok) throw new Error(`${label}失败：${oneLine(r.out || '命令超时', 200)}`)
+      lastActions.push({ at: Date.now(), what: label })
+      if (lastActions.length > 400) lastActions.splice(0, lastActions.length - 400)
       return { ok: true, summary: `${label}完成（${r.ms}ms）。界面变化用 adb_ui 确认。`, elapsed_ms: Date.now() - began }
     },
   }), 'adb: adb_action')
