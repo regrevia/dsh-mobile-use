@@ -20,10 +20,25 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=141'
+import { LiveStream, packFrame } from './stream.js?v=143'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
+
+/**
+ * 节拍器回调兜底：异常冒到 host 顶层会直接把整个 DSH 带走（2026-10-27 事故），
+ * 所以单拍出错只记一行，不停服务、不退进程。
+ * @param {string} where - 出问题的路径。
+ * @param {() => void} run - 这一拍要做的事。
+ * @returns {void}
+ */
+function guard(where, run) {
+  try {
+    run()
+  } catch (error) {
+    console.error(`[dsh-mobile-use] ${where}:`, error)
+  }
+}
 
 /** 最近一次标注里动效拼图的字节数，0 表示没凑够帧。 */
 let lastStripBytes = 0
@@ -41,6 +56,10 @@ const LIVE_FPS = 3
 const PUSH_TICK_MS = 200
 /** 同时在飞的截图数：单张约 0.65s，3 张并发实测 4 帧/秒以上。 */
 const CAPTURE_PARALLEL = 2
+/** 没人看多久之后收掉分段录制：跟抓帧的空转宽限同一个数，别留两个口径。 */
+const WATCH_GRACE_MS = 6000
+/** 本进程的随机标识：设备端 pid 文件名带上它，多开/重启时不会互相覆盖。 */
+const REC_TAG = Math.random().toString(36).slice(2, 8)
 
 /** 环形缓冲：10 秒一段，留 18 段 ≈ 3 分钟，超出的由 ffmpeg 自己覆盖。 */
 const SEGMENT_SECONDS = 10
@@ -268,6 +287,10 @@ export class Mirror {
     this.waiters = []
     this.grabMs = 0
     this.recording = false
+    /* 分段录制的收尾：请求停止标记 + 设备端 pid 文件名（只杀自己这一次录屏）。 */
+    this.recorderStopRequested = false
+    this.recorderPidFile = ''
+    this.recorderSeq = 0
     this.stopping = false
     this.startedAt = 0
     this.error = ''
@@ -293,7 +316,7 @@ export class Mirror {
    * @returns {boolean} 有观看者（或刚有人来看）为真。
    */
   anyoneWatching() {
-    return this.watchers.size > 0 || Date.now() - this.lastWatchAt < 6000
+    return this.watchers.size > 0 || Date.now() - this.lastWatchAt < WATCH_GRACE_MS
   }
 
   async start() {
@@ -306,11 +329,12 @@ export class Mirror {
     if (found !== null) this.physical = { w: Number(found[1]), h: Number(found[2]) }
     await this.snapshot()
     this.alignScreen()
-    this.timer = setInterval(() => this.pump(), 200)
+    this.timer = setInterval(() => guard('pump', () => this.pump()), 200)
     this.timer.unref?.()
-    this.pushTimer = setInterval(() => this.push(), PUSH_TICK_MS)
+    this.pushTimer = setInterval(() => guard('push', () => this.push()), PUSH_TICK_MS)
     this.pushTimer.unref?.()
-    void this.startRecorder()
+    /* 录制跟观看者对齐：起服务时没人看就先不录，等 /frame 或 /live 把人带来再开。 */
+    this.ensureRecorder()
   }
 
   /**
@@ -328,22 +352,24 @@ export class Mirror {
     this.screen = landscape ? { w: long, h: short } : { w: short, h: long }
   }
 
-  /** 有人在看才抓帧；没人看就空转并顺手关掉转码进程。 @returns {void} */
+  /** 有人在看才抓帧；没人看就空转，宽限期过了顺手把分段录制也收掉。 @returns {void} */
   pump() {
     if (this.stopping) return
     if (!this.anyoneWatching()) {
       if (this.inflight === 0) {
         if (this.idleSince === 0) this.idleSince = Date.now()
       }
+      this.ensureRecorder()
       return
     }
     this.idleSince = 0
+    this.ensureRecorder()
     /* 桥接帧够新就别再抓屏：两种源尺寸不同，混进同一池子画面会跳。 */
     if (this.bridgeFresh !== null && this.bridgeFresh()) return
     /* 每个节拍最多补一张，让 3 张在飞时错开完成，画面才匀。 */
     if (this.inflight < CAPTURE_PARALLEL) {
       this.inflight += 1
-      void this.grab().finally(() => { this.inflight -= 1 })
+      void this.grab().catch((error) => { this.error = String(error?.message ?? error) }).finally(() => { this.inflight -= 1 })
     }
   }
 
@@ -879,23 +905,75 @@ export class Mirror {
   }
 
   /**
+   * 该录就录、该停就停：只有有人在看才保留分段录制，没人看超过宽限期就收掉。
+   * 由 pump() 每 200ms 调一次，重复调用无副作用。
+   * @returns {void}
+   */
+  ensureRecorder() {
+    if (this.stopping) return
+    if (this.anyoneWatching()) {
+      if (!this.recording) void this.startRecorder()
+      return
+    }
+    if (!this.recording) return
+    const idleAt = this.idleSince > 0 ? this.idleSince : this.lastWatchAt
+    if (idleAt > 0 && Date.now() - idleAt < WATCH_GRACE_MS) return
+    this.stopRecorder()
+  }
+
+  /**
+   * 请求停掉分段录制：只按自己记下的设备端 pid 收尾，不碰别人的 screenrecord。
+   * @returns {void}
+   */
+  stopRecorder() {
+    this.recorderStopRequested = true
+    const pidFile = this.recorderPidFile
+    this.recorderPidFile = ''
+    if (pidFile !== '') void this.killOwnRecorder(pidFile)
+  }
+
+  /**
+   * 精确杀自己这一次录屏：pid 取自启动时写下的设备端文件，并核对进程名还是 screenrecord。
+   * pid 拿不到（文件为空/读不到）就退化为不杀，只记一条错误，交给下一段自己超时结束。
+   * @param {string} pidFile - 启动时写下的 pid 文件绝对路径。
+   * @returns {Promise<string>} 设备端回话：`killed:<pid>` 或 `skip:<原因>`。
+   */
+  async killOwnRecorder(pidFile) {
+    const safe = String(pidFile).replace(/[^\w./-]/g, '')
+    if (safe === '') return 'skip:no-pid-file'
+    const script = `p='${safe}'; r=$(cat "$p" 2>/dev/null); rm -f "$p"; if [ -n "$r" ] && [ "$(cat /proc/$r/comm 2>/dev/null)" = 'screenrecord' ]; then kill -9 "$r"; echo killed:$r; else echo skip:$r; fi`
+    const result = await this.adb(['-s', this.serial, 'shell', script], { timeout: 8000, direct: true }).catch(() => null)
+    const out = String(result?.out ?? '').trim()
+    if (out.startsWith('killed:')) return out
+    this.error = this.error || `录屏收尾没拿到 pid（${out || '没有回话'}），没杀设备端进程`
+    return out || 'skip:no-reply'
+  }
+
+  /**
    * 循环分段录制：设备上录 10s 一段，拉回本机，只留最近 18 段。
+   * 每段启动时把 pid 写进设备端文件，停止时按 pid 精确 kill。
    * @returns {Promise<void>} 停了才返回。
    */
   async startRecorder() {
     if (this.recording || this.stopping) return
     this.recording = true
-    const remote = `/sdcard/dsh-${this.serial.replace(/[^\w.-]/g, '_')}.mp4`
-    while (!this.stopping) {
+    this.recorderStopRequested = false
+    const safeSerial = this.serial.replace(/[^\w.-]/g, '_')
+    const remote = `/sdcard/dsh-${safeSerial}.mp4`
+    while (!this.stopping && !this.recorderStopRequested) {
       const started = Date.now()
-      const recorded = await this.adb([
-        '-s', this.serial, 'shell', 'screenrecord',
-        '--time-limit', String(SEGMENT_SECONDS),
-        '--bit-rate', '2000000', '--size', this.recordSize(), remote,
-      ], { timeout: (SEGMENT_SECONDS + 20) * 1000, direct: true })
-      if (this.stopping) break
+      this.recorderSeq += 1
+      const pidFile = `/data/local/tmp/dsh-mobile-use-rec-${safeSerial}-${REC_TAG}-${this.recorderSeq}.pid`
+      this.recorderPidFile = pidFile
+      /* exec 让 shell 的 pid 就是 screenrecord 的 pid：停的时候按这个 pid 精确 kill。 */
+      const command = `sh -c 'echo $$ > ${pidFile}; exec screenrecord --time-limit ${SEGMENT_SECONDS} --bit-rate 2000000 --size ${this.recordSize()} ${remote}'`
+      const recorded = await this.adb(['-s', this.serial, 'shell', command], {
+        timeout: (SEGMENT_SECONDS + 20) * 1000,
+        direct: true,
+      }).catch((error) => ({ ok: false, err: String(error?.message ?? error) }))
+      if (this.stopping || this.recorderStopRequested) break
       if (!recorded.ok) {
-        this.error = recorded.err.trim().slice(0, 200) || '录制失败'
+        this.error = String(recorded.err ?? '').trim().slice(0, 200) || '录制失败'
         await new Promise((resolve) => setTimeout(resolve, 1500))
         continue
       }
@@ -914,6 +992,7 @@ export class Mirror {
       if (spent < SEGMENT_SECONDS * 1000) await new Promise((resolve) => setTimeout(resolve, Math.max(0, 400 - spent)))
     }
     this.recording = false
+    this.recorderStopRequested = false
   }
 
   /** 本机只留最近 18 段（约 3 分钟）。 @returns {Promise<void>} 删完。 */
@@ -961,9 +1040,10 @@ export class Mirror {
     return this.latest
   }
 
-  /** 停掉两条子进程并断开观看者。 @returns {void} */
+  /** 停掉两条子进程、收掉分段录制并断开观看者；重复调用无副作用。 @returns {void} */
   stop() {
     this.stopping = true
+    this.stopRecorder()
     if (this.timer !== null) clearInterval(this.timer)
     this.timer = null
     if (this.pushTimer !== null) clearInterval(this.pushTimer)
@@ -1094,6 +1174,11 @@ export function setupMirror(ctx, tools) {
     if (note !== '') lines.push(note)
     if (rect !== null && Number(rect.w) > 0) {
       lines.push(`圈选区域（设备坐标）：x=${Math.round(rect.x)} y=${Math.round(rect.y)} w=${Math.round(rect.w)} h=${Math.round(rect.h)}`)
+    }
+    /* 圈是画在冻结帧上的：把「画面是几秒前的」交出去，免得把那一刻的控件位置当成现在。 */
+    const frozenMs = Number(input.frozen_ms)
+    if (Number.isFinite(frozenMs) && frozenMs >= 1) {
+      lines.push(`这张图是一张 ${(frozenMs / 1000).toFixed(1)} 秒前冻结的画面，圈的位置以那一帧为准。`)
     }
     if (tools.uiInRect !== undefined && rect !== null) {
       const inside = await tools.uiInRect(String(input.serial ?? ''), rect).catch(() => [])
@@ -1347,7 +1432,7 @@ export function setupMirror(ctx, tools) {
       }
       child.on('error', (error) => finish({ ok: false, reason: String(error && error.message ? error.message : error).slice(0, 200) }))
       child.on('exit', (code) => finish(code === 0 ? { ok: true } : { ok: false, reason: '退出码 ' + code }))
-      const tick = () => {
+      const tick = () => guard('gesture-tick', () => {
         if (index >= frames.length) {
           child.stdin.end()
           return
@@ -1355,13 +1440,13 @@ export function setupMirror(ctx, tools) {
         child.stdin.write(stampFrame(frames[index], start + (index * step) / 1000))
         index += 1
         setTimeout(tick, step)
-      }
+      })
       tick()
-      setTimeout(() => {
+      setTimeout(() => guard('gesture-timeout', () => {
         if (done) return
         child.kill('SIGKILL')
         finish({ ok: false, reason: '注入超时' })
-      }, ms + 4000)
+      }), ms + 4000)
     })
   }
 
@@ -1636,6 +1721,8 @@ export function setupMirror(ctx, tools) {
           fps: mirror.measuredFps(),
           live: mirror.latest !== null,
           watchers: mirror.watchers.size,
+          /* 录制是后台行为：状态里如实报，别让人以为没人看时也在录。 */
+          recording: mirror.recording,
           dropped: mirror.dropped,
           grabMs: mirror.grabMs,
           pushed: mirror.pushed,
@@ -1867,6 +1954,7 @@ export function setupMirror(ctx, tools) {
       return {
         serial: chosen,
         live: mirror.latest !== null,
+        recording: mirror.recording,
         frames: mirror.frames,
         fps: mirror.measuredFps(),
         bufferedSeconds: segments.length * SEGMENT_SECONDS,
@@ -1879,6 +1967,12 @@ export function setupMirror(ctx, tools) {
       return mirror === undefined ? [] : mirror.segments()
     },
     stopAll() {
+      /* 先停 H.264 直播：每个实例都有自己的设备端录屏和 ffmpeg 子进程，比抓帧泵重得多。
+         只清 mirrors 会把这些子进程留在设备上继续录，卸载插件后还在跑。 */
+      for (const stream of streams.values()) {
+        try { stream.stop() } catch { /* 已经停了 */ }
+      }
+      streams.clear()
       for (const mirror of mirrors.values()) mirror.stop()
       mirrors.clear()
       for (const res of events) {

@@ -10,7 +10,7 @@
  * @module dsh-mobile-use/ocr
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,7 +18,11 @@ import { fileURLToPath } from 'node:url'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const WORKER = join(HERE, 'ocr_worker.py')
 const IDLE_MS = 45_000
-const CALL_TIMEOUT_MS = 8_000
+/** 一次 ocrImage 的总时限：启动 + 识别共用，避免两边各自超时叠成半分钟。 */
+const CALL_TIMEOUT_MS = 15_000
+/** 启动 worker 的单独上限：worker 卡在 import Vision 时要尽快放弃。 */
+const START_TIMEOUT_MS = 8_000
+const PYTHON = '/usr/bin/python3'
 
 let worker = null
 let ready = null
@@ -27,9 +31,46 @@ let seq = 0
 const pending = new Map()
 let buffer = ''
 
-/** python3 是否存在（不存在就没有 OCR）。 */
+/**
+ * 探一次本机能不能跑 OCR：平台、worker 文件、python 能否 import Vision 三个条件。
+ * 结果缓存，插件生命周期内只探一次（worker 起不来时也别每次调用都 spawn 一次 python）。
+ * @returns {{ available: boolean, reason: string }} 可用性；不可用时 `reason` 说明原因。
+ */
+function probe() {
+  if (process.platform !== 'darwin') return { available: false, reason: `本机是 ${process.platform}，Vision OCR 只有 macOS 有` }
+  if (!existsSync(WORKER)) return { available: false, reason: `缺少 ${WORKER}` }
+  if (!existsSync(PYTHON)) return { available: false, reason: `缺少 ${PYTHON}` }
+  /* 只探 import：worker 真正用到的 Vision/Quartz 都在这里，缺 pyobjc 会在启动后立刻崩。 */
+  const check = spawnSync(PYTHON, ['-c', 'import Vision, Quartz, Foundation'], { timeout: 5000, stdio: 'ignore' })
+  if (check.error) {
+    return { available: false, reason: `${PYTHON} 起不来：${String(check.error.message ?? check.error).slice(0, 120)}` }
+  }
+  if (check.status !== 0) return { available: false, reason: `${PYTHON} 缺 Vision/Quartz（pyobjc-framework-Vision）` }
+  return { available: true, reason: '' }
+}
+
+let availability = null
+
+/**
+ * 本机 OCR 状态：可用性和不可用原因。
+ * @returns {{ available: boolean, reason: string }} `reason` 可直接写进工具结果，让上层回退到文本树/截图。
+ */
+export function ocrStatus() {
+  if (availability === null) availability = probe()
+  return availability
+}
+
+/** python3 与 Vision 是否可用（不存在就没有 OCR）。 @returns {boolean} 可用为 true。 */
 export function ocrAvailable() {
-  return existsSync(WORKER) && existsSync('/usr/bin/python3')
+  return ocrStatus().available
+}
+
+/**
+ * 拿不可用原因；可用时返回空串。
+ * @returns {string} 人话原因，例如「本机是 linux，Vision OCR 只有 macOS 有」。
+ */
+export function ocrReason() {
+  return ocrStatus().reason
 }
 
 function kill() {
@@ -57,13 +98,22 @@ function armIdle() {
 
 function start() {
   if (ready) return ready
+  const state = ocrStatus()
+  if (!state.available) return Promise.reject(new Error(`本机没有 OCR：${state.reason}`))
   ready = new Promise((resolve, reject) => {
-    const child = spawn('/usr/bin/python3', [WORKER], { stdio: ['pipe', 'pipe', 'pipe'] })
+    let settled = false
+    const fail = (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+      kill()
+    }
+    const child = spawn(PYTHON, [WORKER], { stdio: ['pipe', 'pipe', 'pipe'] })
     worker = child
     const timer = setTimeout(() => {
-      reject(new Error('OCR 进程启动超时'))
-      kill()
-    }, 15_000)
+      fail(new Error('OCR 进程启动超时'))
+    }, START_TIMEOUT_MS)
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (chunk) => {
       buffer += chunk
@@ -78,8 +128,11 @@ function start() {
           continue
         }
         if (message.ready === true) {
-          clearTimeout(timer)
-          resolve()
+          if (!settled) {
+            settled = true
+            clearTimeout(timer)
+            resolve()
+          }
           continue
         }
         const entry = pending.get(message.path)
@@ -92,15 +145,16 @@ function start() {
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', () => {})
     child.on('error', (error) => {
-      clearTimeout(timer)
-      reject(error)
-      kill()
+      fail(error)
     })
-    child.on('exit', () => {
-      clearTimeout(timer)
+    child.on('exit', (code, signal) => {
+      /* 关键：ready 之前就退出时必须 reject，否则 start() 的 Promise 永远挂着，
+         上层 ocrImage 的 await 也跟着挂死（非 macOS / 缺 pyobjc 时的实际表现）。 */
+      fail(new Error(`OCR 进程启动时退出（code=${String(code)}, signal=${String(signal)}）`))
       if (worker === child) {
         worker = null
         ready = null
+        buffer = ''
         for (const [, entry] of pending) entry.reject(new Error('OCR 进程退出'))
         pending.clear()
       }
@@ -116,13 +170,17 @@ function start() {
  *   `x/y/w/h` 是归一化坐标，原点在**左下角**（Vision 的习惯）。
  */
 export async function ocrImage(path) {
+  /* 启动和识别共用一个 deadline：启动慢了，识别就少等，整体最多 CALL_TIMEOUT_MS。 */
+  const deadline = Date.now() + CALL_TIMEOUT_MS
   await start()
   armIdle()
+  const left = deadline - Date.now()
+  if (left <= 0) throw new Error('OCR 超时')
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(path)
       reject(new Error('OCR 超时'))
-    }, CALL_TIMEOUT_MS)
+    }, left)
     pending.set(path, {
       resolve: (result) => {
         clearTimeout(timer)
@@ -133,7 +191,20 @@ export async function ocrImage(path) {
         reject(error)
       },
     })
-    worker.stdin.write(`${path}\n`)
+    /* worker 可能在 start() resolve 之后、这里之前就退了：写不进去就明确失败，别抛同步异常。 */
+    if (worker === null) {
+      pending.delete(path)
+      clearTimeout(timer)
+      reject(new Error('OCR 进程已退出'))
+      return
+    }
+    try {
+      worker.stdin.write(`${path}\n`)
+    } catch (error) {
+      pending.delete(path)
+      clearTimeout(timer)
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
   })
 }
 

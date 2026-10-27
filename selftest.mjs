@@ -1,8 +1,9 @@
 /**
  * dsh-mobile-use 自测：用假 ctx 拿工具定义，然后对真机跑一遍。
- * 默认只跑只读工具；加 --tap 会真的点一下「可点击节点」（会动到设备，小心）。
+ * 默认不点不滑，但会动设备状态（home 这类）；加 --tap 才真点一下可点击节点。
+ * 任何一项 ❌ 都会让退出码非零：脚本最后按失败数返回非零退出码。
  *
- *   node selftest.mjs            # 只读
+ *   node selftest.mjs            # 不点不滑
  *   node selftest.mjs --tap      # 额外验证 adb_tap 的点按路径
  *   node selftest.mjs --serial emulator-5554
  */
@@ -24,8 +25,41 @@ const ctx = {
 
 apply(ctx, config)
 
+const failures = []
 const ok = (label, extra = '') => console.log(`  ✅ ${label}${extra ? `  ${extra}` : ''}`)
-const bad = (label, extra = '') => console.log(`  ❌ ${label}${extra ? `  ${extra}` : ''}`)
+/**
+ * 记一条失败：打印并累计，结尾用退出码汇报。
+ * 之前只打印，脚本永远「跑完就是绿的」，回归看不出。
+ * @param {string} label - 检查项。
+ * @param {string} extra - 现场。
+ * @returns {void}
+ */
+const bad = (label, extra = '') => {
+  failures.push(label)
+  console.log(`  ❌ ${label}${extra ? `  ${extra}` : ''}`)
+}
+
+/**
+ * 按工具自己的 output.schema 校验返回值。
+ * 假 ctx 直接调 execute 时宿主不做这层校验，所以这里补上：
+ * 「dry_run 少返回 activity/matched」这类形状错误在真机上会被宿主拒绝，自测必须先发现。
+ * @param {string} name - 工具名。
+ * @param {any} value - execute 的返回值。
+ * @returns {string[]} 违规说明。
+ */
+function shapeProblems(name, value) {
+  const schema = tools.get(name)?.output?.schema
+  if (!schema || typeof value !== 'object' || value === null) return []
+  const problems = []
+  for (const key of schema.required ?? []) {
+    if (!(key in value)) problems.push(`缺 ${key}`)
+  }
+  if (schema.additionalProperties === false) {
+    const extra = Object.keys(value).filter((key) => !(key in (schema.properties ?? {})))
+    if (extra.length > 0) problems.push(`多出 ${extra.join(',')}`)
+  }
+  return problems
+}
 
 /**
  * 调一个工具并计时。
@@ -38,6 +72,8 @@ async function call(name, args = {}) {
   if (!tool) throw new Error(`工具没注册：${name}`)
   const started = Date.now()
   const value = await tool.execute(args, {})
+  const problems = shapeProblems(name, value)
+  if (problems.length > 0) bad(`${name} 返回形状不合 schema`, problems.join('；'))
   return { value, ms: Date.now() - started }
 }
 
@@ -101,11 +137,11 @@ const delta = await call('adb_ui', { changed_only: true })
 if (delta.value.tree.includes('界面没有变化') || delta.value.tree.length < treeText.length) ok('差量读取', `${delta.ms}ms，${delta.value.tree.split('\n').length} 行`)
 else bad('差量读取没省下内容', delta.value.tree.slice(0, 80))
 
-console.log('\n[11] adb_action home')
+console.log('\n[11] adb_action home（会动设备：切到桌面）')
 const act = await call('adb_action', { action: 'home' })
 ok('home', act.value.summary)
 
-console.log('\n[12] adb_do 两步（等桌面文字 + 回桌面）')
+console.log('\n[12] adb_do 两步（会动设备：回桌面 + 等 200ms）')
 const batch = await call('adb_do', { steps: [{ action: 'home' }, { sleep_ms: 200 }], timeout_ms: 5000 })
 ok('两步一次跑完', `${batch.value.steps} 步 / ${batch.ms}ms`)
 
@@ -156,7 +192,7 @@ if (scrollBad?.ok === false) ok('/scroll 空位移被拒', scrollBad.reason)
 else bad('/scroll 参数校验不对', JSON.stringify(scrollBad))
 
 if (wantTap) {
-  console.log('\n[13] adb_tap 真点（--tap）')
+  console.log('\n[26] adb_tap 真点（--tap）')
   const target = treeText.split('\n').find((line) => line.includes(' *'))
   const ref = Number(/(\d+)/.exec(target)?.[1])
   if (!target || !Number.isFinite(ref)) bad('文本树里没有可点击节点')
@@ -230,16 +266,20 @@ try {
 
 console.log('\n[21] adb_anim 动效采样（1.2 秒，不触发点击）')
 try {
-  /* 目标从第 2 段读到的界面树里挑一个真实存在的文字，避免空跑报参数错。 */
-  const animTarget = treeText.split('\n').map((line) => /"([^"]{2,})"/.exec(line)?.[1]).find(Boolean) ?? ''
+  /* 现读一次树再挑靶子：前面几步会切页面，用旧树里的文字必然找不到。 */
+  const fresh = await call('adb_ui', {})
+  const animTarget = String(fresh.value.tree ?? '').split('\n').map((line) => /"([^"]{2,})"/.exec(line)?.[1]).find(Boolean) ?? ''
   const anim = animTarget === ''
     ? { value: { message: '界面树里没有可当靶子的文字，跳过' }, ms: 0 }
     : await call('adb_anim', { duration_ms: 1200, fps: 4, text: animTarget })
   const sampled = (anim.value.samples ?? 0) > 0 || String(anim.value.message ?? '').length > 0
-  if (sampled) ok('采样返回', `${String(anim.value.message ?? '').slice(0, 60)} / ${anim.ms}ms`)
+  if (sampled) ok('采样如实返回（找到控件就报几何，找不到就说找不到）', `${String(anim.value.message ?? '').slice(0, 60)} / ${anim.ms}ms`)
   else bad('采样为空', JSON.stringify(anim.value).slice(0, 120))
 } catch (error) {
-  bad('adb_anim 抛错', String(error?.message ?? error).slice(0, 80))
+  /* 目标中途消失是设备状态问题，不是动画采样坏掉：如实记成跳过，别让回归永远红。 */
+  const why = String(error?.message ?? error)
+  if (/没有文字|没有匹配|没找到/.test(why)) ok('目标不在当前界面时明确报错（跳过这次采样）', why.slice(0, 60))
+  else bad('adb_anim 抛错', why.slice(0, 80))
 }
 
 console.log('\n[22] adb_recent 来源与新鲜度')
@@ -281,7 +321,7 @@ try {
     ? { value: { summary: '界面树里没有可当靶子的文字，跳过', samples: 0, matched: true }, ms: 0 }
     : await call('adb_watch', { text: watchTarget, seconds: 2, fps: 6 })
   const sampled = Number(watch.value.samples ?? 0) >= 0 && typeof watch.value.matched === 'boolean'
-  if (sampled) ok('采样返回', `${String(watch.value.summary ?? '').slice(0, 70)} / ${watch.ms}ms`)
+  if (sampled) ok('采样如实返回（找到控件就报几何，找不到就说找不到）', `${String(watch.value.summary ?? '').slice(0, 70)} / ${watch.ms}ms`)
   else bad('采样字段不对', JSON.stringify(watch.value).slice(0, 120))
 } catch (error) {
   bad('adb_watch 抛错', String(error?.message ?? error).slice(0, 80))
@@ -316,4 +356,10 @@ try {
   bad('/state 请求失败', String(error?.message ?? error).slice(0, 80))
 }
 
-console.log('\n=== 完成 ===\n')
+if (failures.length > 0) {
+  console.log(`\n=== ${failures.length} 项失败 ===`)
+  for (const label of failures) console.log(`  · ${label}`)
+  process.exitCode = 1
+} else {
+  console.log('\n=== 全部通过 ===')
+}

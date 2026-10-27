@@ -10,7 +10,7 @@
  */
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。 */
-window.__ADBM_BUILD = '151'
+window.__ADBM_BUILD = '152'
 
 window.__ModuleLoader__.load({
   id: 'dsh-mobile-use',
@@ -338,6 +338,11 @@ window.__ModuleLoader__.load({
       const stageRef = React.useRef(null) // ui-copy-ignore
       const canvasRef = React.useRef(null) // ui-copy-ignore
       const strokes = React.useRef([])
+      /* 标注要绑住"当时看到的那一帧"：动笔画第一下就把画面冻住，
+         之后输入说明的几秒里页面继续动，送回会话的图、圈、控件仍然是同一时刻的。 */
+      const frozen = React.useRef(null) // ui-copy-ignore
+      /* 防重复提交用独立标志：状态行显示"已发送"之后人还能继续圈下一处。 */
+      const isSending = React.useRef(false) // ui-copy-ignore
       /* 点下去先在本地画一个圈：设备那一帧要 0.7 s 才回来，圈让手感立刻有回应。 */
       const taps = React.useRef([]) // ui-copy-ignore
       const drawing = React.useRef(null) // ui-copy-ignore
@@ -683,10 +688,15 @@ window.__ModuleLoader__.load({
        */
       const devicePoint = (point) => {
         if (screen.w < 1 || screen.h < 1) return { x: 0, y: 0 }
+        const canvas = canvasRef.current
         const rect = pictureRect()
-        if (rect.width < 1 || rect.height < 1) return { x: 0, y: 0 }
-        const u = Math.min(1, Math.max(0, (point.x - rect.left) / rect.width))
-        const v = Math.min(1, Math.max(0, (point.y - rect.top) / rect.height))
+        if (canvas === null || rect.width < 1 || rect.height < 1) return { x: 0, y: 0 }
+        /* point 来自 pointOf，是画布内的局部坐标；pictureRect 是视口坐标。
+           混用两个坐标系会把侧栏整体算成负偏移（右栏越靠右，误差越大），
+           所以这里补一次画布自身在视口里的偏移，整条换算只做一次。 */
+        const box = canvas.getBoundingClientRect()
+        const u = Math.min(1, Math.max(0, (point.x + box.left - rect.left) / rect.width))
+        const v = Math.min(1, Math.max(0, (point.y + box.top - rect.top) / rect.height))
         const x = turned() ? Math.round(v * screen.w) : Math.round(u * screen.w)
         const y = turned() ? Math.round(u * screen.h) : Math.round(v * screen.h)
         return { x, y }
@@ -728,6 +738,23 @@ window.__ModuleLoader__.load({
         if (mode === 'view') return
         const point = pointOf(event)
         if (mode === 'mark') {
+          /* 第一笔落下就把画面冻住：之后几秒输入说明时页面再动，
+             送回会话的仍是"人看到问题的那一帧"。 */
+          if (frozen.current === null && serial !== '') {
+            const box = canvasRef.current === null ? null : canvasRef.current.getBoundingClientRect()
+            const width = box === null ? 0 : box.width
+            fetch(`${ROUTE}/frame?serial=${encodeURIComponent(serial)}`, { cache: 'no-store' })
+              .then((response) => (response.ok ? response.blob() : Promise.reject(new Error('no frame'))))
+              .then((blob) => createImageBitmap(blob))
+              .then((bitmap) => {
+                if (frozen.current === null && strokes.current.length > 0) {
+                  frozen.current = { bitmap, width, at: Date.now() }
+                } else if (bitmap !== null && typeof bitmap.close === 'function') {
+                  bitmap.close()
+                }
+              })
+              .catch(() => { setStatus(L('state.failed')) })
+          }
           drawing.current = [point]
           strokes.current.push(drawing.current)
           paint()
@@ -896,6 +923,7 @@ window.__ModuleLoader__.load({
 
       const clear = () => {
         strokes.current = []
+        frozen.current = null
         paint()
         setStatus('')
       }
@@ -910,20 +938,34 @@ window.__ModuleLoader__.load({
       }
 
       const send = async () => {
-        if (serial === '' || status === L('state.sent')) return
+        if (serial === '' || isSending.current) return
+        isSending.current = true
         setStatus(L('state.starting'))
         try {
-          const response = await fetch(`${ROUTE}/frame?serial=${encodeURIComponent(serial)}`, { cache: 'no-store' })
-          if (!response.ok) throw new Error('no frame')
-          const bitmap = await createImageBitmap(await response.blob())
+          /* 优先用画第一笔时冻住的那一帧：保证图、圈、控件是同一时刻的现场。
+             冻帧失败（当时没网/没帧）才退回取当前帧，并在证据里标明。 */
+          const still = frozen.current
+          let bitmap = null
+          let frozenAt = 0
+          let canvasWidth = 0
+          if (still !== null) {
+            bitmap = still.bitmap
+            frozenAt = still.at
+            canvasWidth = still.width
+          } else {
+            const response = await fetch(`${ROUTE}/frame?serial=${encodeURIComponent(serial)}`, { cache: 'no-store' })
+            if (!response.ok) throw new Error('no frame')
+            bitmap = await createImageBitmap(await response.blob())
+            frozenAt = Date.now()
+            canvasWidth = canvasRef.current.getBoundingClientRect().width
+          }
           const out = document.createElement('canvas')
           out.width = bitmap.width
           out.height = bitmap.height
           const ink = out.getContext('2d')
           if (ink === null) throw new Error('no canvas')
           ink.drawImage(bitmap, 0, 0)
-          const box = canvasRef.current.getBoundingClientRect()
-          const scale = box.width < 1 ? 1 : out.width / box.width
+          const scale = canvasWidth < 1 ? 1 : out.width / canvasWidth
           ink.strokeStyle = '#ff3b30'
           ink.lineWidth = Math.max(3, 3 * scale)
           ink.lineCap = 'round'
@@ -959,11 +1001,20 @@ window.__ModuleLoader__.load({
           const answer = await fetch(`${ROUTE}/annotate`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ serial, session: sessionId, note, png, rect }),
+            body: JSON.stringify({
+              serial,
+              session: sessionId,
+              note,
+              png,
+              rect,
+              frozen_at: frozenAt,
+              frozen_ms: frozenAt < 1 ? null : Math.max(0, Date.now() - frozenAt),
+            }),
           }).then((res) => res.json())
           if (answer?.ok === true) {
             setStatus(L('state.sent'))
             strokes.current = []
+            frozen.current = null
             setNote('')
             paint()
           } else {
@@ -971,13 +1022,16 @@ window.__ModuleLoader__.load({
           }
         } catch {
           setStatus(L('state.failed'))
+        } finally {
+          isSending.current = false
         }
       }
 
       /* 不画任何东西，直接把最近几秒的画面 + 操作时间线推给 agent：
          桌宠变大这类「刚才那几下之后不对劲」的问题，用这个最快。 */
       const sendRecent = async () => {
-        if (serial === '') return
+        if (serial === '' || isSending.current) return
+        isSending.current = true
         setStatus(L('state.starting'))
         try {
           const answer = await fetch(`${ROUTE}/annotate`, {
@@ -993,6 +1047,8 @@ window.__ModuleLoader__.load({
           }
         } catch {
           setStatus(L('state.failed'))
+        } finally {
+          isSending.current = false
         }
       }
 

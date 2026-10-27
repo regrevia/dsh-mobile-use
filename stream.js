@@ -211,6 +211,8 @@ function containsIdr(chunk) {
 
 /** 最后一个观众走后，录屏再活这么久：侧栏重载/切页回来时能立刻出画面，不用等 2 秒起流。 */
 const IDLE_GRACE_MS = 20000
+/** 本进程的随机标识：设备端 pid 文件名带上它，多开/重启不会互相认领对方的录屏。 */
+const RUN_TAG = Math.random().toString(36).slice(2, 8)
 
 export class LiveStream {
   /**
@@ -224,6 +226,8 @@ export class LiveStream {
     this.height = options.height ?? 1280
     this.bitrate = options.bitrate ?? 4_000_000
     this.recorder = null
+    /* 设备端 pid 文件名：停止时只按这个 pid 精确收尾，绝不 pkill 别人在录的屏。 */
+    this.recorderPidFile = ''
     this.remuxer = null
     this.stopping = false
     this.restartTimer = null
@@ -330,7 +334,7 @@ export class LiveStream {
     if (!(globalThis.__dshAdbJpeg.get(this.serial) instanceof Set)) globalThis.__dshAdbJpeg.set(this.serial, new Set())
     globalThis.__dshAdbJpeg.get(this.serial).add(child)
     child.on('exit', () => globalThis.__dshAdbJpeg.get(this.serial)?.delete(child))
-    child.stdout.on('data', (chunk) => this.feedJpeg(chunk))
+    child.stdout.on('data', (chunk) => this.guard('feed-jpeg', () => this.feedJpeg(chunk)))
     child.stderr.on('data', (buf) => {
       const text = String(buf).trim()
       if (text !== '') this.error = text.slice(-300)
@@ -396,10 +400,10 @@ export class LiveStream {
   /** 观众都走了：留一段宽限再停，重开侧栏就不用重新起流。 @returns {void} */
   scheduleIdleStop() {
     if (this.idleTimer !== null) return
-    this.idleTimer = setTimeout(() => {
+    this.idleTimer = setTimeout(() => this.guard('idle-stop', () => {
       this.idleTimer = null
       if (this.clients.size === 0 && this.waiting.size === 0 && Date.now() - this.jpegWantedAt > IDLE_GRACE_MS) this.stop()
-    }, IDLE_GRACE_MS)
+    }), IDLE_GRACE_MS)
     this.idleTimer.unref?.()
   }
 
@@ -429,6 +433,8 @@ export class LiveStream {
     this.intentional = true
     const child = this.recorder
     this.recorder = null
+    /* 换 IDR 前先收掉自己这次的设备端录屏，只按 pid 杀，不碰别人的。 */
+    this.killOwnRecorder()
     this.init = null
     this.error = ''
     this.lastKeyChunks = []
@@ -445,17 +451,62 @@ export class LiveStream {
   }
 
   /**
-   * 设备端兜底清理：本地 adb 被杀掉后，设备上的 screenrecord 还会活到 time-limit，
-   * 占着编码器让下一次录屏直接失败（another recording is running）。
+   * 设备端精确收尾：按启动时写下的 pid 文件找到「自己这一次」的 screenrecord，
+   * 核对进程名还是 screenrecord 再 kill。pid 拿不到就不杀（只记日志），
+   * 让它按 time-limit 自己结束，也不会误伤别人的录屏。
+   * @param {string} [pidFile] - pid 文件；默认用当前这次录屏的。
    * @returns {void}
    */
-  killStale() {
+  killOwnRecorder(pidFile = this.recorderPidFile) {
+    const safe = String(pidFile).replace(/[^\w./-]/g, '')
+    if (safe === '') {
+      this.debug('kill-device skipped: no pid file')
+      return
+    }
+    if (this.recorderPidFile === pidFile) this.recorderPidFile = ''
+    const script = `p='${safe}'; r=$(cat "$p" 2>/dev/null); rm -f "$p"; if [ -n "$r" ] && [ "$(cat /proc/$r/comm 2>/dev/null)" = 'screenrecord' ]; then kill -9 "$r"; echo killed:$r; else echo skip:$r; fi`
     try {
-      const child = spawn(this.adbPath, ['-s', this.serial, 'shell', 'pkill -f screenrecord'], { stdio: 'ignore' })
+      const child = spawn(this.adbPath, ['-s', this.serial, 'shell', script], { stdio: ['ignore', 'pipe', 'ignore'] })
+      let out = ''
+      child.stdout?.on('data', (chunk) => { out = (out + String(chunk)).slice(-120) })
+      child.on('exit', () => this.debug('kill-device ' + (out.trim() || 'no-reply')))
+      child.on('error', () => this.debug('kill-device spawn-error'))
+      child.unref?.()
+    } catch {
+      this.debug('kill-device threw')
+    }
+  }
+
+  /**
+   * 正常到时长退出的清理：只删自己的 pid 文件，不 kill（pid 可能已被别人复用）。
+   * @returns {void}
+   */
+  dropRecorderPidFile() {
+    const pidFile = this.recorderPidFile
+    this.recorderPidFile = ''
+    const safe = String(pidFile).replace(/[^\w./-]/g, '')
+    if (safe === '') return
+    try {
+      const child = spawn(this.adbPath, ['-s', this.serial, 'shell', 'rm', '-f', safe], { stdio: 'ignore' })
       child.on('error', () => {})
       child.unref?.()
     } catch {
-      /* 清理失败不影响主流程 */
+      /* 清不掉就留着，几十字节，不影响主流程 */
+    }
+  }
+
+  /**
+   * 定时器与子进程回调的兜底：这里抛出的异常会冒到 host 顶层，整个 DSH 以 1 退出
+   * （2026-10-27 `this.killStale` 两次事故），所以宁可这一步不做也要写日志。
+   * @param {string} where - 出问题的路径，写进 stream-debug.log。
+   * @param {() => void} run - 真正要做的事。
+   * @returns {void}
+   */
+  guard(where, run) {
+    try {
+      run()
+    } catch (error) {
+      this.debug(`guard ${where}: ${String(error?.stack ?? error).slice(0, 400)}`)
     }
   }
 
@@ -475,30 +526,28 @@ export class LiveStream {
   spawnRecorder() {
     if (this.stopping) return
     const size = `${this.width}x${this.height}`
-    const args = [
-      '-s', this.serial, 'exec-out', 'screenrecord',
-      '--output-format=h264',
-      `--time-limit=${RECORD_LIMIT}`,
-      `--size=${size}`,
-      `--bit-rate=${this.bitrate}`,
-      '-',
-    ]
+    this.sessions += 1
+    const safeSerial = this.serial.replace(/[^\w.-]/g, '_')
+    const pidFile = `/data/local/tmp/dsh-mobile-use-stream-${safeSerial}-${RUN_TAG}-${this.sessions}.pid`
+    this.recorderPidFile = pidFile
+    /* exec 让 shell 的 pid 就是 screenrecord 的 pid：停止时按这个 pid 精确 kill。 */
+    const command = `sh -c 'echo $$ > ${pidFile}; exec screenrecord --output-format=h264 --time-limit=${RECORD_LIMIT} --size=${size} --bit-rate=${this.bitrate} -'`
+    const args = ['-s', this.serial, 'exec-out', command]
     const child = spawn(this.adbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     this.recorder = child
-    this.sessions += 1
     this.debug('spawn')
     let stderr = ''
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => {
       stderr = (stderr + chunk).slice(-2000)
     })
-    child.stdout.on('data', (chunk) => this.feedRaw(chunk))
-    child.on('error', (error) => {
+    child.stdout.on('data', (chunk) => this.guard('feed-raw', () => this.feedRaw(chunk)))
+    child.on('error', (error) => this.guard('recorder-error', () => {
       this.error = String(error?.message ?? error)
       this.recorder = null
       this.scheduleRestart()
-    })
-    child.on('exit', (code) => {
+    }))
+    child.on('exit', (code) => this.guard('recorder-exit', () => {
       if (this.recorder === child) this.recorder = null
       this.closeRemuxer()
       if (this.stopping) return
@@ -512,23 +561,25 @@ export class LiveStream {
       }
       /* 正常到时长或编码器重启都走这里：换一份 moov，前端按 INIT 帧重建 MediaSource。 */
       if (this.clients.size > 0) this.broadcast(packFrame(FRAME_END, Buffer.alloc(0)))
+      /* 录满时长正常退出：screenrecord 已经不在了，只删自己的 pid 文件（不 kill，免 pid 复用误伤）。 */
+      if (code === 0) this.dropRecorderPidFile()
       if (wasIntentional && this.stopping) return
       this.scheduleRestart()
-    })
+    }))
   }
 
   /** 到点自动续上，避免中断超过半秒。 @returns {void} */
   scheduleRestart() {
     if (this.stopping || this.restartTimer !== null) return
     if (this.clients.size === 0 && this.waiting.size === 0) return
-    this.restartTimer = setTimeout(() => {
+    this.restartTimer = setTimeout(() => this.guard('restart', () => {
       this.restartTimer = null
       if (!this.stopping && (this.clients.size > 0 || this.waiting.size > 0)) {
-        /* 上一轮可能是被 SIGKILL 的 adb：先清掉设备端残留，再开新录屏。 */
-        if (this.sessions > 0) this.killStale()
+        /* 上一轮可能是被 SIGKILL 的 adb：先按自己的 pid 清掉设备端残留，再开新录屏。 */
+        this.killOwnRecorder()
         this.spawnRecorder()
       }
-    }, 120)
+    }), 120)
     this.restartTimer.unref?.()
   }
 
@@ -587,7 +638,7 @@ export class LiveStream {
       '-f', 'mp4', 'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     this.remuxer = child
-    child.stdout.on('data', (chunk) => this.feedMp4(chunk))
+    child.stdout.on('data', (chunk) => this.guard('feed-mp4', () => this.feedMp4(chunk)))
     child.stderr.on('data', (buf) => {
       const text = String(buf).trim()
       if (text !== '') this.error = text.slice(-300)
@@ -776,6 +827,8 @@ export class LiveStream {
     this.closeJpeg()
     const child = this.recorder
     this.recorder = null
+    /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */
+    this.killOwnRecorder()
     if (child !== null) {
       try {
         child.kill('SIGKILL')
@@ -785,8 +838,6 @@ export class LiveStream {
     }
     this.intentional = true
     this.stopping = false
-    /* 本地杀进程不等于设备端停了：显式收掉，否则下一次开流会撞上另一个录屏在跑。 */
-    if (this.sessions > 0) this.killStale()
     this.init = null
     this.lastKeyChunks = []
     this.waiting.clear()

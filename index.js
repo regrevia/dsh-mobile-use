@@ -22,8 +22,8 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=164'
-import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=115'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=166'
+import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=116'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
 export const name = 'adb'
@@ -86,12 +86,13 @@ function adb(args, options = {}) {
       const cmd = args.slice(shellAt + 1).join(' ')
       return sh(serial, cmd, timeout).then((result) => ({
         ok: result.ok,
-        code: result.ok ? 0 : 1,
+        code: result.code ?? (result.ok ? 0 : 1),
         out: result.out,
         raw: Buffer.from(result.out, 'utf8'),
         err: result.err ?? '',
         ms: result.ms,
-        timedOut: false,
+        /* 超时/通道断：命令可能已经执行了一半，调用方不能当「确定没做」处理。 */
+        timedOut: result.uncertain === true,
       }))
     }
   }
@@ -221,6 +222,62 @@ function dshSleep(ms) {
 /** WebView 调试口转发缓存：`serial/pid` → 本机端口。 */
 const webPorts = new Map()
 
+/** 自己建的转发：`serial|本机端` → { serial, local, remote }，退出时只删自己建的。 @type {Map<string, {serial: string, local: string, remote: string}>} */
+const ownedForwards = new Map()
+
+/**
+ * 解析 `adb forward --list`，每行形如 `序列号 tcp:19108 tcp:9008`。
+ * `-s` 只决定新建的转发挂在哪台设备上，列表本身是所有设备的，所以必须自己按序列号过滤。
+ * @param {string} text - 命令输出。
+ * @returns {Array<{ serial: string, local: string, remote: string }>} 转发条目。
+ */
+function parseForwards(text) {
+  const rows = []
+  for (const line of String(text).split('\n')) {
+    const matched = /^(\S+)\s+(tcp:\d+|localabstract:\S+|localreserved:\S+|local:[\w.-]+)\s+(\S+)\s*$/.exec(line.trim())
+    if (matched === null) continue
+    rows.push({ serial: matched[1], local: matched[2], remote: matched[3] })
+  }
+  return rows
+}
+
+/**
+ * 在转发列表里找指定设备的某条转发。
+ * @param {string} text - `adb forward --list` 输出。
+ * @param {string} serial - 设备序列号。
+ * @param {string} remote - 设备端目标（如 `tcp:9008`、`localabstract:webview_devtools_remote_123`）。
+ * @returns {{ serial: string, local: string, remote: string } | null} 命中条目。
+ */
+function forwardFor(text, serial, remote) {
+  return parseForwards(text).find((row) => row.serial === serial && row.remote === remote) ?? null
+}
+
+/**
+ * 记下自己建的转发，退出时只删这些。
+ * @param {string} serial - 设备。
+ * @param {string} local - 本机端（`tcp:19108`）。
+ * @param {string} remote - 设备端。
+ * @returns {void}
+ */
+function ownForward(serial, local, remote) {
+  ownedForwards.set(`${serial}|${local}`, { serial, local, remote })
+}
+
+/**
+ * 删掉自己建的转发：只删记过的，别人的（或别的设备的）不动。
+ * @param {string} serial - 设备。
+ * @param {string} [local] - 本机端；不写就删这台设备所有自己建的。
+ * @returns {Promise<void>} 删完返回。
+ */
+async function releaseForward(serial, local) {
+  for (const [key, entry] of [...ownedForwards]) {
+    if (entry.serial !== serial) continue
+    if (local !== undefined && entry.local !== local) continue
+    ownedForwards.delete(key)
+    await adb(['-s', serial, 'forward', '--remove', entry.local], { timeout: 4000 })
+  }
+}
+
 /**
  * 找 App 的 WebView 调试口，必要时建 adb forward。
  * @param {string} device - 设备序列号。
@@ -239,13 +296,25 @@ async function webTarget(device, packageName) {
   }
   const socketPid = socketName.slice('webview_devtools_remote_'.length)
   const key = `${device}/${socketPid}`
+  const remote = `localabstract:${socketName}`
   const cachedPort = webPorts.get(key)
-  if (cachedPort) return { pid, port: cachedPort, socketPid }
-  const forward = await adb(['-s', device, 'forward', 'tcp:0', `localabstract:${socketName}`], { timeout: 6000 })
+  if (cachedPort) {
+    /* 缓存端口只在「仍是这台设备、仍指向这个 socket」时复用，否则别的设备的转发会被拿来用。 */
+    const rows = await adb(['-s', device, 'forward', '--list'], { timeout: 6000 })
+    const hit = forwardFor(rows.out, device, remote)
+    const port = hit === null ? 0 : Number(hit.local.replace(/^tcp:/, ''))
+    if (Number.isFinite(port) && port > 0) {
+      webPorts.set(key, port)
+      return { pid, port, socketPid }
+    }
+    webPorts.delete(key)
+  }
+  const forward = await adb(['-s', device, 'forward', 'tcp:0', remote], { timeout: 6000 })
   const port = Number((forward.out || '').trim())
   if (!Number.isFinite(port) || port <= 0) {
     throw new Error(`WebView 调试口转发失败：${oneLine(forward.err || forward.out, 140)}`)
   }
+  ownForward(device, `tcp:${port}`, remote)
   webPorts.set(key, port)
   return { pid, port, socketPid }
 }
@@ -331,58 +400,121 @@ function openShell(serial) {
   return channel
 }
 
+/** 只读命令的首词：只读设备状态，失败后重跑一遍不会改设备，可以安全重试。 */
+const READ_ONLY_HEADS = new Set([
+  'cat', 'ls', 'getprop', 'dumpsys', 'pidof', 'ps', 'top', 'stat', 'wc', 'head', 'tail',
+  'grep', 'sed', 'awk', 'echo', 'printf', 'date', 'id', 'whoami', 'uname', 'uptime',
+  'df', 'du', 'logcat', 'uiautomator', 'screencap', 'test', '[', 'true', 'false',
+  'sleep', 'which', 'find', 'getevent', 'netstat', 'ip', 'lsusb', 'dmesg',
+])
+
+/** 明确会改设备状态的首词：超时后一律不重放（点一次再点一次就是两下）。 */
+const WRITE_HEADS = new Set([
+  'input', 'am', 'pm', 'svc', 'settings', 'cmd', 'rm', 'rmdir', 'mkdir', 'mv', 'cp',
+  'chmod', 'chown', 'kill', 'killall', 'monkey', 'screenrecord', 'nohup', 'app_process',
+  'setprop', 'reboot', 'shutdown', 'wm', 'su', 'sh', 'bash', 'touch', 'dd', 'tee',
+  'install', 'uninstall', 'ln',
+])
+
+/**
+ * 判断一条命令是不是「写状态」的：写命令超时后设备可能已经执行，重放会重复操作。
+ * 按 `; & |` 和换行拆成简单命令逐段判断；不认识的命令按写命令算（宁可不重试）。
+ * @param {string} cmd - shell 命令。
+ * @returns {boolean} 是否写了设备状态。
+ */
+function isWriteCommand(cmd) {
+  for (const raw of String(cmd).split(/[;&|\n]+/)) {
+    const segment = raw.trim().replace(/^\(+\s*/, '')
+    if (segment === '') continue
+    const [head, second] = segment.split(/\s+/)
+    if (WRITE_HEADS.has(head)) {
+      /* `wm size` 只是读分辨率，其余 wm 子命令都会改状态。 */
+      if (head === 'wm' && second === 'size') continue
+      return true
+    }
+    if (READ_ONLY_HEADS.has(head)) continue
+    return true
+  }
+  return false
+}
+
+/**
+ * 失败结果的给用户看的说法：超时和明确报错要分开，超时不能说成「没做成」。
+ * @param {string} what - 动作名。
+ * @param {{ out: string, uncertain?: boolean }} result - sh 的结果。
+ * @returns {string} 错误信息。
+ */
+function failureNote(what, result) {
+  if (result.uncertain) return `${what}超时：设备可能已经执行，先用 adb_ui 看界面再决定要不要重试（不会自动重放）。`
+  return `${what}失败：${oneLine(result.out || '命令超时', 160)}`
+}
+
 /**
  * 在常驻 shell 里跑一条命令。
+ * 命令包一层 `( … ) 2>&1` 让 stderr 也进输出，再用唯一标记夹住并在标记后写 `$?`：
+ * 读到标记和退出码才算跑完；没读到就是超时或通道断了，返回 code:null（不确定）。
  * @param {string} serial - 设备。
  * @param {string} cmd - shell 命令。
  * @param {number} timeout - 毫秒。
- * @returns {Promise<{ ok: boolean, out: string, ms: number }>} 结果。
+ * @returns {Promise<{ ok: boolean, code: number | null, out: string, ms: number, uncertain?: boolean }>} 结果。
  */
 function shellOnce(serial, cmd, timeout) {
   return new Promise((resolve) => {
     let channel = shellChannels.get(serial)
     if (channel === undefined || channel.dead) channel = openShell(serial)
-    const tag = `@S${(Math.random() * 1e9) | 0}@`
+    /* 标记只用字母数字：不进 printf 格式串，也不会被引号、百分号弄坏。 */
+    const token = `dsh${Date.now().toString(36)}${(Math.random() * 1e9) | 0}`
+    const marker = `@${token}:`
     const started = performance.now()
     let done = false
-    /** 收尾：只认第一次，顺手摘掉监听。 @param {string} out - 输出。 @param {boolean} ok - 是否成功。 @returns {void} */
-    const finish = (out, ok) => {
+    /**
+     * 收尾：只认第一次，顺手摘掉监听。
+     * @param {number | null} code - 退出码；null 表示没读到（超时或通道断了）。
+     * @param {string} out - 命令输出（stdout + stderr）。
+     * @returns {void}
+     */
+    const finish = (code, out) => {
       if (done) return
       done = true
       clearTimeout(timer)
       channel.onChunk = null
       channel.child.removeListener('exit', onExit)
-      resolve({ ok, out, ms: Math.round(performance.now() - started) })
+      const ms = Math.round(performance.now() - started)
+      if (code === null) resolve({ ok: false, code: null, out, ms, uncertain: true })
+      else resolve({ ok: code === 0, code, out, ms })
     }
     /** 子进程退出：这次命令等不到了。 @returns {void} */
-    const onExit = () => finish('', false)
+    const onExit = () => finish(null, '')
     channel.buf = ''
     channel.onChunk = (text) => {
-      const cut = text.indexOf(tag)
+      const cut = text.indexOf(marker)
       if (cut < 0) return
-      finish(text.slice(0, cut), true)
+      /* 标记可能被拆在两个 chunk 里，退出码还没收全就继续等。 */
+      const matched = /^(\d+)@/.exec(text.slice(cut + marker.length))
+      if (matched === null) return
+      finish(Number(matched[1]), text.slice(0, cut))
     }
     const timer = setTimeout(() => {
       killShell(serial)
-      finish('', false)
+      finish(null, '')
     }, timeout)
     timer.unref?.()
     channel.child.once('exit', onExit)
     try {
-      channel.child.stdin.write(`${cmd}; echo ${tag}\n`)
+      channel.child.stdin.write(`( ${cmd} ) 2>&1; printf '@${token}:%s@\\n' "$?"\n`)
     } catch {
       killShell(serial)
-      finish('', false)
+      finish(null, '')
     }
   })
 }
 
 /**
- * 跑一条 shell 命令：优先走常驻通道，失败退回一次性 `adb shell`。
+ * 跑一条 shell 命令：优先走常驻通道，只有「确定没执行」的读命令才退回一次性 `adb shell`。
  * @param {string} serial - 设备。
  * @param {string} cmd - shell 命令。
  * @param {number} timeout - 毫秒。
- * @returns {Promise<{ ok: boolean, out: string, ms: number }>} 结果。
+ * @returns {Promise<{ ok: boolean, code: number | null, out: string, ms: number, uncertain?: boolean, reason?: string }>} 结果。
  */
 async function sh(serial, cmd, timeout = 15_000) {
   const previous = shellQueues.get(serial) ?? Promise.resolve()
@@ -394,10 +526,20 @@ async function sh(serial, cmd, timeout = 15_000) {
   await previous
   try {
     const fast = await shellOnce(serial, cmd, timeout)
-    if (fast.ok) return fast
+    if (fast.code !== null) return fast
+    /* 没读到退出码：命令可能已经执行了一半。写命令重放就是重复点击/重复发送，不重试。 */
+    if (isWriteCommand(cmd)) {
+      return { ok: false, code: null, out: fast.out, ms: fast.ms, uncertain: true, reason: '超时，设备可能已执行' }
+    }
     const started = performance.now()
     const slow = await adb(['-s', serial, 'shell', cmd], { timeout, direct: true })
-    return { ok: slow.ok, out: slow.out, ms: Math.round(performance.now() - started) }
+    return {
+      ok: slow.ok,
+      code: slow.ok ? 0 : (slow.timedOut ? null : 1),
+      out: `${slow.out}${slow.err ?? ''}`,
+      ms: Math.round(performance.now() - started),
+      ...(slow.ok ? {} : { uncertain: slow.timedOut }),
+    }
   } finally {
     release()
   }
@@ -592,12 +734,18 @@ async function u2Start(serial) {
  */
 async function u2Port(serial) {
   const cached = u2Cache.get(serial)
-  if (cached && Date.now() - cached.at < 120_000 && await u2Alive(cached.port)) return cached.port
+  if (cached && Date.now() - cached.at < 120_000 && await u2Alive(cached.port)) {
+    /* 缓存端口也要先确认转发还在、而且属于这台设备：别的设备的转发会被误当成自己的。 */
+    const rows = await adb(['-s', serial, 'forward', '--list'], { timeout: 8000 })
+    if (forwardFor(rows.out, serial, `tcp:${U2_PORT}`) !== null) return cached.port
+    u2Cache.delete(serial)
+  }
   const list = await adb(['-s', serial, 'forward', '--list'], { timeout: 8000 })
-  const reused = new RegExp(`tcp:(\\d+) tcp:${U2_PORT}\\b`).exec(list.out)
-  if (reused && await u2Alive(Number(reused[1]))) {
-    u2Cache.set(serial, { port: Number(reused[1]), at: Date.now() })
-    return Number(reused[1])
+  const reused = forwardFor(list.out, serial, `tcp:${U2_PORT}`)
+  const reusedPort = reused === null ? 0 : Number(reused.local.replace(/^tcp:/, ''))
+  if (Number.isFinite(reusedPort) && reusedPort > 0 && await u2Alive(reusedPort)) {
+    u2Cache.set(serial, { port: reusedPort, at: Date.now() })
+    return reusedPort
   }
   /* `adb forward tcp:0` 在部分 adb 版本上直接失败（实测 37.0.1 返回非 0），
      所以自己挑几个端口试，能 ping 通即用。 */
@@ -608,6 +756,7 @@ async function u2Port(serial) {
       lastError = oneLine(created.err || created.out || `adb forward 退出码 ${created.code}`, 160)
       continue
     }
+    ownForward(serial, `tcp:${port}`, `tcp:${U2_PORT}`)
     if (!await u2Alive(port)) {
       try {
         await u2Start(serial)
@@ -781,10 +930,24 @@ async function foregroundActivity(serial) {
 }
 
 /**
- * 当前设备上最近一次文本树，用于把 ref 还原成坐标。
- * @type {Map<string, {refs: Array<{ref: number, node: any}>, at: number}>}
+ * 当前设备上最近一次界面快照，用于把 ref 还原成坐标。
+ * 快照带编号：ref 只在生成它的那次快照里有效，跨快照用同一个 ref 会点到别的地方。
+ * @type {Map<string, {snapshotId: string, serial: string, activity: string, at: number, refs: Array<{ref: number, node: any}>, nodes: any[], signature: string}>}
  */
 const lastTrees = new Map()
+
+/** 快照序号：只增不减，和时间戳一起组成快照编号。 */
+let snapshotSeq = 0
+
+/**
+ * 生成一次快照的编号。
+ * @param {string} serial - 设备。
+ * @returns {string} 形如 `R58C12A3:7:1730000000000`。
+ */
+function nextSnapshotId(serial) {
+  snapshotSeq += 1
+  return `${serial}:${snapshotSeq}:${Date.now()}`
+}
 /** 上一次 adb_ui 的行，changed_only 用来做差。 */
 const lastUiLines = new Map()
 
@@ -963,34 +1126,70 @@ async function dumpState(serial, options) {
   const signature = tree.lines.join('\n')
   const previous = lastTrees.get(serial)
   const changed = !previous || previous.signature !== signature
-  lastTrees.set(serial, { refs: tree.refs, nodes, at: Date.now(), signature, activity })
-  return { serial, activity, nodes, tree, changed, ms: Date.now() - started, source, ocrNote }
+  const at = Date.now()
+  const snapshotId = nextSnapshotId(serial)
+  lastTrees.set(serial, { snapshotId, serial, activity, at, refs: tree.refs, nodes, signature })
+  return { serial, activity, nodes, tree, changed, ms: at - started, source, ocrNote, snapshotId, generated_at: new Date(at).toISOString() }
 }
 
 /**
- * 找 ref 对应的节点。
+ * 校验手上这次快照还能用：没有快照、过期、或编号对不上都直接说清楚，不拿旧 ref 乱点。
+ * @param {string} serial - 设备。
+ * @param {string | undefined} snapshotId - 调用方带的快照编号（可省略）。
+ * @param {string} what - 用于错误信息的名词（ref / 文字）。
+ * @returns {any} 快照条目。
+ */
+function checkSnapshot(serial, snapshotId, what) {
+  const cached = lastTrees.get(serial)
+  if (!cached) throw new Error(`还没有界面快照：先调用 adb_ui 读一次界面，再用它给的 ${what}。`)
+  if (Date.now() - cached.at > REF_TTL_MS) throw new Error('界面快照已过期，请重新 adb_ui。')
+  if (snapshotId !== undefined && snapshotId !== null && String(snapshotId) !== '' && String(snapshotId) !== cached.snapshotId) {
+    throw new Error(`快照已变：你手上的是 ${snapshotId}，当前是 ${cached.snapshotId}（之后又 dump 过界面），先 adb_ui 看最新界面再操作。`)
+  }
+  return cached
+}
+
+/**
+ * 找 ref 对应的节点。ref 只在生成它的那次快照里有效，调用方应带上 snapshot_id。
  * @param {string} serial - 设备。
  * @param {number} ref - 引用号。
+ * @param {string} [snapshotId] - 调用方手上的快照编号。
  * @returns {any} 节点。
  */
-function nodeForRef(serial, ref) {
-  const cached = lastTrees.get(serial)
-  if (!cached) throw new Error('还没有界面树：先调用 adb_ui 读一次界面，再用它给的 ref 点击。')
-  if (Date.now() - cached.at > REF_TTL_MS) throw new Error('ref 已过期（超过 2 分钟或界面已变）：重新调用 adb_ui，用新的 ref。')
+function nodeForRef(serial, ref, snapshotId) {
+  const cached = checkSnapshot(serial, snapshotId, 'ref')
   const found = cached.refs.find((entry) => entry.ref === ref)
   if (!found) throw new Error(`没有 ref=${ref}：ref 编号每次 adb_ui 都会重新分配，用最新一次返回的编号。`)
   return found.node
 }
 
 /**
+ * 按文字/id 找控件前先拿到可用快照：缺失、过期、或当前页面已经换了一页就重新 dump 一次。
+ * 这比拿两分钟前的坐标去点安全，也比直接报错少一个模型回合。
+ * @param {string} serial - 设备。
+ * @param {string} [snapshotId] - 调用方带的快照编号；带了且对不上就直接报错，不偷偷换快照。
+ * @returns {Promise<any>} 快照条目。
+ */
+async function snapshotForSelector(serial, snapshotId) {
+  const cached = lastTrees.get(serial)
+  if (cached !== undefined && snapshotId !== undefined && snapshotId !== null && String(snapshotId) !== ''
+    && String(snapshotId) !== cached.snapshotId) {
+    throw new Error(`快照已变：你手上的是 ${snapshotId}，当前是 ${cached.snapshotId}（之后又 dump 过界面），先 adb_ui 看最新界面再操作。`)
+  }
+  if (cached === undefined || Date.now() - cached.at > REF_TTL_MS) return dumpState(serial, {})
+  const live = await foregroundActivity(serial).catch(() => '')
+  if (live !== '' && cached.activity !== '' && live !== cached.activity) return dumpState(serial, {})
+  return cached
+}
+
+/**
  * 按文字/资源 id/描述找节点。文字优先精确匹配，再退化为包含匹配。
  * @param {string} serial - 设备。
- * @param {{text?: string, id?: string, desc?: string}} want - 选择器。
+ * @param {{text?: string, id?: string, desc?: string, snapshotId?: string}} want - 选择器。
  * @returns {any} 节点。
  */
 function nodeForSelector(serial, want) {
-  const cached = lastTrees.get(serial)
-  if (!cached) throw new Error('还没有界面树：先调用 adb_ui 读一次界面，再按文字/id 点击。')
+  const cached = checkSnapshot(serial, want.snapshotId, '文字/id')
   const refs = cached.refs.map((entry) => entry.node)
   if (want.text) {
     const exact = refs.find((node) => node.text === want.text || node.desc === want.text)
@@ -1074,6 +1273,33 @@ function shellInputText(text) {
   }
   const escaped = text.replace(/ /g, '%s').replace(/'/g, `'\\''`)
   return { ok: true, value: `'${escaped}'` }
+}
+
+/**
+ * 往当前焦点输入框输入文字：能走 `input text` 就走（快），中文/emoji 走剪贴板粘贴。
+ * adb_input 与 adb_do 的 text 步骤共用这一条路径，避免两处各自只支持一半。
+ * @param {string} serial - 设备。
+ * @param {string} text - 要输入的文字。
+ * @returns {Promise<{how: 'input' | 'paste', steps: string[], field: string, note: string}>} 结果。
+ */
+async function inputTextVia(serial, text) {
+  const wanted = String(text)
+  const count = [...wanted].length
+  if (wanted === '') throw new Error('要输入的文字是空的。')
+  const encoded = shellInputText(wanted)
+  if (encoded.ok) {
+    const result = await sh(serial, `input text ${encoded.value}`, 15_000)
+    if (!result.ok) throw new Error(failureNote('输入', result))
+    return { how: 'input', steps: ['input text'], field: '', note: `已输入 ${count} 个字符` }
+  }
+  /* 中文没有 input text 可用：写剪贴板再长按粘贴，走的是系统输入法自己的通道。 */
+  const pasted = await typeViaClipboard(serial, wanted)
+  return {
+    how: 'paste',
+    steps: pasted.steps,
+    field: pasted.field,
+    note: `已粘贴 ${count} 个字符（${pasted.steps.join(' → ')}）`,
+  }
 }
 
 /**
@@ -1250,6 +1476,9 @@ export function apply(ctx, config) {
     mirror.stopAll()
     stopOcr()
     for (const device of [...shellChannels.keys()]) killShell(device)
+    /* 只拆本插件自己建的转发（按 serial 区分），别的设备/别的工具留的不要动。 */
+    const created = new Set([...ownedForwards.values()].map((item) => item.serial))
+    for (const device of created) void releaseForward(device).catch(() => {})
   }, 'adb: 实时镜像退出')
 
   ctx.effect(() => ctx.tools.register({
@@ -1286,9 +1515,11 @@ export function apply(ctx, config) {
           tree: { type: 'string' },
           changed: { type: 'boolean' },
           matched: { type: 'boolean' },
+          snapshot_id: { type: 'string' },
+          generated_at: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['serial', 'activity', 'summary', 'tree', 'changed', 'matched', 'elapsed_ms'],
+        required: ['serial', 'activity', 'summary', 'tree', 'changed', 'matched', 'snapshot_id', 'generated_at', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(`${value.summary}\n${value.tree}`),
@@ -1351,6 +1582,8 @@ export function apply(ctx, config) {
         tree: shown.join('\n') || '（没有匹配的控件）',
         changed: state.changed,
         matched,
+        snapshot_id: state.snapshotId,
+        generated_at: state.generated_at,
         elapsed_ms: Date.now() - started,
       }
     },
@@ -1362,7 +1595,8 @@ export function apply(ctx, config) {
     parameters: {
       type: 'object',
       properties: {
-        ref: { type: 'integer', description: 'adb_ui 返回的 ref 编号（只对最近一次 adb_ui 有效）' },
+        ref: { type: 'integer', description: 'adb_ui 返回的 ref 编号（只对生成它的那次快照有效，界面重新 dump 过就作废）' },
+        snapshot_id: { type: 'string', description: '可选：adb_ui 返回的 snapshot_id。带上就校验快照还是不是那次，对不上直接报错，不拿旧 ref 点。' },
         text: { type: 'string', description: '按钮/文字内容，精确匹配优先，其次包含匹配' },
         id: { type: 'string', description: '资源 id，可写全名或只写后半段，如 login_btn' },
         desc: { type: 'string', description: 'content-desc 内容' },
@@ -1404,11 +1638,15 @@ export function apply(ctx, config) {
         ;[x, y] = parts
         target = `坐标 ${x},${y}`
       } else {
-        /* 这次会话还没读过树就自动读一次：少一个来回，也不用先让模型调 adb_ui。 */
-        if (!lastTrees.has(device)) await dumpState(device, {})
-        const node = args.ref !== undefined
-          ? nodeForRef(device, Number(args.ref))
-          : nodeForSelector(device, { text: args.text, id: args.id, desc: args.desc })
+        /* ref 严格按快照校验：快照过期或之后又 dump 过就报错，不拿旧 ref 乱点。
+           按文字/id 点则允许自动重读：页面换了就 dump 一次再找，比拿旧坐标点安全。 */
+        let node
+        if (args.ref !== undefined) {
+          node = nodeForRef(device, Number(args.ref), args.snapshot_id)
+        } else {
+          await snapshotForSelector(device, args.snapshot_id)
+          node = nodeForSelector(device, { text: args.text, id: args.id, desc: args.desc, snapshotId: args.snapshot_id })
+        }
         const hit = clickTarget(nodesOf(device), node)
         x = Math.round((hit.x1 + hit.x2) / 2)
         y = Math.round((hit.y1 + hit.y2) / 2)
@@ -1418,12 +1656,20 @@ export function apply(ctx, config) {
       }
       /* 轻点用 input tap（一条命令 ~35ms）；长按只能靠 swipe 原地按住 600ms。 */
       if (args.dry_run) {
-        return { ok: true, target, message: `预演：会${args.long ? '长按' : '点击'} ${target}（没有真点）。确认无误去掉 dry_run 再点。`, elapsed_ms: Date.now() - started }
+        const activity = lastTrees.get(device)?.activity ?? await foregroundActivity(device).catch(() => '')
+        return {
+          ok: true,
+          target,
+          activity,
+          matched: true,
+          message: `预演：会${args.long ? '长按' : '点击'} ${target}（没有真点）。确认无误去掉 dry_run 再点。`,
+          elapsed_ms: Date.now() - started,
+        }
       }
       const r = args.long
         ? await sh(device, `input swipe ${x} ${y} ${x} ${y} 600`, 10_000)
         : await sh(device, `input tap ${x} ${y}`, 10_000)
-      if (!r.ok) throw new Error(`点击失败：${oneLine(r.out || '命令超时', 200)}`)
+      if (!r.ok) throw new Error(failureNote(args.long ? '长按' : '点击', r))
 
       lastActions.push({ at: Date.now(), what: `${args.long ? '长按' : '点击'} ${target}` })
       /* 点完顺手等结果：一次工具调用顶「点一下 + 再读一次树」，省一个模型回合。 */
@@ -1513,7 +1759,7 @@ export function apply(ctx, config) {
       for (const point of path.slice(1)) script.push(`sleep ${pause}`, `input motionevent MOVE ${point.join(' ')}`)
       script.push(`input motionevent UP ${path[path.length - 1].join(' ')}`)
       const r = await sh(device, script.join('; '), 30_000)
-      if (!r.ok) throw new Error(`手势失败：${oneLine(r.out || '命令超时', 200)}`)
+      if (!r.ok) throw new Error(failureNote('手势', r))
       lastActions.push({ at: Date.now(), what: `手势 ${points[0].join(',')}→${points[points.length - 1].join(',')}（${duration}ms）` })
       return {
         ok: true,
@@ -1529,7 +1775,7 @@ export function apply(ctx, config) {
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要输入的文字（ASCII）；先点中输入框再调用' },
+        text: { type: 'string', description: '要输入的文字（ASCII 直发，中文走剪贴板粘贴）；先点中输入框再调用' },
         key: { type: 'string', description: '按键名，如 ENTER、BACK、HOME、DEL、TAB、APP_SWITCH，或数字 keycode' },
         swipe: {
           type: 'array',
@@ -1558,30 +1804,22 @@ export function apply(ctx, config) {
       const started = Date.now()
       const messages = []
       if (args.clear) {
-        await sh(device, 'input keyevent KEYCODE_MOVE_END; for i in $(seq 40); do input keyevent KEYCODE_DEL; done', 20_000)
+        const cleared = await sh(device, 'input keyevent KEYCODE_MOVE_END; for i in $(seq 40); do input keyevent KEYCODE_DEL; done', 20_000)
+        if (!cleared.ok) throw new Error(failureNote('清空输入框', cleared))
         messages.push('已清空输入框')
       }
       if (args.text !== undefined) {
         const wanted = String(args.text)
-        const encoded = shellInputText(wanted)
-        if (!encoded.ok) {
-          /* 中文没有 input text 可用：写剪贴板再长按粘贴，走的是系统输入法自己的通道。 */
-          const pasted = await typeViaClipboard(device, wanted)
-          lastActions.push({ at: Date.now(), what: `粘贴文字 ${wanted.length} 字` })
-          messages.push(`已粘贴 ${wanted.length} 个字符（${pasted.steps.join(' → ')}）`)
-          if (pasted.field !== '') messages.push(`输入框现在是「${oneLine(pasted.field, 40)}」`)
-        } else {
-          const r = await sh(device, `input text ${encoded.value}`, 15_000)
-          if (!r.ok) throw new Error(`输入失败：${oneLine(r.out || '命令超时', 200)}`)
-          lastActions.push({ at: Date.now(), what: `输入文字 ${wanted.length} 字` })
-          messages.push(`已输入 ${wanted.length} 个字符`)
-        }
+        const typed = await inputTextVia(device, wanted)
+        lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${wanted.length} 字` : `输入文字 ${wanted.length} 字` })
+        messages.push(typed.note)
+        if (typed.field !== '') messages.push(`输入框现在是「${oneLine(typed.field, 40)}」`)
       }
       if (args.key !== undefined) {
         const key = String(args.key).trim()
         const name = /^\d+$/.test(key) ? key : key.toUpperCase()
         const r = await sh(device, `input keyevent ${name}`, 8000)
-        if (!r.ok) throw new Error(`按键失败：${oneLine(r.out || '命令超时', 200)}`)
+        if (!r.ok) throw new Error(failureNote(`按键 ${name}`, r))
         lastActions.push({ at: Date.now(), what: `按键 ${name}` })
         messages.push(`已按 ${name}`)
       }
@@ -1590,7 +1828,7 @@ export function apply(ctx, config) {
         if (values.length < 4) throw new Error('swipe 至少给 4 个数：x1,y1,x2,y2')
         const duration = values[4] ?? 300
         const r = await sh(device, `input swipe ${values.slice(0, 4).join(' ')} ${duration}`, 15_000)
-        if (!r.ok) throw new Error(`滑动失败：${oneLine(r.out || '命令超时', 200)}`)
+        if (!r.ok) throw new Error(failureNote('滑动', r))
         lastActions.push({ at: Date.now(), what: `滑动 ${values.slice(0, 4).join(',')}` })
         messages.push(`已滑动 ${values.slice(0, 4).join(',')}（${duration}ms）`)
       }
@@ -1695,10 +1933,12 @@ export function apply(ctx, config) {
         type: 'object',
         properties: {
           ok: { type: 'boolean' },
+          code: { type: 'integer' },
+          uncertain: { type: 'boolean' },
           output: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'output', 'elapsed_ms'],
+        required: ['ok', 'code', 'uncertain', 'output', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.output),
@@ -1712,8 +1952,13 @@ export function apply(ctx, config) {
         ? await adb(['-s', device, 'shell', cmd], { timeout: wait, buffer: 16 << 20 })
         : await sh(device, cmd, wait)
       const body = `${r.out}${r.err ?? ''}`.trim()
-      const output = body.length > OUTPUT_LIMIT ? `${body.slice(0, OUTPUT_LIMIT)}\n…（截断，原长 ${body.length} 字符）` : body
-      return { ok: r.ok, output: output || '（无输出）', elapsed_ms: r.ms }
+      const cut = body.length > OUTPUT_LIMIT ? `${body.slice(0, OUTPUT_LIMIT)}\n…（截断，原长 ${body.length} 字符）` : body
+      /* 退出码和「超时但可能已执行」都要写出来：只看 ok 会把失败的命令当成成功。 */
+      const notes = []
+      if (typeof r.code === 'number' && r.code !== 0) notes.push(`退出码 ${r.code}`)
+      if (r.uncertain) notes.push('命令超时：设备可能已经执行，先看界面或日志确认结果，再决定要不要重试（不会自动重放）。')
+      const output = `${cut || '（无输出）'}${notes.length > 0 ? `\n${notes.join('\n')}` : ''}`
+      return { ok: r.ok, code: typeof r.code === 'number' ? r.code : -1, uncertain: r.uncertain === true, output, elapsed_ms: r.ms }
     },
   }), 'adb: adb_sh')
 
@@ -1738,7 +1983,7 @@ export function apply(ctx, config) {
               id: { type: 'string', description: '按资源 id 点' },
               swipe: { type: 'array', items: { type: 'integer' }, description: '滑动 [x1,y1,x2,y2,毫秒]' },
               key: { type: 'string', description: '按键名：BACK / HOME / ENTER，或 keycode 数字' },
-              text: { type: 'string', description: '往焦点输入框输入（仅 ASCII）' },
+              text: { type: 'string', description: '往焦点输入框输入文字（ASCII 直发，中文走剪贴板粘贴；先点中输入框让它获得焦点）' },
               action: { type: 'string', description: '系统动作：home / back / recents / lock / wake / notifications / quick_settings' },
               wait_text: { type: 'string', description: '等这段文字出现再做下一步' },
               wait_gone: { type: 'string', description: '等这段文字消失再做下一步' },
@@ -1782,7 +2027,8 @@ export function apply(ctx, config) {
             const parts = String(step.tap).split(',').map((value) => Number(value.trim()))
             point = { x: parts[0], y: parts[1] }
           } else {
-            if (!lastTrees.has(device)) await dumpState(device, {})
+            /* 按文字/id 点之前先确认快照还对应现在的界面，页面换了就重新 dump，不拿旧坐标点。 */
+            await snapshotForSelector(device)
             node = nodeForSelector(device, { text: step.tap, id: step.id })
           }
           let target
@@ -1795,7 +2041,7 @@ export function apply(ctx, config) {
             target = { x, y, label: `「${oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)}」@${x},${y}` }
           }
           const r = await sh(device, `input tap ${target.x} ${target.y}`, 10_000)
-          if (!r.ok) throw new Error(`第 ${at} 步点击失败：${oneLine(r.out || '命令超时', 160)}`)
+          if (!r.ok) throw new Error(`第 ${at} 步${failureNote('点击', r)}`)
           lastActions.push({ at: Date.now(), what: `点击 ${target.label}` })
           done.push(`点 ${target.label}`)
         } else if (step.swipe !== undefined) {
@@ -1803,24 +2049,23 @@ export function apply(ctx, config) {
           if (!Array.isArray(s4) || s4.length < 4) throw new Error(`第 ${at} 步 swipe 要写 [x1,y1,x2,y2,毫秒]。`)
           const ms = s4[4] ?? 300
           const r = await sh(device, `input swipe ${s4[0]} ${s4[1]} ${s4[2]} ${s4[3]} ${ms}`, 15_000)
-          if (!r.ok) throw new Error(`第 ${at} 步滑动失败：${oneLine(r.out || '命令超时', 160)}`)
+          if (!r.ok) throw new Error(`第 ${at} 步${failureNote('滑动', r)}`)
           done.push(`滑 ${s4[0]},${s4[1]}→${s4[2]},${s4[3]}`)
         } else if (step.key !== undefined) {
           const code = /^\d+$/.test(String(step.key)) ? String(step.key) : String(step.key).toUpperCase()
           const r = await sh(device, `input keyevent ${code}`, 10_000)
-          if (!r.ok) throw new Error(`第 ${at} 步按键失败：${oneLine(r.out || '命令超时', 160)}`)
+          if (!r.ok) throw new Error(`第 ${at} 步${failureNote(`按键 ${code}`, r)}`)
           done.push(`键 ${code}`)
         } else if (step.text !== undefined) {
-          const bad = [...String(step.text)].filter((char) => char.charCodeAt(0) > 127)
-          if (bad.length > 0) throw new Error(`第 ${at} 步含非 ASCII 字符（${[...new Set(bad)].slice(0, 5).join('')}），adb input text 不支持中文。`)
-          const r = await sh(device, `input text '${String(step.text).replace(/'/g, "'\\''")}'`, 15_000)
-          if (!r.ok) throw new Error(`第 ${at} 步输入失败：${oneLine(r.out || '命令超时', 160)}`)
+          /* 与 adb_input 共用一条路径：ASCII 走 input text，中文走剪贴板粘贴。 */
+          const typed = await inputTextVia(device, String(step.text))
+          lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${String(step.text).length} 字` : `输入文字 ${String(step.text).length} 字` })
           done.push(`输入 ${oneLine(String(step.text), 20)}`)
         } else if (step.action !== undefined) {
           const cmd = ACTION_MAP[step.action]
           if (cmd === undefined) throw new Error(`第 ${at} 步 action 不认识：${step.action}`)
           const r = await sh(device, cmd, 12_000)
-          if (!r.ok) throw new Error(`第 ${at} 步系统动作失败：${oneLine(r.out || '命令超时', 160)}`)
+          if (!r.ok) throw new Error(`第 ${at} 步${failureNote('系统动作', r)}`)
           done.push(step.action)
         }
 
@@ -1852,6 +2097,7 @@ export function apply(ctx, config) {
       type: 'object',
       properties: {
         ref: { type: 'integer', description: '目标控件 ref，来自最近一次 adb_ui（和 text/id 三选一）' },
+        snapshot_id: { type: 'string', description: '可选：adb_ui 返回的 snapshot_id；带上就校验 ref 属于那次快照，对不上直接报错' },
         text: { type: 'string', description: '目标控件文字' },
         id: { type: 'string', description: '目标控件资源 id' },
         duration_ms: { type: 'integer', description: '采样时长，默认 2000，上限 20000' },
@@ -1866,7 +2112,7 @@ export function apply(ctx, config) {
               tap: { type: 'string', description: '文字内容，或 "x,y" 坐标' },
               swipe: { type: 'array', description: '滑动 [x1,y1,x2,y2,毫秒]', items: { type: 'integer' } },
               id: { type: 'string', description: '资源 id' },
-              text: { type: 'string', description: '要输入的文字（ASCII）' },
+              text: { type: 'string', description: '要输入的文字（ASCII 直发，中文走剪贴板粘贴；先点中输入框）' },
               action: { type: 'string', description: '系统动作，同 adb_action' },
             },
             additionalProperties: false,
@@ -1898,8 +2144,14 @@ export function apply(ctx, config) {
       const began = Date.now()
       const duration = Math.min(Math.max(args.duration_ms ?? 2000, 300), 20_000)
       const wantedFps = Math.min(Math.max(args.fps ?? 6, 2), 10)
-      if (!lastTrees.has(device)) await dumpState(device, {})
-      const seed = args.ref !== undefined ? nodeForRef(device, args.ref) : nodeForSelector(device, { text: args.text, id: args.id })
+      /* 起始对象：ref 严格按快照校验，text/id 允许自动重读一次再找。 */
+      let seed
+      if (args.ref !== undefined) {
+        seed = nodeForRef(device, args.ref, args.snapshot_id)
+      } else {
+        await snapshotForSelector(device, args.snapshot_id)
+        seed = nodeForSelector(device, { text: args.text, id: args.id, snapshotId: args.snapshot_id })
+      }
       const key = { text: seed.text, id: seed.id, desc: seed.desc }
       const seedX = (seed.x1 + seed.x2) / 2
       const seedY = (seed.y1 + seed.y2) / 2
@@ -1958,7 +2210,7 @@ export function apply(ctx, config) {
                 continue
               }
               if (step.text !== undefined) {
-                await adb(['-s', device, 'shell', 'input', 'text', String(step.text).replace(/ /g, '%s')], { timeout: 8000 })
+                await inputTextVia(device, String(step.text))
                 continue
               }
               if (Array.isArray(step.swipe)) {
@@ -2588,7 +2840,7 @@ ctx.effect(() => ctx.tools.register({
         throw new Error('action 只能是 home / back / recents / lock / wake / rotate / notifications / quick_settings / night_mode。')
       }
       const r = await sh(device, cmd, 12_000)
-      if (!r.ok) throw new Error(`${label}失败：${oneLine(r.out || '命令超时', 200)}`)
+      if (!r.ok) throw new Error(failureNote(label, r))
       lastActions.push({ at: Date.now(), what: label })
       if (lastActions.length > 400) lastActions.splice(0, lastActions.length - 400)
       return { ok: true, summary: `${label}完成（${r.ms}ms）。界面变化用 adb_ui 确认。`, elapsed_ms: Date.now() - began }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-use",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": false,
   "description": "真机调试插件：界面文本树、动效数据、实时画面侧栏与圈选标注",
   "type": "module",
@@ -40,7 +40,8 @@
     "ocr_worker.py",
     ".env.example",
     "THIRD_PARTY_NOTICES.md",
-    "docs"
+    "docs",
+    "test"
   ],
   "license": "MIT",
   "author": "dsh-mobile-use contributors",
@@ -60,5 +61,8 @@
     "uiautomator",
     "mirror",
     "debugging"
-  ]
+  ],
+  "scripts": {
+    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs"
+  }
 }
