@@ -175,6 +175,8 @@ try {
     }
   }
   clearTimeout(timer)
+  /* abort 只断了读循环，连接还挂在池里会让本进程收不了尾（实测 selftest 打印完不退出）。 */
+  await reader.cancel().catch(() => {})
   /* 静态画面时 screenrecord 约 1 帧/秒，3 秒窗口可能一片都没有：初始化段到了就算链路通。 */
   if (init > 0) ok('推流链路可订阅', `init ${init} / media ${media} / ${Math.round(bytes / 1024)}KB`)
   else bad('推流没出片', `init ${init} / media ${media}`)
@@ -363,3 +365,7 @@ if (failures.length > 0) {
 } else {
   console.log('\n=== 全部通过 ===')
 }
+
+/* 宿主那边还有未关的长连接（/stream、/live），事件循环可能永远不空：
+   输出冲干净后按结果显式退出，别让外面只能靠 timeout 收尸。 */
+process.stdout.write('', () => process.exit(process.exitCode ?? 0))
