@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=143'
+import { LiveStream, packFrame } from './stream.js?v=146'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -1097,6 +1097,11 @@ export function setupMirror(ctx, tools) {
     let stream = streams.get(serial)
     if (stream === undefined) {
       stream = new LiveStream({ serial, adb: tools.adb.path })
+      /* 空闲回收前先问一句：镜像还有人在看（/live 常连或刚拉过帧）就别停。 */
+      stream.stillWanted = () => {
+        const mirror = mirrors.get(serial)
+        return mirror !== undefined && mirror.anyoneWatching()
+      }
       streams.set(serial, stream)
     }
     return stream
@@ -1673,6 +1678,8 @@ export function setupMirror(ctx, tools) {
           void stream.enableJpeg()
           /* 录屏到时长会停；每次有人拉帧都把它续上，否则画面就只剩抓帧那一路。 */
           void stream.start()
+          /* start() 会清空闲定时器，所以续命之后重新排一次：面板关掉 20 秒后自动停录。 */
+          stream.scheduleIdleStop()
         })
         const pump = () => {
           const jpeg = stream.jpeg

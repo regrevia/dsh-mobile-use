@@ -232,6 +232,8 @@ export class LiveStream {
     this.stopping = false
     this.restartTimer = null
     this.clients = new Set()
+    /* 由 mirror 装上：问一句「镜像那边还有人在看吗」，空闲回收时用。 */
+    this.stillWanted = null
     this.init = null
     this.pending = Buffer.alloc(0)
     /** 待拼的 box 字节。 @type {Buffer} */
@@ -311,11 +313,17 @@ export class LiveStream {
   /** 有人要看 JPEG 帧时才起解码器：不看不花 CPU。 @returns {boolean} 是否可用（解码器起来后 300 ms 内有帧）。 */
   enableJpeg() {
     this.jpegWantedAt = Date.now()
-    if (this.jpegChild !== null) return true
+    /* 只看帧（/frame 轮询）也会起录屏：没人再来取帧就按同一套宽限停掉，否则设备一直在录。
+       必须排在这里之后：start() 会清掉空闲定时器（它以为有人回来了）。 */
+    if (this.jpegChild !== null) {
+      this.scheduleIdleStop()
+      return true
+    }
     if (this.stopping) return false
     if (Date.now() - this.jpegOpenAt < 2000) return false
     this.jpegOpenAt = Date.now()
     this.start()
+    this.scheduleIdleStop()
     LiveStream.reapJpeg(this.serial)
     const child = spawn('ffmpeg', [
       '-hide_banner', '-loglevel', 'error',
@@ -398,12 +406,24 @@ export class LiveStream {
   }
 
   /** 观众都走了：留一段宽限再停，重开侧栏就不用重新起流。 @returns {void} */
-  scheduleIdleStop() {
+  scheduleIdleStop(delayMs = IDLE_GRACE_MS) {
     if (this.idleTimer !== null) return
     this.idleTimer = setTimeout(() => this.guard('idle-stop', () => {
       this.idleTimer = null
-      if (this.clients.size === 0 && this.waiting.size === 0 && Date.now() - this.jpegWantedAt > IDLE_GRACE_MS) this.stop()
-    }), IDLE_GRACE_MS)
+      if (this.clients.size > 0 || this.waiting.size > 0) return
+      /* 只看帧的人每隔一秒来一次，取帧时间戳会被不断刷新；差多少补多少，不重复排满宽限。 */
+      /* 镜像那边还有常连观看者（/live）时不能停：它不走 clients，只靠这个回调说话。 */
+      if (typeof this.stillWanted === 'function' && this.stillWanted()) {
+        this.scheduleIdleStop()
+        return
+      }
+      const left = IDLE_GRACE_MS - (Date.now() - this.jpegWantedAt)
+      if (left > 250) {
+        this.scheduleIdleStop(left)
+        return
+      }
+      this.stop()
+    }), Math.max(0, delayMs))
     this.idleTimer.unref?.()
   }
 
