@@ -1,5 +1,5 @@
 /**
- * dsh-adb — 真机调试工具：用界面文本树代替截图驱动调试循环。
+ * dsh-mobile-use — 真机调试工具：用界面文本树代替截图驱动调试循环。
  *
  * 实测（小米平板 8 / 2136x3200，2026-10）：
  *   adb exec-out screencap -p         3.2s，8.9MB PNG，之后还要一次看图调用
@@ -11,7 +11,7 @@
  * 不会留下脏状态。界面树的 ref 缓存按设备序列号保存，`adb_tap` 的 ref 只在
  * 最近一次 `adb_ui` 之后有效（用时间戳检查，过期会明确报错而不是点错位置）。
  *
- * @module dsh-adb
+ * @module dsh-mobile-use
  */
 
 import { execFile, spawn } from 'node:child_process'
@@ -22,8 +22,8 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=148'
-import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=114'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=164'
+import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=115'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
 export const name = 'adb'
@@ -667,7 +667,7 @@ async function typeViaClipboard(serial, text) {
     jsonrpc: '2.0',
     id: 1,
     method: 'setClipboard',
-    params: [text, 'dsh-adb'],
+    params: [text, 'dsh-mobile-use'],
   }, 6000)
   let data
   try {
@@ -840,7 +840,7 @@ async function waitFor(serial, want, timeoutMs) {
 /** PNG 头签名，screencap 的输出前面偶尔带杂字节。 */
 const PNG_SIG_OCR = Buffer.from([0x89, 0x50, 0x4e, 0x47])
 const JPEG_SIG_OCR = Buffer.from([0xff, 0xd8, 0xff])
-const OCR_REMOTE = '/data/local/tmp/dsh-adb-ocr.jpg'
+const OCR_REMOTE = '/data/local/tmp/dsh-mobile-use-ocr.jpg'
 
 /**
  * 拿一张给 OCR 用的截图：设备端编 JPEG 再 cat 回来，比 `exec-out screencap -p` 快一个量级
@@ -882,7 +882,7 @@ async function ocrNodes(serial) {
     image = raw.subarray(at)
     ext = 'png'
   }
-  const path = join(tmpdir(), `dsh-adb-ocr-${Date.now()}.${ext}`)
+  const path = join(tmpdir(), `dsh-mobile-use-ocr-${Date.now()}.${ext}`)
   await writeFile(path, image).catch(() => {})
   let rects
   try {
@@ -1157,7 +1157,7 @@ async function screenshot(serial, options) {
     buffer = await cropJpeg(buffer, options.region)
     if (buffer.length < 100) throw new Error('裁切失败：区域超出画面？')
   }
-  const dir = join(tmpdir(), 'dsh-adb')
+  const dir = join(tmpdir(), 'dsh-mobile-use')
   await mkdir(dir, { recursive: true })
   const path = options.path || join(dir, `screen-${serial}-${Date.now()}.${jpeg ? 'jpg' : 'png'}`)
   await writeFile(path, buffer)

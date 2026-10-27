@@ -1,5 +1,5 @@
 /**
- * dsh-adb 自测：用假 ctx 拿工具定义，然后对真机跑一遍。
+ * dsh-mobile-use 自测：用假 ctx 拿工具定义，然后对真机跑一遍。
  * 默认只跑只读工具；加 --tap 会真的点一下「可点击节点」（会动到设备，小心）。
  *
  *   node selftest.mjs            # 只读
@@ -41,7 +41,7 @@ async function call(name, args = {}) {
   return { value, ms: Date.now() - started }
 }
 
-console.log(`\n=== dsh-adb selftest（${tools.size} 个工具已注册）===\n`)
+console.log(`\n=== dsh-mobile-use selftest（${tools.size} 个工具已注册）===\n`)
 
 console.log('[1] adb_device')
 const device = await call('adb_device')
@@ -111,7 +111,7 @@ ok('两步一次跑完', `${batch.value.steps} 步 / ${batch.ms}ms`)
 
 console.log('\n[13] 推流接口（/stream/info + /stream 3 秒）')
 /* 宿主端口会变：从环境变量取，默认当前的 GUI 端口。 */
-const base = process.env.DSH_ADB_BASE ?? 'http://127.0.0.1:' + (process.env.DSH_PORT ?? '55409') + '/dsh-adb'
+const base = process.env.DSH_ADB_BASE ?? 'http://127.0.0.1:' + (process.env.DSH_PORT ?? '55409') + '/dsh-mobile-use'
 const info = await fetch(`${base}/stream/info?serial=${encodeURIComponent(device.value.serial)}`).then((res) => res.json()).catch(() => null)
 if (info === null) bad('拿不到 /stream/info')
 else ok('/stream/info 可读', `codec=${info.codec || '(未开)'} clients=${info.clients}`)
@@ -288,7 +288,7 @@ try {
 }
 
 /* 页面侧的接口：没有 CDP 也能确认直播链路和「刚做了什么」是通的。 */
-const BASE = process.env.DSH_ADB_BASE ?? `http://127.0.0.1:${process.env.DSH_PORT ?? '55409'}/dsh-adb`
+const BASE = process.env.DSH_ADB_BASE ?? `http://127.0.0.1:${process.env.DSH_PORT ?? '55409'}/dsh-mobile-use`
 const probe = async (path, init) => {
   const response = await fetch(`${BASE}${path}`, { ...init, cache: 'no-store' })
   return { code: response.status, headers: response.headers, body: await response.json().catch(() => null) }

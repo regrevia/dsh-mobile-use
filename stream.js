@@ -219,8 +219,9 @@ export class LiveStream {
   constructor(options) {
     this.serial = options.serial
     this.adbPath = options.adb
-    this.width = options.width ?? 960
-    this.height = options.height ?? 640
+    /* 默认必须是竖屏比例：横屏录制出来的帧和抓帧帧比例不同，侧栏画面就会一大一小跳。 */
+    this.width = options.width ?? 720
+    this.height = options.height ?? 1280
     this.bitrate = options.bitrate ?? 4_000_000
     this.recorder = null
     this.remuxer = null
@@ -262,6 +263,47 @@ export class LiveStream {
     this.jpegWantedAt = 0
   }
 
+  /**
+   * 按设备物理尺寸定录屏尺寸：长边封顶 1280，保持竖屏比例，宽高取偶数。
+   * 尺寸变了要重开录屏换新 IDR，否则编码器还按旧尺寸出帧。
+   * @param {number} w - `wm size` 报的宽。
+   * @param {number} h - `wm size` 报的高。
+   * @returns {boolean} 尺寸有变化为 true。
+   */
+  configure(w, h) {
+    if (!(w > 0) || !(h > 0)) return false
+    const short = Math.min(w, h)
+    const long = Math.max(w, h)
+    const k = Math.min(1, 1280 / long)
+    const width = Math.max(2, Math.round((short * k) / 2) * 2)
+    const height = Math.max(2, Math.round((long * k) / 2) * 2)
+    if (width === this.width && height === this.height) return false
+    this.width = width
+    this.height = height
+    if (this.recorder !== null) this.rekey()
+    return true
+  }
+
+  /**
+   * 收掉上一次插件重载留下的 ffmpeg：旧模块实例不会自己清理，解码器会越积越多。
+   * @param {string} serial - 设备序列号。
+   * @returns {void}
+   */
+  static reapJpeg(serial) {
+    const registry = globalThis.__dshAdbJpeg
+    if (!(registry instanceof Map)) return
+    const seen = registry.get(serial)
+    if (!(seen instanceof Set)) return
+    for (const child of seen) {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        /* 已经退了 */
+      }
+    }
+    seen.clear()
+  }
+
   /** 有人要看 JPEG 帧时才起解码器：不看不花 CPU。 @returns {boolean} 是否可用（解码器起来后 300 ms 内有帧）。 */
   enableJpeg() {
     this.jpegWantedAt = Date.now()
@@ -270,12 +312,13 @@ export class LiveStream {
     if (Date.now() - this.jpegOpenAt < 2000) return false
     this.jpegOpenAt = Date.now()
     this.start()
+    LiveStream.reapJpeg(this.serial)
     const child = spawn('ffmpeg', [
       '-hide_banner', '-loglevel', 'error',
       '-flags', 'low_delay',
       '-f', 'h264', '-i', 'pipe:0',
-      /* 12 fps 够看清手指动作；720 高在侧栏里不糊，编码开销只有几十毫秒。 */
-      '-vf', 'fps=15,scale=-2:720',
+      /* 12 fps 够看清手指动作；960 高在展开的侧栏里也不糊，编码开销只有几十毫秒。 */
+      '-vf', 'fps=15,scale=-2:960',
       /* mjpeg 复用器会把 20 KB 级的帧攒在 avio 缓冲里，不加这个要等进程退出才吐一帧。 */
       '-flush_packets', '1',
       '-fps_mode', 'passthrough',
@@ -283,6 +326,10 @@ export class LiveStream {
       'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     this.jpegChild = child
+    if (!(globalThis.__dshAdbJpeg instanceof Map)) globalThis.__dshAdbJpeg = new Map()
+    if (!(globalThis.__dshAdbJpeg.get(this.serial) instanceof Set)) globalThis.__dshAdbJpeg.set(this.serial, new Set())
+    globalThis.__dshAdbJpeg.get(this.serial).add(child)
+    child.on('exit', () => globalThis.__dshAdbJpeg.get(this.serial)?.delete(child))
     child.stdout.on('data', (chunk) => this.feedJpeg(chunk))
     child.stderr.on('data', (buf) => {
       const text = String(buf).trim()

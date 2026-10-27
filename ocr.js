@@ -7,7 +7,7 @@
  * 资源：进程空闲 45 秒自动退出；一次识别实测 150–180 ms（1618×1080 帧），
  * 首次启动约 230 ms（Vision 模型加载）。
  *
- * @module dsh-adb/ocr
+ * @module dsh-mobile-use/ocr
  */
 
 import { spawn } from 'node:child_process'

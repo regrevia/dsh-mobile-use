@@ -1,5 +1,5 @@
 /**
- * dsh-adb · 实时镜像：把设备画面低帧率镜像到右侧栏，人手能直接点，
+ * dsh-mobile-use · 实时镜像：把设备画面低帧率镜像到右侧栏，人手能直接点，
  * 也能画个圈把「这段」连同坐标推回聊天。
  *
  * 数据通路（全部在本机，不经过任何外部服务）：
@@ -11,7 +11,7 @@
  * 由截图续帧，录制走分段文件；要看逐像素外观仍然走 adb_shot。
  * 没人看的时候一张都不抓，侧栏关掉就完全不动。
  *
- * @module dsh-adb/mirror
+ * @module dsh-mobile-use/mirror
  */
 
 import { execFile, spawn } from 'node:child_process'
@@ -20,10 +20,10 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=138'
+import { LiveStream, packFrame } from './stream.js?v=141'
 
 /** 客户端与宿主共用的路由前缀。 */
-export const ROUTE = '/dsh-adb'
+export const ROUTE = '/dsh-mobile-use'
 
 /** 最近一次标注里动效拼图的字节数，0 表示没凑够帧。 */
 let lastStripBytes = 0
@@ -191,7 +191,7 @@ const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 const JPEG_SIG = Buffer.from([0xff, 0xd8, 0xff])
 
 /** 设备端截图落点：同一台设备只留一份，覆盖写。 */
-const LIVE_SHOT = '/data/local/tmp/.dsh-adb-live.jpg'
+const LIVE_SHOT = '/data/local/tmp/.dsh-mobile-use-live.jpg'
 
 /* 页面代码的版本号：写在 client.rev 里。页面拿 /state 的 build 和自己带的对一下，
    不一致就自己重载，省掉「改一次客户端就要人按一次刷新」。 */
@@ -254,6 +254,8 @@ export class Mirror {
   constructor(serial, adb) {
     this.serial = serial
     this.adb = adb
+    /* 注入：桥接帧是否新鲜。 */
+    this.bridgeFresh = null
     this.frames = 0
     this.latest = null
     this.latestAt = 0
@@ -336,6 +338,8 @@ export class Mirror {
       return
     }
     this.idleSince = 0
+    /* 桥接帧够新就别再抓屏：两种源尺寸不同，混进同一池子画面会跳。 */
+    if (this.bridgeFresh !== null && this.bridgeFresh()) return
     /* 每个节拍最多补一张，让 3 张在飞时错开完成，画面才匀。 */
     if (this.inflight < CAPTURE_PARALLEL) {
       this.inflight += 1
@@ -486,6 +490,20 @@ export class Mirror {
    * @param {number} seconds - 录几秒（2–12）。
    * @returns {Promise<string | null>} 本地 mp4 路径；起不来时 null（例如直播正占着编码器）。
    */
+  /**
+   * 录像尺寸：跟设备竖屏同比例，长边 960。写死 960x640 是横屏 3:2，竖屏内容会被压扁。
+   * @returns {string} screenrecord 的 --size 参数。
+   */
+  recordSize() {
+    const p = this.physical
+    const short = Math.min(p.w > 0 ? p.w : 9, p.h > 0 ? p.h : 16)
+    const long = Math.max(p.w > 0 ? p.w : 9, p.h > 0 ? p.h : 16)
+    const k = 960 / long
+    const width = Math.max(2, Math.round((short * k) / 2) * 2)
+    const height = Math.max(2, Math.round((long * k) / 2) * 2)
+    return `${width}x${height}`
+  }
+
   async captureBurst(seconds = 4) {
     const span = Math.min(12, Math.max(2, Math.round(seconds)))
     const remote = `/sdcard/dsh-burst-${this.serial.replace(/[^\w.-]/g, '_')}.mp4`
@@ -493,7 +511,7 @@ export class Mirror {
     const t0 = Date.now()
     const recorded = await this.adb([
       '-s', this.serial, 'shell', 'screenrecord',
-      '--time-limit', String(span), '--bit-rate', '2000000', '--size', '960x640', remote,
+      '--time-limit', String(span), '--bit-rate', '2000000', '--size', this.recordSize(), remote,
     ], { timeout: (span + 15) * 1000, direct: true }).catch(() => null)
     if (!recorded || !recorded.ok) return null
     const t1 = Date.now()
@@ -873,7 +891,7 @@ export class Mirror {
       const recorded = await this.adb([
         '-s', this.serial, 'shell', 'screenrecord',
         '--time-limit', String(SEGMENT_SECONDS),
-        '--bit-rate', '2000000', '--size', '960x640', remote,
+        '--bit-rate', '2000000', '--size', this.recordSize(), remote,
       ], { timeout: (SEGMENT_SECONDS + 20) * 1000, direct: true })
       if (this.stopping) break
       if (!recorded.ok) {
@@ -1008,6 +1026,7 @@ export function setupMirror(ctx, tools) {
     let mirror = mirrors.get(serial)
     if (mirror === undefined) {
       mirror = new Mirror(serial, tools.adb)
+      mirror.bridgeFresh = () => streamFor(serial).jpegFresh()
       mirrors.set(serial, mirror)
     }
     return mirror
@@ -1188,6 +1207,230 @@ export function setupMirror(ctx, tools) {
     return { ok: true }
   }
 
+  /* 触摸屏直写：一条 input_event 24 字节（arm64：tv_sec i64 / tv_usec i64 /
+     type u16 / code u16 / value i32）。逐条 sendevent 在端上约 14 ms 一条，
+     一次两指捏合 30 条就要 0.4 s 以上；同一个手势拼成二进制流写设备节点，
+     14 帧实测 178 ms（含节拍），快一个量级，而且是设备上唯一能做多指的路子。 */
+  const touchNodes = new Map()
+
+  /** 一条 input_event。 */
+  function event24(type, code, value) {
+    const buf = Buffer.alloc(24)
+    buf.writeUInt16LE(type, 16)
+    buf.writeUInt16LE(code, 18)
+    buf.writeInt32LE(value, 20)
+    return buf
+  }
+
+  /** 设备开机秒数，注入事件的时间戳从它往前推。 */
+  async function uptime(serial) {
+    const read = await tools.adb(['-s', serial, 'shell', 'cat', '/proc/uptime'], { timeout: 6000, direct: true })
+    const hit = /([\d.]+)/.exec(String(read.out ?? ''))
+    return hit === null ? 0 : Number(hit[1])
+  }
+
+  /**
+   * 给一帧里的每条事件写同一个时间戳。内核按时间戳排序，全零会被当成远古事件。
+   * @param {Buffer} frame - 该帧字节。
+   * @param {number} at - 开机秒数。
+   * @returns {Buffer} 同一段字节，已写好时间。
+   */
+  function stampFrame(frame, at) {
+    const seconds = Math.floor(at)
+    const micros = Math.round((at - seconds) * 1e6)
+    for (let offset = 0; offset + 24 <= frame.length; offset += 24) {
+      frame.writeBigInt64LE(BigInt(seconds), offset)
+      frame.writeBigInt64LE(BigInt(micros), offset + 8)
+    }
+    return frame
+  }
+
+  /**
+   * 屏幕坐标换算成面板坐标。触摸面板固定在竖屏原生方向，画面一转就得换轴，
+   * 换了轴还要定镜像方向，差了就是「点哪儿都不对」。
+   * @param {{ w: number, h: number }} screen - 当前画面尺寸。
+   * @param {{ ax: number, ay: number }} range - ABS 量程。
+   * @param {number} rotation - 0 / 90 / 180 / 270。
+   * @returns {(x: number, y: number) => { x: number, y: number }} 换算函数。
+   */
+  function mapper(screen, range, rotation) {
+    const { w, h } = screen
+    if (rotation === 90) {
+      return (x, y) => ({ x: ((h - y) / h) * range.ax, y: (x / w) * range.ay })
+    }
+    if (rotation === 270) {
+      return (x, y) => ({ x: (y / h) * range.ax, y: ((w - x) / w) * range.ay })
+    }
+    if (rotation === 180) {
+      return (x, y) => ({ x: ((w - x) / w) * range.ax, y: ((h - y) / h) * range.ay })
+    }
+    return (x, y) => ({ x: (x / w) * range.ax, y: (y / h) * range.ay })
+  }
+
+  /** 当前画面方向，走一次 dumpsys，实测 30 ms。 */
+  async function rotationOf(serial) {
+    const result = await tools.adb(['-s', serial, 'shell',
+      'dumpsys window 2>/dev/null | grep -m1 -oE "mRotation=.{0,12}"'], { timeout: 8000, direct: true })
+    if (!result.ok) return 0
+    const hit = /ROTATION_(\d+)/.exec(String(result.out))
+    return hit === null ? 0 : Number(hit[1]) % 360
+  }
+
+  /**
+   * 找触摸屏节点和 ABS 量程，每台设备只探一次。
+   * @param {string} serial - 设备。
+   * @returns {Promise<{ node: string, ax: number, ay: number } | null>} 节点与量程。
+   */
+  async function touchInfo(serial) {
+    if (touchNodes.has(serial)) return touchNodes.get(serial)
+    const scan = await tools.adb(['-s', serial, 'shell',
+      'grep -ilE "touchscreen|capacitive" /sys/class/input/event*/device/name'], { timeout: 8000, direct: true })
+    if (!scan.ok) return null
+    const rows = String(scan.out).split('\n').map((line) => line.trim()).filter((line) => line.endsWith('/name'))
+    if (rows.length === 0) return null
+    /* 一部机器上常有两三个带 Touch 的节点（手写笔、虚拟键），电容屏才是要写的那个。 */
+    const event = /event\d+/.exec(rows[0])
+    if (event === null) return null
+    const node = '/dev/input/' + event[0]
+    const detail = await tools.adb(['-s', serial, 'shell', 'getevent', '-p', node], { timeout: 8000, direct: true })
+    if (!detail.ok) return null
+    const size = (code) => {
+      const hit = new RegExp('^\\s*' + code + '\\s*:.*max\\s+(\\d+)', 'm').exec(String(detail.out))
+      return hit === null ? 0 : Number(hit[1])
+    }
+    const info = { node, ax: size('0035'), ay: size('0036') }
+    if (info.ax < 1 || info.ay < 1) return null
+    touchNodes.set(serial, info)
+    return info
+  }
+
+  /**
+   * 一帧触摸数据，末尾一条 SYN_REPORT 收帧。
+   * @param {Array<{ slot: number, id: number, x: number, y: number }>} points - 该帧面板坐标；id 为 -1 表示抬起。
+   * @returns {Buffer} 该帧字节。
+   */
+  function touchFrame(points, touch) {
+    const parts = []
+    for (const point of points) {
+      parts.push(event24(3, 47, point.slot))
+      parts.push(event24(3, 57, point.id))
+      if (point.id < 0) continue
+      parts.push(event24(3, 53, Math.round(point.x)))
+      parts.push(event24(3, 54, Math.round(point.y)))
+      parts.push(event24(3, 58, 100))
+    }
+    if (touch === 1) parts.push(event24(1, 330, 1))
+    if (touch === 0) parts.push(event24(1, 330, 0))
+    parts.push(event24(0, 0, 0))
+    return Buffer.concat(parts)
+  }
+
+  /**
+   * 把整段帧按节拍写进设备：一次 shell 常驻，端上零进程开销。
+   * @param {string} serial - 设备。
+   * @param {Buffer[]} frames - 每帧字节。
+   * @param {number} ms - 整段时长。
+   * @param {string} node - 触摸屏节点。
+   * @returns {Promise<{ ok: boolean, reason?: string }>} 结果。
+   */
+  async function injectFrames(serial, frames, ms, node) {
+    const step = Math.max(4, Math.round(ms / Math.max(1, frames.length)))
+    const start = (await uptime(serial)) + 0.05
+    return new Promise((resolve) => {
+      const child = spawn(tools.adb.path, ['-s', serial, 'shell', 'cat > ' + node], { stdio: ['pipe', 'ignore', 'ignore'] })
+      let index = 0
+      let done = false
+      const finish = (result) => {
+        if (done) return
+        done = true
+        resolve(result)
+      }
+      child.on('error', (error) => finish({ ok: false, reason: String(error && error.message ? error.message : error).slice(0, 200) }))
+      child.on('exit', (code) => finish(code === 0 ? { ok: true } : { ok: false, reason: '退出码 ' + code }))
+      const tick = () => {
+        if (index >= frames.length) {
+          child.stdin.end()
+          return
+        }
+        child.stdin.write(stampFrame(frames[index], start + (index * step) / 1000))
+        index += 1
+        setTimeout(tick, step)
+      }
+      tick()
+      setTimeout(() => {
+        if (done) return
+        child.kill('SIGKILL')
+        finish({ ok: false, reason: '注入超时' })
+      }, ms + 4000)
+    })
+  }
+
+  /**
+   * 多指手势：每条轨迹是若干屏幕坐标点，所有轨迹同节拍推进，先全部抬起收尾。
+   * @param {string} serial - 设备。
+   * @param {number[][]} tracks - 每条轨迹的点列 [[x, y], ...]。
+   * @param {number} ms - 时长。
+   * @returns {Promise<{ ok: boolean, reason?: string }>} 结果。
+   */
+  async function gesture(serial, tracks, ms) {
+    const info = await touchInfo(serial)
+    if (info === null) return { ok: false, reason: '没有找到触摸屏' }
+    const rotation = await rotationOf(serial)
+    let screen = mirrorFor(serial).screen
+    if (screen === undefined || screen.w < 1 || screen.h < 1) {
+      /* 刚连上还没出画面时没有画面尺寸，退回物理尺寸再按方向换轴。 */
+      const probed = await tools.adb(['-s', serial, 'shell', 'wm', 'size'], { timeout: 6000, direct: true })
+      const found = /(\d+)x(\d+)/.exec(String(probed.out ?? ''))
+      if (found === null) return { ok: false, reason: '屏幕尺寸还没读到' }
+      const w = Number(found[1])
+      const h = Number(found[2])
+      screen = rotation === 90 || rotation === 270 ? { w: h, h: w } : { w, h }
+    }
+    const map = mapper(screen, info, rotation)
+    const count = Math.max(2, Math.min(40, Math.round(ms / 16)))
+    const frames = []
+    for (let index = 0; index <= count; index += 1) {
+      const t = index / count
+      const points = []
+      tracks.forEach((track, slot) => {
+        const raw = Math.min(track.length - 1, Math.round(t * (track.length - 1)))
+        const point = map(track[raw][0], track[raw][1])
+        points.push({ slot, id: 700 + slot, x: point.x, y: point.y })
+      })
+      frames.push(touchFrame(points, index === 0 ? 1 : undefined))
+    }
+    frames.push(touchFrame(tracks.map((_, slot) => ({ slot, id: -1, x: 0, y: 0 })), 0))
+    return injectFrames(serial, frames, ms, info.node)
+  }
+
+  /**
+   * 两指捏合 / 张开。
+   * @param {string} serial - 设备。
+   * @param {number} x - 中心点。
+   * @param {number} y - 中心点。
+   * @param {number} from - 起始两指间距。
+   * @param {number} to - 结束间距。
+   * @param {number} ms - 时长。
+   * @returns {Promise<{ ok: boolean, reason?: string }>} 结果。
+   */
+  function pinch(serial, x, y, from, to, ms) {
+    const ease = (t) => 1 - (1 - t) * (1 - t)
+    const at = (gap) => [
+      [x, y - gap / 2],
+      [x, y + gap / 2],
+    ]
+    const trackA = []
+    const trackB = []
+    const steps = 12
+    for (let index = 0; index <= steps; index += 1) {
+      const gap = from + (to - from) * ease(index / steps)
+      const pair = at(gap)
+      trackA.push(pair[0])
+      trackB.push(pair[1])
+    }
+    return gesture(serial, [trackA, trackB], ms)
+  }
+
   /**
    * 只认本机回环 + 同源：侧栏页面在 127.0.0.1 直连，别的网页没法借道操设备。
    * @param {import('node:http').IncomingMessage} req - 请求。
@@ -1332,13 +1575,20 @@ export function setupMirror(ctx, tools) {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         const mirror = mirrorFor(serial)
         mirror.lastWatchAt = Date.now()
-        void mirror.start()
+        const starting = mirror.start()
         const since = Number(url.searchParams.get('since') ?? '') || 0
         const wait = Math.min(2500, Math.max(0, Number(url.searchParams.get('wait') ?? '') || 0))
         /* H.264 桥接：screenrecord 已经在跑，让 ffmpeg 把它解成 JPEG 喂进同一个帧池。
            实测 screencap 一帧 867 ms，桥接后是解码延迟（几十毫秒），帧率上限也不再是 1 fps。 */
         const stream = streamFor(serial)
         void stream.enableJpeg()
+        /* 录屏尺寸必须跟设备真实竖屏比例一致：横着录出来的帧和抓帧帧比例不同，画面会一大一小跳。 */
+        void starting.then(() => {
+          if (mirror.physical.w > 0) stream.configure(mirror.physical.w, mirror.physical.h)
+          void stream.enableJpeg()
+          /* 录屏到时长会停；每次有人拉帧都把它续上，否则画面就只剩抓帧那一路。 */
+          void stream.start()
+        })
         const pump = () => {
           const jpeg = stream.jpeg
           if (jpeg !== null && stream.jpegAt > mirror.latestAt) mirror.accept(Buffer.from(jpeg))
@@ -1356,7 +1606,7 @@ export function setupMirror(ctx, tools) {
             if (frame === null) frame = await mirror.nextFrame(since, wait)
           } else {
             frame = await mirror.firstFrame(4000)
-            if (frame !== null && Date.now() - mirror.latestAt > 1200) frame = (await mirror.snapshot()) ?? frame
+            if (frame !== null && Date.now() - mirror.latestAt > 1200 && !stream.jpegFresh()) frame = (await mirror.snapshot()) ?? frame
           }
         } finally {
           if (pumpTimer !== null) clearInterval(pumpTimer)
@@ -1443,6 +1693,45 @@ export function setupMirror(ctx, tools) {
           String(Math.round(body.x2)), String(Math.round(body.y2)),
           String(Math.round(body.ms ?? 300)),
         ]))
+      }
+
+      if (path === '/gesture' && req.method === 'POST') {
+        const body = await readJson(req)
+        const serial = String(body.serial ?? '')
+        if (serial === '') return json({ ok: false, reason: '缺少参数' })
+        const tracks = Array.isArray(body.tracks) ? body.tracks : []
+        const ok = tracks.length > 0 && tracks.length <= 5
+          && tracks.every((track) => Array.isArray(track) && track.length > 1
+            && track.every((point) => Array.isArray(point) && point.length === 2
+              && Number.isFinite(Number(point[0])) && Number.isFinite(Number(point[1]))))
+        if (!ok) return json({ ok: false, reason: '轨迹格式不对' })
+        const ms = Math.max(16, Math.min(2000, Number(body.ms ?? 240)))
+        return json(await gesture(serial, tracks.map((track) => track.map((point) => [Number(point[0]), Number(point[1])])), ms))
+      }
+
+      if (path === '/raw' && req.method === 'POST') {
+        const body = await readJson(req)
+        const serial = String(body.serial ?? '')
+        if (serial === '') return json({ ok: false, reason: '缺少参数' })
+        const ms = Math.max(16, Math.min(2000, Number(body.ms ?? 200)))
+        return json(await gesture(serial, [[
+          [Number(body.x1 ?? 0), Number(body.y1 ?? 0)],
+          [Number(body.x2 ?? 0), Number(body.y2 ?? 0)],
+        ]], ms))
+      }
+
+      if (path === '/pinch' && req.method === 'POST') {
+        const body = await readJson(req)
+        const serial = String(body.serial ?? '')
+        if (serial === '') return json({ ok: false, reason: '缺少参数' })
+        const num = (value, fallback) => {
+          const n = Number(value)
+          return Number.isFinite(n) ? n : fallback
+        }
+        const from = Math.max(40, Math.min(1600, num(body.from, 520)))
+        const to = Math.max(40, Math.min(1600, num(body.to, 140)))
+        const ms = Math.max(80, Math.min(1200, num(body.ms, 280)))
+        return json(await pinch(serial, num(body.x, 0), num(body.y, 0), from, to, ms))
       }
 
       if (path === '/text' && req.method === 'POST') {
@@ -1607,7 +1896,7 @@ export const MIRROR_ROOT = ROOT
 export const SEGMENT = { seconds: SEGMENT_SECONDS, keep: SEGMENT_KEEP, fps: LIVE_FPS }
 
 /**
- * 【内部自测页】只在开发时用来验证 MSE 链路：打开 /dsh-adb/dev/mse 就能自己订阅 /stream。
+ * 【内部自测页】只在开发时用来验证 MSE 链路：打开 /dsh-mobile-use/dev/mse 就能自己订阅 /stream。
  * 产品界面走 client.js，这个页面不参与打包。
  */
 const DEV_MSE_PAGE = `<!doctype html><meta charset="utf-8"><title>MSE probe</title>
@@ -1648,7 +1937,7 @@ function push() {
 }
 v.addEventListener('loadeddata', () => { if (!shown) { shown = 1; first = performance.now() - t0 } })
 async function run() {
-  const res = await fetch('/dsh-adb/stream?serial=' + encodeURIComponent(serial))
+  const res = await fetch('/dsh-mobile-use/stream?serial=' + encodeURIComponent(serial))
   const rd = res.body.getReader()
   let buf = new Uint8Array(0)
   for (;;) {

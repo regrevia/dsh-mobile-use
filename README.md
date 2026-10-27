@@ -1,12 +1,12 @@
-# dsh-adb · 真机调试（ADB）
+# dsh-mobile-use · 真机调试（ADB）
 
 侧栏「实时ADB」：平板/手机画面按低帧率推进 DSH 右栏，鼠标点一下就是真机上点一下，在画面上圈一处再写一句话，带圈图和圈内控件一起回到会话里。插件内建，不需要额外 MCP、不需要独立 agent，也不上传任何画面——所有 HTTP 接口只监听 127.0.0.1，校验 peer / Host / Origin，伪造来源实测 403。
 
 ```bash
-git clone https://github.com/regrevia/dsh-adb.git dsh-adb
-cd dsh-adb
-# 在 DSH 里：plugin_manager action=install_bundle target=$HOME/dsh-adb
-# 或直接把它写进 profile 的 package.json 依赖： "dsh-adb": "link:$HOME/dsh-adb"
+git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
+cd dsh-mobile-use
+# 在 DSH 里：plugin_manager action=install_bundle target=$HOME/dsh-mobile-use
+# 或直接把它写进 profile 的 package.json 依赖： "dsh-mobile-use": "link:$HOME/dsh-mobile-use"
 ```
 
 环境变量（可选，都可不设）：`ADB`（adb 路径）、`ANDROID_SERIAL`（默认设备）、`FFMPEG`（转码路径）。见 `.env.example`。
@@ -125,7 +125,7 @@ cd dsh-adb
 
 ```bash
 # 一次性：装进当前 profile（对所有会话生效）
-# 在 DSH 里用 plugin_manager：action=install_bundle, target=$HOME/dsh-adb
+# 在 DSH 里用 plugin_manager：action=install_bundle, target=$HOME/dsh-mobile-use
 ```
 
 装完 `plugin_manager list_plugins` 里应出现 `include:adb`（`enabled=true`、`fiberPhase=active`）。
@@ -134,7 +134,7 @@ cd dsh-adb
 
 ```yaml
 - id: adb
-  name: dsh-adb
+  name: dsh-mobile-use
   config:
     serial: ""             # 固定设备序列号；留空则取 ANDROID_SERIAL，再退回第一台 online 设备
     adb: /opt/homebrew/bin/adb  # 可选；不写按常见路径探测

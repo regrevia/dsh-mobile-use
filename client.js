@@ -1,5 +1,5 @@
 /**
- * dsh-adb · 实时ADB 的页面半边。
+ * dsh-mobile-use · 实时ADB 的页面半边。
  *
  * 一栏给三种用法：
  *   · 看：设备画面按 4 帧/秒推过来，鼠标点一下就是真机上的点击，拖动就是滑动；
@@ -10,20 +10,20 @@
  */
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。 */
-window.__ADBM_BUILD = '146'
+window.__ADBM_BUILD = '151'
 
 window.__ModuleLoader__.load({
-  id: 'dsh-adb',
+  id: 'dsh-mobile-use',
   factory(require) {
     const React = require('react')
     const h = React.createElement
 
     const NS = 'adb-mirror'
     const KIND = 'adb-mirror' // ui-copy-ignore
-    const ID = 'dsh-adb'
+    const ID = 'dsh-mobile-use'
     const SLOT = 'sidebar.right.pane.tab'
     const TITLE_SLOT = 'sidebar.right.pane.tab.title'
-    const ROUTE = '/dsh-adb' // ui-copy-ignore
+    const ROUTE = '/dsh-mobile-use' // ui-copy-ignore
 
     const DICT = {
       zh: {
@@ -34,6 +34,8 @@ window.__ModuleLoader__.load({
         'act.send': '发送',
         'act.clear': '清除',
         'act.recent': '近几秒',
+        'empty.none': '没有连接设备，插上线就会自己出现',
+        'empty.gone': '设备已断开，插回来自动恢复',
         'state.starting': '画面准备中',
         'state.sent': '已发送',
         'state.failed': '发送失败',
@@ -56,6 +58,8 @@ window.__ModuleLoader__.load({
         'act.send': 'Send',
         'act.clear': 'Clear',
         'act.recent': 'Last seconds',
+        'empty.none': 'No device connected; plug one in',
+        'empty.gone': 'Device disconnected; plug it back in',
         'state.starting': 'Starting',
         'state.sent': 'Sent',
         'state.failed': 'Send failed',
@@ -90,27 +94,30 @@ window.__ModuleLoader__.load({
 
     const CSS = [
       '.adbm-body{display:flex;flex-direction:column;flex:1 1 auto;min-width:0;min-height:0;height:100%;gap:6px;padding:8px;background:var(--dsw-alias-bg-base)}',
-      '.adbm-bar{flex:none;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary);min-height:26px}',
-      '.adbm-btn{font:inherit;font-size:12px;padding:2px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-subtle);background:transparent;color:inherit;cursor:pointer}',
-      '.adbm-btn[data-on="1"]{border-color:var(--dsw-alias-label-success);color:var(--dsw-alias-label-success)}',
+      '.adbm-bar{flex:none;display:flex;align-items:center;flex-wrap:wrap;gap:6px;row-gap:4px;font-size:12px;color:var(--dsw-alias-label-secondary);min-height:26px}',
+      '.adbm-btn{font:inherit;font-size:12px;padding:2px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:inherit;cursor:pointer}',
+      '.adbm-btn[data-on="1"]{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}',
       '.adbm-btn[disabled]{opacity:.45;cursor:default}',
-      '.adbm-said{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}',
+  '.adbm-btn[data-primary="1"]{background:var(--dsw-alias-button-primary-fill);border-color:transparent;color:var(--dsw-alias-label-primary-inverted)}',
+  '.adbm-btn[data-primary="1"]:hover:not([disabled]){background:var(--dsw-alias-button-primary-hover);border-color:transparent}',
+      '.adbm-said{flex:1 1 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}',
       '.adbm-stage{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}',
-      '.adbm-frame{position:relative;display:inline-flex;max-width:100%;max-height:100%;line-height:0;transform-origin:0 0}',
+      '.adbm-frame{position:relative;flex:none;display:block;line-height:0;transform-origin:0 0}',
       '.adbm-keys{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-top:4px}',
-      '.adbm-key{font:inherit;font-size:12px;padding:2px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-subtle);background:transparent;color:inherit;cursor:pointer}',
+      '.adbm-key{font:inherit;font-size:12px;padding:2px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:inherit;cursor:pointer}',
       '.adbm-key:disabled{opacity:.4;cursor:default}',
       '.adbm-text{flex:1 1 120px;min-width:0}',
       '.adbm-log{flex:none;font-size:12px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.adbm-mark{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:999px;border:2px solid var(--dsw-alias-label-success);pointer-events:none;animation:adbm-ping .9s ease-out forwards}',
+      '.adbm-mark{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:999px;border:2px solid var(--dsw-alias-state-success-primary);pointer-events:none;animation:adbm-ping .9s ease-out forwards}',
       '@keyframes adbm-ping{from{transform:scale(.5);opacity:1}to{transform:scale(2.4);opacity:0}}',
-      '.adbm-img{display:block;max-width:100%;max-height:100%;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
-      '.adbm-video{display:block;max-width:100%;max-height:100%;background:#000;border-radius:6px;object-fit:contain}',
+      '.adbm-img{display:block;width:100%;height:100%;object-fit:contain;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
+      '.adbm-video{display:block;width:100%;height:100%;background:#000;border-radius:6px;object-fit:contain}',
       '.adbm-ink{position:absolute;inset:0;touch-action:none}',
       '.adbm-ink[data-mode="mark"]{cursor:crosshair}',
       '.adbm-ink[data-mode="tap"]{cursor:pointer}',
-      '.adbm-input{flex:none;font:inherit;font-size:12px;padding:5px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-subtle);background:transparent;color:inherit}',
-      '.adbm-title{white-space:nowrap}',
+      '.adbm-input{flex:none;font:inherit;font-size:12px;padding:5px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:inherit}',
+      '.adbm-empty{position:absolute;inset:auto 12px;margin:0;text-align:center;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary)}',
+  '.adbm-title{white-space:nowrap}',
     ].join('')
 
     /**
@@ -313,6 +320,9 @@ window.__ModuleLoader__.load({
       const [ready, setReady] = React.useState(false)
       const [screen, setScreen] = React.useState({ w: 0, h: 0 })
       const [frameSize, setFrameSize] = React.useState({ w: 0, h: 0 })
+      /* 画面框像素尺寸：只由容器和设备屏幕比例决定，帧尺寸变了也不动。 */
+      const [box, setBox] = React.useState({ w: 0, h: 0 })
+      const boxAt = React.useRef({ w: 0, h: 0 }) // ui-copy-ignore
       const [streaming, setStreaming] = React.useState(false)
       /* jpeg = 抓帧长轮询，mse = 持续推流；后者起来后前者自动停。 */
       const [engine, setEngine] = React.useState('jpeg')
@@ -334,6 +344,7 @@ window.__ModuleLoader__.load({
       const gesture = React.useRef(null) // ui-copy-ignore
       const panDrag = React.useRef(null) // ui-copy-ignore
       const wheel = React.useRef({ dy: 0, x: 0, y: 0, timer: 0 }) // ui-copy-ignore
+      const pinch = React.useRef({ dy: 0, x: 0, y: 0, timer: 0 }) // ui-copy-ignore
 
       /* 画布按显示尺寸重建，人画的线才和画面同尺度。 */
       const paint = React.useCallback(() => {
@@ -376,6 +387,33 @@ window.__ModuleLoader__.load({
           ink.fill()
         }
       }, [])
+
+      /* 画面框按设备屏幕比例装进 stage：推流帧和抓帧帧比例不同也不改框，交给 object-fit 留边。 */
+      React.useEffect(() => {
+        const stage = stageRef.current
+        if (stage === null) return undefined
+        const fit = () => {
+          const rect = stage.getBoundingClientRect()
+          const knows = screen.w > 0 && screen.h > 0
+          const aw = knows ? screen.w : 9
+          const ah = knows ? screen.h : 16
+          if (rect.width < 2 || rect.height < 2 || aw < 2 || ah < 2) return
+          const k = Math.min(rect.width / aw, rect.height / ah)
+          const next = { w: Math.max(2, Math.round(aw * k)), h: Math.max(2, Math.round(ah * k)) }
+          if (boxAt.current.w === next.w && boxAt.current.h === next.h) return
+          boxAt.current = next
+          setBox(next)
+          paint()
+        }
+        fit()
+        const watch = typeof ResizeObserver === 'function' ? new ResizeObserver(fit) : null
+        watch?.observe(stage)
+        window.addEventListener('resize', fit)
+        return () => {
+          watch?.disconnect()
+          window.removeEventListener('resize', fit)
+        }
+      }, [screen.w, screen.h, frameSize.w, frameSize.h, paint])
 
       /* 只在这一栏真的被人看见时收画面：切走、最小化、被别的页签盖住都停。 */
       React.useEffect(() => {
@@ -580,10 +618,17 @@ window.__ModuleLoader__.load({
         let n = 0
         const beat = () => {
           const img = imgRef.current
+          const size = (node) => {
+            const rect = node === null || node === undefined ? null : node.getBoundingClientRect()
+            return rect === null ? [0, 0] : [Math.round(rect.width), Math.round(rect.height)]
+          }
           n += 1
           report({
             event: 'pane',
             n,
+            stage: size(stageRef.current),
+            frame: size(frameRef.current),
+
             serial,
             streaming: streaming === true,
             img: img === null ? 'none' : String(img.getAttribute('src') ?? '').slice(-26),
@@ -801,6 +846,33 @@ window.__ModuleLoader__.load({
         if (mode === 'mark' || serial === '') return
         event.preventDefault()
         const point = pointOf(event)
+        if (event.altKey) {
+          /* 捏合：滚轮攒够一段再整段发，端上一次性写进触摸屏。 */
+          pinch.current.dy += event.deltaY
+          pinch.current.x = point.x
+          pinch.current.y = point.y
+          if (pinch.current.timer !== 0) return
+          pinch.current.timer = window.setTimeout(() => {
+            const { dy, x, y } = pinch.current
+            pinch.current = { dy: 0, x: 0, y: 0, timer: 0 }
+            if (Math.abs(dy) < 8) return
+            const at = devicePoint({ x, y })
+            const apart = dy < 0
+            fetch(`${ROUTE}/pinch`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                serial,
+                x: at.x,
+                y: at.y,
+                from: apart ? 140 : 520,
+                to: apart ? 520 : 140,
+                ms: 280,
+              }),
+            }).catch(() => setStatus(L('state.failed')))
+          }, 160)
+          return
+        }
         if (event.ctrlKey || event.metaKey) {
           zoomTo(zoom * (event.deltaY < 0 ? 1.15 : 1 / 1.15), point)
           return
@@ -927,9 +999,15 @@ window.__ModuleLoader__.load({
       const button = (value, label, onClick, extra) => h('button', {
         className: 'adbm-btn',
         'data-on': mode === value ? '1' : '0',
+        'data-primary': extra?.primary === true ? '1' : undefined,
         disabled: extra?.disabled === true,
         onClick,
       }, label)
+
+      const say = status !== '' ? status : (ready ? '' : L('state.starting'))
+      const empty = serial === ''
+        ? L('empty.none')
+        : (devices.includes(serial) ? '' : L('empty.gone'))
 
       return h('div', { className: 'adbm-body' },
         h('div', { className: 'adbm-bar' },
@@ -937,6 +1015,7 @@ window.__ModuleLoader__.load({
           button('tap', L('act.tap'), () => setMode(mode === 'tap' ? 'view' : 'tap')),
           h('button', {
             className: 'adbm-btn',
+            'data-primary': '1',
             disabled: !ready,
             onClick: send,
           }, L('act.send')),
@@ -946,7 +1025,7 @@ window.__ModuleLoader__.load({
             onClick: sendRecent,
           }, L('act.recent')),
           strokes.current.length > 0 ? h('button', { className: 'adbm-btn', onClick: clear }, L('act.clear')) : null,
-          h('span', { className: 'adbm-said' }, status || (ready ? '' : L('state.starting'))),
+          say === '' ? null : h('span', { className: 'adbm-said' }, say),
           devices.length > 1
             ? h('select', {
               className: 'adbm-input',
@@ -956,7 +1035,20 @@ window.__ModuleLoader__.load({
             : null,
         ),
         h('div', { className: 'adbm-stage', ref: stageRef }, // ui-copy-ignore
-          h('div', { className: 'adbm-frame', ref: frameRef, style: zoom === 1 ? undefined : { transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` } }, // ui-copy-ignore
+          empty === '' ? null : h('p', { className: 'adbm-empty' }, empty),
+          h('div', {
+            className: 'adbm-frame',
+            ref: frameRef,
+            style: (() => {
+              const frameStyle = {}
+              if (box.w > 0) {
+                frameStyle.width = `${box.w}px`
+                frameStyle.height = `${box.h}px`
+              }
+              if (zoom !== 1) frameStyle.transform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`
+              return frameStyle
+            })(), // ui-copy-ignore
+          },
             serial === ''
               ? null
               : h('video', {
@@ -1014,6 +1106,8 @@ window.__ModuleLoader__.load({
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('ENTER') }, L('key.enter')),
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('DEL') }, L('key.del')),
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('TAB') }, L('key.tab')),
+        ),
+        h('div', { className: 'adbm-keys' },
           h('button', { className: 'adbm-key', disabled: serial === '' || zoom === 1, onClick: () => zoomTo(1) }, L('act.fit')),
           h('button', { className: 'adbm-key', disabled: serial === '', 'data-on': zoom >= 2 ? '1' : '0', onClick: () => zoomTo(2) }, '2×'),
           h('button', { className: 'adbm-key', disabled: serial === '', 'data-on': zoom >= 3 ? '1' : '0', onClick: () => zoomTo(3) }, '3×'),
@@ -1042,22 +1136,22 @@ window.__ModuleLoader__.load({
         }
         ctx.effect(() => {
           const style = document.createElement('style')
-          style.id = 'dsh-adb-mirror-css'
+          style.id = 'dsh-mobile-use-mirror-css'
           style.dataset.pluginCss = ID
           style.textContent = CSS
           document.head.appendChild(style)
           return () => style.remove()
-        }, 'dsh-adb: 实时镜像样式')
+        }, 'dsh-mobile-use: 实时镜像样式')
 
         /* 右栏的登记处是页面级单例，而插件的模块可能被就地换过一次：旧实例注册的类型
            还在册，新实例再注册就会撞名，页签于是只长出个空壳。这里把整页重建一次，
            登记处和页面一起换新；同一页面 30 秒内只重建一次，避免来回跳。 */
         const reloadPage = (reason) => {
           try {
-            const last = Number(sessionStorage.getItem('dsh-adb.reload') ?? 0)
+            const last = Number(sessionStorage.getItem('dsh-mobile-use.reload') ?? 0)
             if (Date.now() - last < 30_000) return
             if (document.querySelector('[aria-modal="true"], dialog[open]') !== null) return
-            sessionStorage.setItem('dsh-adb.reload', String(Date.now()))
+            sessionStorage.setItem('dsh-mobile-use.reload', String(Date.now()))
             report({ event: 'reload', reason })
             location.reload()
           } catch {
@@ -1300,7 +1394,7 @@ window.__ModuleLoader__.load({
             try { source?.close() } catch { /* 已关 */ }
             for (const dispose of done.reverse()) { try { dispose?.() } catch { /* 已撤 */ } }
           }
-        }, 'dsh-adb: 实时镜像面板'))
+        }, 'dsh-mobile-use: 实时镜像面板'))
       },
     }
   },
