@@ -49,7 +49,7 @@ export const PLAYER_HTML = `<!doctype html>
   <button id="send" disabled>发到对话</button>
   <span id="status">连接中</span>
 </div>
-<div id="hint">按住拖一个框，松手后画面定住；点「发到对话」把这一块连同坐标、控件、操作时间线发给会话。</div>
+<div id="hint" class="on">点一下＝点按，按住拖动＝滑动，滚轮＝上下滑。</div>
 <script>
 (function () {
   var ROUTE = '/dsh-mobile-use'
@@ -58,9 +58,10 @@ export const PLAYER_HTML = `<!doctype html>
   var session = params.get('session') || localStorage.getItem('adb-session') || ''
   if (session !== '') localStorage.setItem('adb-session', session)
 
+  var stage = document.getElementById('stage')
   var video = document.getElementById('video')
   var canvas = document.getElementById('canvas')
-    var markBtn = document.getElementById('mark')
+  var markBtn = document.getElementById('mark')
   var send = document.getElementById('send')
   var status = document.getElementById('status')
   var hint = document.getElementById('hint')
@@ -439,19 +440,73 @@ export const PLAYER_HTML = `<!doctype html>
     try { window.location.reload() } catch (error) { /* 下次打开再说 */ }
   }, 6 * 3600 * 1000)
 
-  /* ---- 点击 → 设备坐标 ---- */
-  video.addEventListener('click', function (event) {
-    if (marking) return
+  /* ---- 鼠标直操作：点=点按，拖=滑动，按住=长按，滚轮=上下滑 ---- */
+  function devicePoint(event) {
     var box = video.getBoundingClientRect()
     var w = screen.w || video.videoWidth
     var h = screen.h || video.videoHeight
-    if (!w || !h) return
+    if (!w || !h || box.width < 8 || box.height < 8) return null
     var x = Math.round((event.clientX - box.left) / box.width * w)
     var y = Math.round((event.clientY - box.top) / box.height * h)
-    post('/tap', { serial: serial, x: x, y: y }).then(function (result) {
-      say(result && result.ok ? ('已点 ' + x + ',' + y + ' · ' + (result.engine || '')) : '点击失败')
+    return { x: Math.max(0, Math.min(w - 1, x)), y: Math.max(0, Math.min(h - 1, y)) }
+  }
+
+  var press = null
+  function onDown(event) {
+    if (marking || event.button !== 0) return
+    var at = devicePoint(event)
+    if (at === null) return
+    try { stage.setPointerCapture(event.pointerId) } catch (error) { /* 拿不到指针也能用 */ }
+    hint.classList.remove('on')
+    press = { at: at, x: event.clientX, y: event.clientY, t: Date.now(), track: [at], moved: false }
+  }
+  function onMove(event) {
+    if (press === null) return
+    if (!press.moved && Math.abs(event.clientX - press.x) + Math.abs(event.clientY - press.y) > 6) press.moved = true
+    if (!press.moved) return
+    var at = devicePoint(event)
+    if (at !== null) press.track.push(at)
+  }
+  function onUp(event) {
+    if (press === null) return
+    var held = press
+    press = null
+    var ms = Date.now() - held.t
+    if (!held.moved) {
+      /* 按住不放再松手是长按，快速按一下是点按。 */
+      if (ms >= 550) {
+        post('/gesture', { serial: serial, tracks: [[held.at]], ms: Math.min(1200, ms) }).then(function () {
+          say('长按 ' + held.at.x + ',' + held.at.y)
+        })
+        return
+      }
+      post('/tap', { serial: serial, x: held.at.x, y: held.at.y }).then(function (result) {
+        say(result && result.ok ? ('点 ' + held.at.x + ',' + held.at.y) : '点击失败')
+      })
+      return
+    }
+    var at = devicePoint(event)
+    if (at !== null) held.track.push(at)
+    var track = held.track.filter(function (point, index) {
+      return index === 0 || index === held.track.length - 1 || index % 3 === 0
     })
-  })
+    post('/gesture', { serial: serial, tracks: [track], ms: Math.max(80, Math.min(1200, ms)) }).then(function (result) {
+      say(result && result.ok ? ('滑动 ' + track.length + ' 点') : '滑动失败')
+    })
+  }
+  function onWheel(event) {
+    if (marking) return
+    event.preventDefault()
+    var at = devicePoint(event) || { x: Math.round((screen.w || 1080) / 2), y: Math.round((screen.h || 1920) / 2) }
+    var dy = Math.round(Math.max(-1200, Math.min(1200, event.deltaY * 4)))
+    if (dy === 0) return
+    post('/scroll', { serial: serial, x: at.x, y: at.y, dy: dy }).catch(function () { /* 滚动失败不刷状态 */ })
+  }
+  stage.addEventListener('pointerdown', onDown)
+  stage.addEventListener('pointermove', onMove)
+  stage.addEventListener('pointerup', onUp)
+  stage.addEventListener('pointercancel', function () { press = null })
+  stage.addEventListener('wheel', onWheel, { passive: false })
 
   /* ---- 圈选 ---- */
   markBtn.addEventListener('click', function () {
@@ -459,6 +514,9 @@ export const PLAYER_HTML = `<!doctype html>
     markBtn.setAttribute('aria-pressed', marking ? 'true' : 'false')
     hint.classList.toggle('on', marking)
     canvas.classList.toggle('on', marking)
+    hint.textContent = marking
+      ? '按住拖一个框，松手后画面定住；点「发到对话」把这一块连同坐标、控件、操作时间线发给会话。'
+      : '点一下＝点按，按住拖动＝滑动，滚轮＝上下滑。'
     if (marking) {
       var box = video.getBoundingClientRect()
       canvas.width = video.videoWidth || Math.round(box.width)

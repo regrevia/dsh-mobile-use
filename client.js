@@ -11,7 +11,7 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '171'
+window.__ADBM_BUILD = '174'
 
 /* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
    factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。

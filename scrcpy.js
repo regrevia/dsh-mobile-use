@@ -670,7 +670,7 @@ const DEFAULT_OPTIONS = {
      设备编码器忙不过来就直接变成操作延迟。侧栏画布只有几百像素宽，压到长边 1600 足够清晰。 */
   maxSize: 1600,
   maxFps: 0,
-  videoBitRate: 12_000_000,
+  videoBitRate: 16_000_000,
   logLevel: 'info',
   readyTimeoutMs: 15000,
   commandTimeoutMs: 20000,
