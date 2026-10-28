@@ -4035,6 +4035,7 @@ ctx.effect(() => ctx.tools.register({
         selected: Boolean(node.selected),
         focused: Boolean(node.focused),
         scrollable: Boolean(node.scrollable),
+        password: Boolean(node.password),
       }
     })
     const lines = matches.map((item) => {
@@ -4045,8 +4046,12 @@ ctx.effect(() => ctx.tools.register({
       if (item.id) parts.push('#' + shortId(item.id))
       parts.push(`[${item.rect[2]}×${item.rect[3]} @${item.point}]`)
       if (item.clickable) parts.push('*')
+      if (item.scrollable) parts.push('~')
       if (!item.enabled) parts.push('[off]')
       if (item.checked) parts.push('[x]')
+      else if (item.selected) parts.push('[s]')
+      if (item.focused) parts.push('[f]')
+      if (item.password) parts.push('[pwd]')
       return parts.join(' ')
     })
     const filterText = [args.text, args.id, args.desc, args.cls, args.pkg].filter(Boolean).join(' ')

@@ -132,6 +132,19 @@
 | 组合动作链（W3C 风格） | 长按拖动、双击后滑，一次提交多段轨迹；scrcpy 的 `INJECT_TOUCH_EVENT` 连续帧是参考实现 |
 | 纯 Python 免 adb 二进制 | `adb-shell` 直连设备（TCP/USB），适合 CI 容器里没装 platform-tools 的场景；本机开发不必换 |
 
+### 已落地（本轮，均有单测覆盖）
+
+| 能力 | 竞品口径 | 本插件做法 | 落地 |
+| --- | --- | --- | --- |
+| 语义选择器 | Appium `checked/selected/…` 要配合 `findElements` + 属性断言；u2 靠 `d(checked=True)` | `selectNodes` 直接吃 `checked / selected / scrollable / focused / editable / password`，true=必须有、false=必须没有（一次挑「没勾上的复选框」），与 `text/id/cls/pkg` 等条件 AND | `cb678f2` |
+| 控件状态可见 | Appium 要读 `element.getAttribute()` 逐个问 | 紧凑行行尾直接标 `* ~ [x] [s] [f] [pwd] [off]`，一次 dump 全知道；`adb_find` 行同样带这些标记 | `cb678f2` |
+| 密码框识别 | 需要额外属性查询才知道是密码输入 | `parseNodes` 读 `password`，树上即标 `[pwd]`，模型不会把掩码当正文填 | `cb678f2` |
+| 边滑边点 | Appium `mobile: scroll` 是独立动作，要自己拆成两次调用 | `adb_tap {scroll}`、`adb_do` 每步 `scroll/scroll_direction`：当前屏没有就边滑边找再点，只对「当前屏没有」滑（歧义/快照过期的滑了没用，原样报错） | `cb678f2` / `39388c2` |
+| 一步内等跳转 | Appium 用 `waitForActivity` 单独一次 | `adb_do` 步骤自带 `wait_activity`（页面正则），`adb_app start/open` 同样带，本地先校验正则再跑 | `6aad1d1` |
+| 隐式等待 | Appium `implicitlyWait` 是会话级全局开关 | 每个 `adb_tap` / `adb_do` 步默认自带 ≤900ms 有界等待（`wait_ms` 可调），不掩盖歧义与快照过期 | `52545f9` |
+| 清空输入框 | `element.clear()` 走 W3C 一次往返 | 一次 Ctrl+A+DEL（约 120ms，与长度无关）+ 一次核对 dump；自绘控件忽略时退回单次 DEL 连发 | `52545f9` |
+| 步骤预校验 | 走到一半才发现参数写错 | `validateSteps` 在注入前逐条查：动作冲突、regex、`scroll` 范围、`scroll_direction` 取值，一次报清「第几步要改什么」 | `6aad1d1` / `39388c2` |
+
 ### 明确不抄
 
 - **Appium 整机那套**（server + session + W3C 协议）：为跨端一致性付的抽象税，对本插件是纯延迟。
