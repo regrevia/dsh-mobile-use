@@ -1280,6 +1280,47 @@ async function snapshotForSelector(serial, snapshotId) {
  * @param {{text?: string, id?: string, desc?: string, snapshotId?: string}} want - 选择器。
  * @returns {any} 节点。
  */
+/**
+ * 同一处堆叠的多个命中（父容器带着它的图标/文字子节点）是一个控件，不是两个选择：
+ * 按中心点分簇，每簇只留面积最小的那个，避免把「一个按钮」误报成 ambiguous_target。
+ * @param {any[]} nodes - 命中节点。
+ * @param {number} [tolerance] - 认为同一点的最大中心距离（设备像素）。
+ * @returns {any[]} 去重后的候选。
+ */
+function collapseSameSpot(nodes, tolerance = 12) {
+  if (nodes.length < 2) return nodes
+  const midX = (item) => (item.x1 + item.x2) / 2
+  const midY = (item) => (item.y1 + item.y2) / 2
+  const area = (item) => Math.max(1, (item.x2 - item.x1) * (item.y2 - item.y1))
+  const taken = new Set()
+  const kept = []
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (taken.has(i)) continue
+    const group = [nodes[i]]
+    taken.add(i)
+    for (let j = i + 1; j < nodes.length; j += 1) {
+      if (taken.has(j)) continue
+      if (Math.hypot(midX(nodes[i]) - midX(nodes[j]), midY(nodes[i]) - midY(nodes[j])) <= tolerance) {
+        group.push(nodes[j])
+        taken.add(j)
+      }
+    }
+    kept.push(group.sort((a, b) => area(a) - area(b))[0])
+  }
+  return kept
+}
+
+/**
+ * 歧义报错里带上各个候选的落点，模型可以直接用 point 点其中一个，不用再 dump 一次界面。
+ * @param {any[]} nodes - 候选节点。
+ * @returns {string} 形如 `（@120,340、@120,880）`。
+ */
+function spotList(nodes) {
+  const shown = nodes.slice(0, 4).map((node) => `@${Math.round((node.x1 + node.x2) / 2)},${Math.round((node.y1 + node.y2) / 2)}`)
+  const more = nodes.length > shown.length ? ` 等 ${nodes.length} 处` : ''
+  return `（${shown.join('、')}${more}）`
+}
+
 function nodeForSelector(serial, want) {
   const cached = checkSnapshot(serial, want.snapshotId, '文字/id')
   const refs = cached.refs.map((entry) => entry.node)
@@ -1287,23 +1328,26 @@ function nodeForSelector(serial, want) {
     const exact = refs.filter((node) => node.text === want.text || node.desc === want.text)
     const loose = exact.length > 0 ? exact : refs.filter((node) => `${node.text} ${node.desc}`.includes(want.text))
     if (loose.length === 0) throw new Error(`界面上没有文字「${want.text}」：先 adb_ui 看当前界面，或用 filter 搜一下。`)
-    if (loose.length > 1) throw new Error(`ambiguous_target：文字「${want.text}」匹配到 ${loose.length} 个控件，改用 ref 挑一个。`)
-    return loose[0]
+    const places = collapseSameSpot(loose)
+    if (places.length > 1) throw new Error(`ambiguous_target：文字「${want.text}」匹配到 ${places.length} 个控件${spotList(places)}，改用 ref 挑一个，或直接 point 点其中一处。`)
+    return places[0]
   }
   if (want.id) {
     const needle = shortId(want.id)
     const exact = refs.filter((node) => shortId(node.id) === needle)
     const loose = exact.length > 0 ? exact : refs.filter((node) => shortId(node.id).includes(needle))
     if (loose.length === 0) throw new Error(`界面上没有 id 包含「${needle}」的控件：先 adb_ui 看当前界面。`)
-    if (loose.length > 1) throw new Error(`ambiguous_target：id「${needle}」匹配到 ${loose.length} 个控件，改用 ref 挑一个。`)
-    return loose[0]
+    const places = collapseSameSpot(loose)
+    if (places.length > 1) throw new Error(`ambiguous_target：id「${needle}」匹配到 ${places.length} 个控件${spotList(places)}，改用 ref 挑一个，或直接 point 点其中一处。`)
+    return places[0]
   }
   if (want.desc) {
     const exact = refs.filter((node) => node.desc === want.desc)
     const loose = exact.length > 0 ? exact : refs.filter((node) => node.desc.includes(want.desc) || node.text.includes(want.desc))
     if (loose.length === 0) throw new Error(`界面上没有描述包含「${want.desc}」的控件：先 adb_ui 看当前界面。`)
-    if (loose.length > 1) throw new Error(`ambiguous_target：描述「${want.desc}」匹配到 ${loose.length} 个控件，改用 ref 挑一个。`)
-    return loose[0]
+    const places = collapseSameSpot(loose)
+    if (places.length > 1) throw new Error(`ambiguous_target：描述「${want.desc}」匹配到 ${places.length} 个控件${spotList(places)}，改用 ref 挑一个，或直接 point 点其中一处。`)
+    return places[0]
   }
   throw new Error('需要 ref、text、id、desc 或 point 其中之一。')
 }
@@ -2129,6 +2173,8 @@ export function apply(ctx, config) {
             /* 按文字/id 点之前先确认快照还对应现在的界面，页面换了就重新 dump，不拿旧坐标点。 */
             await snapshotForSelector(device)
             node = nodeForSelector(device, { text: step.tap, id: step.id })
+            /* 快照比软时效还旧时再核一次：控件挪了或没了就报 stale_snapshot，不把一串步骤点到旧位置。 */
+            node = await freshNodeFor(device, node)
           }
           let target
           if (point !== null) {
@@ -2250,6 +2296,8 @@ export function apply(ctx, config) {
       } else {
         await snapshotForSelector(device, args.snapshot_id)
         seed = nodeForSelector(device, { text: args.text, id: args.id, snapshotId: args.snapshot_id })
+        /* 采样前确认这个控件还在原位；挪了或没了直接报，不录一段别人的动效。 */
+        seed = await freshNodeFor(device, seed, args.snapshot_id)
       }
       const key = { text: seed.text, id: seed.id, desc: seed.desc }
       const seedX = (seed.x1 + seed.x2) / 2
