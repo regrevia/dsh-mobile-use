@@ -328,4 +328,13 @@ it('密码框在树上标 [pwd]，也能按 password 挑出来', () => {
   assert.equal(selectNodes(state, { password: true }).length, 1)
   assert.equal(selectNodes(state, { password: false }).length, 1)
 })
+
+it('adb_do 每一步能带 scroll 边滑边找，写错了当场报', () => {
+  assert.equal(validateSteps([{ tap: '设置', scroll: 3 }]).ok, true)
+  assert.equal(validateSteps([{ id: 'btn', scroll: 1, scroll_direction: 'down' }]).ok, true)
+  assert.match(validateSteps([{ tap: '设置', scroll: 0 }]).problems[0], /scroll 要写 1–15/)
+  assert.match(validateSteps([{ tap: '设置', scroll: 99 }]).problems[0], /scroll 要写 1–15/)
+  assert.match(validateSteps([{ ref: 2, scroll: 3 }]).problems[0], /scroll 只能配 tap \/ id/)
+  assert.match(validateSteps([{ tap: '设置', scroll: 2, scroll_direction: '斜着' }]).problems[0], /scroll_direction 只能是/)
+})
 console.log(`\n${pass} 项通过\n`)

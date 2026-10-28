@@ -229,6 +229,17 @@ function validateSteps(steps) {
         && step.swipe.slice(0, 4).every((item) => Number.isFinite(Number(item)))
       if (!ok) problems.push(`第 ${at} 步 swipe 要写 [x1,y1,x2,y2] 四个数，最后一位毫秒可选。`)
     }
+    if (step.scroll !== undefined) {
+      const times = Number(step.scroll)
+      if (!(Number.isInteger(times) && times >= 1 && times <= 15)) {
+        problems.push(`第 ${at} 步 scroll 要写 1–15 之间的整数。`)
+      } else if (!['tap', 'id'].includes(used[0] ?? '')) {
+        problems.push(`第 ${at} 步 scroll 只能配 tap / id 用（ref 是快照里的位置，滑动后就没意义了）。`)
+      }
+    }
+    if (step.scroll_direction !== undefined && !directions.includes(String(step.scroll_direction))) {
+      problems.push(`第 ${at} 步 scroll_direction 只能是 up / down / left / right。`)
+    }
     if (step.direction !== undefined && !directions.includes(String(step.direction))) {
       problems.push(`第 ${at} 步 direction 只能是 up / down / left / right。`)
     }
@@ -3458,6 +3469,8 @@ export function apply(ctx, config) {
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
               scroll_to: { type: 'string', description: '先边滑边找这段文字，找到就点它；找不到算失败' },
+              scroll: { type: 'integer', description: '按文字/id 点时先滑几次找目标（1–15）：当前屏没有就边滑边找，找到再点' },
+              scroll_direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'scroll 的滑动方向，默认 up（把下面的内容拉上来）' },
               wait_ms: { type: 'integer', description: '这一步的目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）' },
               direction: { type: 'string', description: 'scroll_to 的滑动方向：up/down/left/right，默认 up' },
               wait_idle: { type: 'boolean', description: '本步做完等界面静止（动画/加载结束）再核对' },
@@ -3526,7 +3539,16 @@ export function apply(ctx, config) {
           } else {
             /* 按文字/id 点之前先确认快照还对应现在的界面，页面换了就重新 dump，不拿旧坐标点。 */
             await snapshotForSelector(device)
-            node = await awaitNode(device, { text: step.tap, id: step.id }, step.wait_ms)
+            const want = { text: step.tap, id: step.id }
+            try {
+              node = await awaitNode(device, want, step.wait_ms)
+            } catch (error) {
+              /* 与 adb_tap 同一条规则：只有「当前屏没有」才值得滑；有歧义/快照过期滑了也没用。 */
+              const reason = String(error?.message ?? error)
+              if (!(step.scroll && reason.startsWith('界面上没有'))) throw error
+              node = await scrollToSelector(device, want, step.scroll_direction, step.scroll)
+              done.push(`滑 ${step.scroll} 次找到「${oneLine(node.text || node.desc || '', 16)}」`)
+            }
             /* 快照比软时效还旧时再核一次：控件挪了或没了就报 stale_snapshot，不把一串步骤点到旧位置。 */
             node = await freshNodeFor(device, node)
           }
