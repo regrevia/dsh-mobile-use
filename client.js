@@ -11,7 +11,7 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '167'
+window.__ADBM_BUILD = '171'
 
 /* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
    factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。
@@ -258,8 +258,8 @@ if (window.__ADBM_LOADED__ !== true) {
               /* 追到直播边缘：落后 0.6 s 直接跳到尾部，落后一点用 1.25 倍速追
                  （小漂移不会自己收敛，不追就一直落后）；顺手扔掉 4 s 之前的。 */
               const lag = end - video.currentTime
-              if (lag > 0.6) video.currentTime = Math.max(start, end - 0.06)
-              else video.playbackRate = lag > 0.15 ? 1.25 : 1
+              if (lag > 0.45) video.currentTime = Math.max(start, end - 0.06)
+              else video.playbackRate = lag > 0.12 ? 1.2 : 1
               if (end - start > 8 && sourceBuffer.updating === false) sourceBuffer.remove(start, end - 4)
               /* 延迟的唯一可观测口径：把落后直播边缘多少报给宿主，/state 里看得到。 */
               if (Date.now() - lastLagAt > 2000) {

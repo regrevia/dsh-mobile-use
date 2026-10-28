@@ -46,11 +46,10 @@ export const PLAYER_HTML = `<!doctype html>
 </div>
 <div id="bar">
   <button id="mark" aria-pressed="false" title="拖一个框，把这块发给会话">圈选</button>
-  <textarea id="note" placeholder="这块是什么问题"></textarea>
-  <button id="send" disabled>发到会话</button>
+  <button id="send" disabled>发到对话</button>
   <span id="status">连接中</span>
 </div>
-<div id="hint">按住拖一个框；松手后画面定住，可以补一句说明再发。</div>
+<div id="hint">按住拖一个框，松手后画面定住；点「发到对话」把这一块连同坐标、控件、操作时间线发给会话。</div>
 <script>
 (function () {
   var ROUTE = '/dsh-mobile-use'
@@ -61,8 +60,7 @@ export const PLAYER_HTML = `<!doctype html>
 
   var video = document.getElementById('video')
   var canvas = document.getElementById('canvas')
-  var note = document.getElementById('note')
-  var markBtn = document.getElementById('mark')
+    var markBtn = document.getElementById('mark')
   var send = document.getElementById('send')
   var status = document.getElementById('status')
   var hint = document.getElementById('hint')
@@ -187,8 +185,8 @@ export const PLAYER_HTML = `<!doctype html>
           var end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
           var start = sourceBuffer.buffered.start(0)
           var lag = end - video.currentTime
-          if (lag > 0.6) video.currentTime = Math.max(start, end - 0.06)
-          else video.playbackRate = lag > 0.15 ? 1.25 : 1
+          if (lag > 0.45) video.currentTime = Math.max(start, end - 0.06)
+          else video.playbackRate = lag > 0.12 ? 1.2 : 1
           tryPlay()
           if (end - start > 8 && sourceBuffer.updating === false) sourceBuffer.remove(start, end - 4)
           stats.buf = [Math.round(start * 100) / 100, Math.round(end * 100) / 100, sourceBuffer.buffered.length]
@@ -421,6 +419,26 @@ export const PLAYER_HTML = `<!doctype html>
     } catch (error) { /* 诊断不能抛 */ }
   }, 1000)
 
+  /* 宿主升级后这一页可能还是旧代码：每 30 秒对一次版本，不一致就自己重载。
+     长期开着的侧栏不用人记得刷新。 */
+  setInterval(function () {
+    try {
+      if (liveStopped) return
+      var mine = String(window.__ADBM_PAGE_BUILD || '')
+      if (mine === '') return
+      fetch(ROUTE + '/state?t=' + Date.now(), { cache: 'no-store' }).then(function (res) { return res.ok ? res.json() : null }).then(function (state) {
+        var host = String((state && state.build) || '')
+        if (host !== '' && host !== mine) window.location.reload()
+      }).catch(function () {})
+    } catch (error) { /* 对版本失败不打扰画面 */ }
+  }, 30000)
+
+  /* 侧栏这一页会被长期开着：解码器、缓冲、连接残留只会越攒越多。
+     六小时自己重载一次，断的是这一页，采集链路几十毫秒就接回来。 */
+  setTimeout(function () {
+    try { window.location.reload() } catch (error) { /* 下次打开再说 */ }
+  }, 6 * 3600 * 1000)
+
   /* ---- 点击 → 设备坐标 ---- */
   video.addEventListener('click', function (event) {
     if (marking) return
@@ -515,7 +533,7 @@ export const PLAYER_HTML = `<!doctype html>
     var body = {
       session: session,
       serial: serial,
-      note: note.value,
+      note: '',
       rect: rect,
       frozen_ms: frozenMs,
     }
@@ -523,7 +541,6 @@ export const PLAYER_HTML = `<!doctype html>
     post('/annotate', body).then(function (result) {
       if (result && result.ok) {
         say('已发到会话')
-        note.value = ''
         rect = null
         marking = false
         markBtn.setAttribute('aria-pressed', 'false')

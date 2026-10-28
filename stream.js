@@ -245,6 +245,9 @@ const IDLE_GRACE_MS = Math.max(3000, Number(process.env.ADBM_IDLE_GRACE_MS ?? 12
 /** 看门狗节拍、判定阈值、重建冷却：2 秒一拍，8 秒没初始化段就重建，15 秒内不重复重建。 */
 const WATCH_TICK_MS = 2000
 const WATCH_INIT_MS = 8000
+/* 已经有初始化段、画面却不再出片：静态画面会真的不出片，所以先请一帧验证，
+   请了还不来才判卡死。长跑时这条是「画面冻住」的唯一出路。 */
+const WATCH_STALL_MS = 10000
 const WATCH_COOLDOWN_MS = 15000
 /** 主链路待写队列上限：ffmpeg 不读数据时，队列涨到这里就整条重建，绝不把宿主内存吃光。 */
 const MAX_REMUX_QUEUE = 4 * 1024 * 1024
@@ -1192,7 +1195,22 @@ export class LiveStream {
     }
     if (this.init !== null) {
       this.viewerSince = Date.now()
-      this.revivedAt = 0
+      const lastAt = Number(this.lastAt) || 0
+      if (lastAt === 0 || Date.now() - lastAt < WATCH_STALL_MS) {
+        this.revivedAt = 0
+        this.stallTries = 0
+        return
+      }
+      if (this.revivedAt !== 0 && Date.now() - this.revivedAt < WATCH_COOLDOWN_MS) return
+      /* 第一次判停顿只请一帧：静态画面本来就不出片，请帧回来的片就是活着的证据。 */
+      if ((Number(this.stallTries) || 0) === 0) {
+        this.stallTries = 1
+        if (this.requestFrame()) return
+      }
+      this.stallTries = 0
+      this.revivedAt = Date.now()
+      this.debug('看门狗：' + String(Math.round(WATCH_STALL_MS / 1000)) + ' 秒没有新分片，重建采集链路')
+      this.reviveSource()
       return
     }
     if (this.viewerSince === 0) {
@@ -1357,6 +1375,7 @@ export class LiveStream {
   emitMedia(chunk) {
     this.framesSeen += 1
     this.lastAt = Date.now()
+    this.stallTries = 0
     const pts = readTfdt(chunk, this.timescale ?? 90000)
     if (pts >= 0) {
       this.lastPts = pts

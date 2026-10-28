@@ -20,9 +20,9 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=204'
-import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=11'
-import { PLAYER_HTML } from './page.js?v=28'
+import { LiveStream, packFrame } from './stream.js?v=205'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=12'
+import { PLAYER_HTML } from './page.js?v=33'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -1894,7 +1894,10 @@ export function setupMirror(ctx, tools) {
     try {
       if (path === '/' && req.method === 'GET') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
-        return res.end(PLAYER_HTML)
+        /* 把宿主当前版本写进页面：长期开着的侧栏页据此发现自己是旧代码，自己刷一次。 */
+        const build = CLIENT_BUILD
+        const html = build === '' ? PLAYER_HTML : PLAYER_HTML.replace('<script>', '<script>window.__ADBM_PAGE_BUILD = "' + build + '";')
+        return res.end(html)
       }
 
       if (path === '/events' && req.method === 'GET') {
