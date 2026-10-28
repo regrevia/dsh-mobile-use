@@ -273,3 +273,69 @@ node test/scrcpy.test.mjs      # 纯内存，不连设备、不 spawn 进程
 可用 codec 禁用标记、AVCC→Annex-B、32/14/5+N/2 字节控制消息、UTF-8 边界截断、
 server 参数拼装、`stop()` 幂等与敌对对象（child 无 `kill`、socket `destroy` 抛、log 抛）、
 未连控制 socket 时 push 返回 false。
+
+## 10. 静止画面出画要几秒？（2026-11 实测，已修）
+
+现象：设备端首包几十毫秒就到宿主，但浏览器侧要到 ~6.3 秒才看见第一帧，且每次冷启动都一样。宿主日志里量「moov 距首包」= **+5184 ms**。
+
+成因不在 scrcpy，也不在 MSE，而在转封装那一段：`ffmpeg -f mpegts -i pipe:0` 默认 `probesize=5000000`、`analyzeduration=5000000`。探测阶段要攒够数据或攒够 5 秒才肯认定流格式，静止桌面几乎没有新帧，于是每次都是 5 秒超时才吐 moov，之后浏览器才有初始化段。
+
+改法：喂给 ffmpeg 的是我们自己封的 TS，第一包就带 PAT/PMT + SPS/PPS，不需要它猜：
+
+```
+-probesize 32000 -analyzeduration 0 -f mpegts -i pipe:0
+```
+
+改完后同一台设备、同一份代码：
+
+| 场景 | 改前 | 改后 |
+| --- | --- | --- |
+| 冷启动首帧（宿主 reload / 显式 stop 后） | 6297–6325 ms | 1261–1511 ms |
+| 面板关掉再打开（120 秒宽限内，采集还活着） | 6290 ms | 252 ms |
+
+回归判据：调试日志里 `moov 就绪 +Nms（自首包）` 应 < 200 ms；若又回到几秒，先查这两项有没有被别处覆盖。
+
+### 10.1 顺带修掉的两个连带问题
+
+- **显式 stop 之后的失败冷却**：`/stream/stop?confirm=1` 只清了通道对象，没清 `failed` 冷却（10 秒）。冷却期内 `channelFor()` 一律返回 null，只能退回 `screenrecord`，于是「停一下再开」反而慢且糊。现在停流时连冷却一起清，冷却也从 10 秒收到 4 秒。
+- **设备端残留**：`adb forward --remove` 不会杀死设备端的 scrcpy-server，它会一直占着编码器（下一次启动表现为「没有帧」）。现在 `ScrcpyChannel._dispose()` 按 scid 精确收掉：`pkill -9 -f 'scid=<hex8>'`，再用 `ps | grep -F` 兜底。screenrecord 回退路径同理，会在 stop 时按 pid 文件前缀横扫一遍，逐个核对 `/proc/<pid>/comm` 是 `screenrecord` 才杀。
+
+## 11. 给模型看的人话时间线（`deviceStory`）
+
+`logcat -b events` 的原始行模型读起来很费劲（`am_focused_activity [...] am_proc_died ...`）。`describe_device_event()` 把七类事件翻成一句中文：切页 / 启动 / 退出 / 崩溃 / 无响应 / 被系统杀掉；`deviceStory(serial, windowMs)` 再去掉系统组件噪声、合并「同一次退出的 am_kill + am_proc_died」、按时间倒序给最多 6 条。
+
+两处入口都在用同一份实现，别各写一套：
+
+- `adb_events` 工具输出末尾追加「人话时间线（倒推，直接照着回答用户）」；
+- 侧边栏标注 `annotate()` 回给模型的本来就是这份时间线；
+- 调试直读：`GET /dsh-mobile-use/story?serial=<serial>`。
+
+## 12. 冷启动黑屏三连坑（2026-10-28 实测）
+
+症状：面板打开先黑 6–13 秒，出来的是 720p（screenrecord），过一会儿才切回 1600×1068；日志里 `看门狗：8 秒没有初始化段，重建采集链路` 反复出现。三个独立原因叠在一起，缺一个都修不好：
+
+1. **sweep 杀掉刚 spawn 的 recorder。** `spawnRecorder()` 里调过一次 `sweepOwnRecorders()`，它是异步的（`adb shell ps` 再 `kill -9`），`ps` 回来时新 recorder 已经在，于是自己杀自己：`spawn session=N` → `recorder-exit code=0` → 无限重建。修法：spawn 路径不再 sweep，只在 `stop()` 里清。
+2. **通道 entry 被 `closed` 清空后永不重建。** `channelFor()` 只在 `entry === undefined` 时 new 通道；`closed` 把 `entry.channel` 置 null 但 entry 还在，于是永远 `ready = null`、永远不重连，采集源退回 screenrecord。修法：`channel === null && !starting && !failed` 时扔掉 entry 重造。
+3. **`sourceWaitFailed` 是永久判决。** 冷启动时等通道超时一次，标志永不复位，之后每次 spawn 直接跳过等通道，钉死在回退路径。修法：换成时间戳 `sourceWaitAt`，8 秒窗口后允许再等。
+
+配套等待策略：通道还在连（`starting`/`idle`/`none`）就继续等，最多 12 秒，只有明确 `failed` 才退回 screenrecord。提前起 screenrecord 会抢走设备编码器，反而让 scrcpy 彻底起不来——这是「越等越慢」的真因，不是等太久。
+
+冷启动顺带省两处时间：设备上已有同尺寸 server 就跳过 `adb push`（省 300–600ms，`ADBM_FORCE_PUSH=1` 强制重推）；设备端 jar 改用独立路径 `/data/local/tmp/dsh-mobile-use-scrcpy-server.jar`，避免和别的 scrcpy 工具互相覆盖导致尺寸判断失真。
+
+修完实测（`/stream/stop?confirm=1` 后重新打开）：
+
+| 场景 | 首帧时间 | 分辨率 |
+| --- | --- | --- |
+| 冷启动 ×3 | 1006 / 1509 / 1516 ms | 1600×1068 |
+| 暖启动（120s 空闲宽限内再打开） | 253 ms | 1600×1068 |
+
+## 13. 低延迟手势通道（实测）
+
+`POST /dsh-mobile-use/gesture`（同族还有 `/tap`、`/swipe`、`/raw`、`/pinch`）：通道活着时直接往 scrcpy 控制 socket 注入触摸序列，不走 `input`/u2。响应里的 `engine` 说明实际走的哪条路：
+
+| 路径 | 往返耗时（含 16ms 动作时长） |
+| --- | --- |
+| `engine: "scrcpy"` | p50 20ms / p90 177ms（14 次）；120ms 动作时 p50 142ms ≈ 下发开销 22ms |
+| `engine: "adb-input"`（通道不可用回退） | p50 172ms |
+
+回退要如实标注：`{"ok":true,"engine":"adb-input"}`。两条路差一个数量级，模型据此判断手感对不对，别让它猜。

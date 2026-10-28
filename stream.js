@@ -14,6 +14,8 @@ import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { createTsMuxer } from './tsmux.js'
+
 /** 帧类型：0 文本元信息，1 初始化段，2 媒体分片，3 一条流结束（前端应重连）。 */
 export const FRAME_META = 0
 export const FRAME_INIT = 1
@@ -236,8 +238,14 @@ function containsIdr(chunk) {
   return false
 }
 
-/** 最后一个观众走后，录屏再活这么久：侧栏重载/切页回来时能立刻出画面，不用等 2 秒起流。 */
-const IDLE_GRACE_MS = 20000
+/** 最后一个观众走后，采集链路再活这么久：侧栏重载/切页回来时能立刻出画面（实测 0.25 秒），
+    而冷启动要重新推 server、等 IDR，实测 8~9 秒。静止画面时编码器本来就不产出流量，留 2 分钟不费资源。 */
+/* 没人在看多久后收掉设备端采集。默认两分钟：重开侧栏是热的；调试/自测可用环境变量压到几秒。 */
+const IDLE_GRACE_MS = Math.max(3000, Number(process.env.ADBM_IDLE_GRACE_MS ?? 120000) || 120000)
+/** 看门狗节拍、判定阈值、重建冷却：2 秒一拍，8 秒没初始化段就重建，15 秒内不重复重建。 */
+const WATCH_TICK_MS = 2000
+const WATCH_INIT_MS = 8000
+const WATCH_COOLDOWN_MS = 15000
 /** 主链路待写队列上限：ffmpeg 不读数据时，队列涨到这里就整条重建，绝不把宿主内存吃光。 */
 const MAX_REMUX_QUEUE = 4 * 1024 * 1024
 /** JPEG 是可选支路：落后超过这个量就丢掉重建，它没有资格拖慢采集。 */
@@ -290,6 +298,8 @@ export class LiveStream {
     this.recorder = null
     /* 设备端 pid 文件名：停止时只按这个 pid 精确收尾，绝不 pkill 别人在录的屏。 */
     this.recorderPidFile = ''
+    /* 本插件在这台设备上的录屏 pid 文件前缀，收尾时按它横扫。 */
+    this.recorderPidPrefix = `/data/local/tmp/dsh-mobile-use-stream-${String(this.serial).replace(/[^\w.-]/g, '_')}-`
     this.remuxer = null
     this.stopping = false
     this.restartTimer = null
@@ -316,8 +326,16 @@ export class LiveStream {
     this.error = ''
     this.intentional = false
     this.idleTimer = null
+    this.idleArmedAt = 0
+    this.lastViewerAt = 0
     this.firstFrameAt = 0
     this.bytes = 0
+    /* 送进 ffmpeg 的是自己封的 MPEG-TS：裸 H.264 没时间戳，ffmpeg 只能按读到那一刻打戳，
+       而 scrcpy 的帧成批到达，同一批戳几乎一样，重封出来的时间轴会失真（实测 5 s 采集能拉成 50 s）。
+       每个视频包自带设备端真实 PTS，封进 PES 就不丢。 */
+    this.tsMux = createTsMuxer()
+    this.lastPtsUs = 0
+    this.ptsOriginUs = 0
     this.framesSeen = 0
     this.lastAt = 0
     /** 最新的 JPEG 帧（桥接器解出来的）。 @type {Buffer|null} */
@@ -343,7 +361,9 @@ export class LiveStream {
     this.sourceReady = typeof options.sourceReady === 'function' ? options.sourceReady : null
     /* 采集源可能还在建（scrcpy 连上要 1~2s）：给它一次异步等待的机会，别急着起 screenrecord。 */
     this.sourceWait = typeof options.sourceWait === 'function' ? options.sourceWait : null
-    this.sourceWaitFailed = false
+    /* 采集源当前状态；通道还在连时继续等，别急着退回录屏。 */
+    this.sourceState = typeof options.sourceState === 'function' ? options.sourceState : null
+    this.sourceWaitAt = 0
     /* 通道接上却不出帧时先冷一会儿，别每 1.5 秒重挂一次。 */
     this.scrcpyHoldUntil = 0
     /** 正在用的 scrcpy 通道。 @type {any} */
@@ -352,6 +372,12 @@ export class LiveStream {
     this.scrcpyBound = null
     /* scrcpy 起不来的兜底计时器：到点没帧就退回 screenrecord。 */
     this.scrcpyTimer = null
+    this.frameRetryTimer = null
+    /* 有观众但迟迟拿不到初始化段：黑屏自我修复用的看门狗。 */
+    this.viewerSince = 0
+    this.revivedAt = 0
+    this.watchTimer = null
+    this.initAt = 0
   }
 
   /**
@@ -498,8 +524,10 @@ export class LiveStream {
   /** 观众都走了：留一段宽限再停，重开侧栏就不用重新起流。 @returns {void} */
   scheduleIdleStop(delayMs = IDLE_GRACE_MS) {
     if (this.idleTimer !== null) return
+    if (this.idleArmedAt === 0) this.idleArmedAt = Date.now()
     this.idleTimer = setTimeout(() => this.guard('idle-stop', () => {
       this.idleTimer = null
+      this.idleArmedAt = 0
       if (this.clients.size > 0 || this.waiting.size > 0) return
       /* 只看帧的人每隔一秒来一次，取帧时间戳会被不断刷新；差多少补多少，不重复排满宽限。 */
       /* 镜像那边还有常连观看者（/live）时不能停：它不走 clients，只靠这个回调说话。 */
@@ -507,7 +535,15 @@ export class LiveStream {
         this.scheduleIdleStop()
         return
       }
-      const left = IDLE_GRACE_MS - (Date.now() - this.jpegWantedAt)
+      /* 宽限从「最后一次有人看」起算；jpegWantedAt 只有走 /frame 才会被刷新，
+         单靠它会让 left 永远等于满宽限，于是反复重排、空闲流永远不释放（实测 132 秒后还在推）。 */
+      const now = Date.now()
+      const lastSeen = Math.max(
+        Number(this.jpegWantedAt) || 0,
+        Number(this.lastViewerAt) || 0,
+        Number(this.idleArmedAt) || 0,
+      )
+      const left = IDLE_GRACE_MS - (now - lastSeen)
       if (left > 250) {
         this.scheduleIdleStop(left)
         return
@@ -538,6 +574,23 @@ export class LiveStream {
    * 重开一次录屏，换一张新的 IDR：新观众进场时用，代价约半秒黑屏。
    * @returns {void}
    */
+  /**
+   * 要设备端重发一帧关键帧（走 scrcpy 控制消息，不重建链路）。
+   * 静止画面下编码器不出帧，面板打开后会一直黑；主动要一帧比反复重建采集链路省得多。
+   * @returns {boolean} 是否真的发了请求
+   */
+  requestFrame() {
+    const source = this.scrcpy
+    if (source === null || this.stopping) return false
+    let sent = false
+    this.guard('request-frame', () => {
+      if (typeof source.requestKeyFrame === 'function') sent = source.requestKeyFrame() === true
+    })
+    if (sent) this.frameReqAt = Date.now()
+    this.debug('requestFrame ' + (sent ? 'ok' : 'skip'))
+    return sent
+  }
+
   rekey() {
     if (this.stopping) return
     /* scrcpy 采集源没有「重启录屏换 IDR」这条路：只清转封装，等它自己下一个关键帧。 */
@@ -602,6 +655,31 @@ export class LiveStream {
   }
 
   /**
+   * 收尾时横扫本插件留下的所有录屏 pid 文件（换源/重建会换来换去，只杀最后一只就会漏）。
+   * 仍然逐个核对进程名是 screenrecord，绝不动别人的录屏。
+   * @returns {void}
+   */
+  sweepOwnRecorders() {
+    /* pid 文件靠不住：adb 子进程先退出时会把文件删掉，设备端的 screenrecord 还活着。
+       所以按命令行里的 dsh-mobile-use-stream- 标记认领壳进程，再按 PPID 收它的子进程。 */
+    const marker = `dsh-mobile-use-stream-${String(this.serial).replace(/[^\w.-]/g, '_')}-`
+    const script = `w=$(ps -A -o PID,ARGS 2>/dev/null | grep -F '${marker}' | grep -v grep | awk '{print $1}'); `
+      + `for p in $w; do k=$(ps -A -o PID,PPID 2>/dev/null | awk -v P="$p" '$2==P{print $1}'); `
+      + `for c in $k; do kill -9 "$c" 2>/dev/null; echo swept:$c; done; kill -9 "$p" 2>/dev/null; done; `
+      + `x=$(ps -A -o PID,ARGS 2>/dev/null | grep 'screenrecord --output-format=h264' | grep -v grep | grep -F -- '--time-limit=${RECORD_LIMIT}' | awk '{print $1}'); for c in $x; do kill -9 "$c" 2>/dev/null; echo swept-orphan:$c; done; ` + `rm -f ${this.recorderPidPrefix}*.pid 2>/dev/null; echo sweep-done`
+    try {
+      const child = spawn(this.adbPath, ['-s', this.serial, 'shell', script], { stdio: ['ignore', 'pipe', 'ignore'] })
+      let out = ''
+      child.stdout?.on('data', (chunk) => { out = (out + String(chunk)).slice(-200) })
+      child.on('exit', () => this.debug('sweep ' + (out.trim() || 'no-reply')))
+      child.on('error', () => this.debug('sweep spawn-error'))
+      child.unref?.()
+    } catch {
+      this.debug('sweep threw')
+    }
+  }
+
+  /**
    * 正常到时长退出的清理：只删自己的 pid 文件，不 kill（pid 可能已被别人复用）。
    * @returns {void}
    */
@@ -645,27 +723,37 @@ export class LiveStream {
   spawnRecorder() {
     if (this.stopping) return
     /* 有 scrcpy 通道就直接吃它的 H.264：连续出帧、延迟低，不用设备端再开一个编码器。 */
-    if (this.sourceWait !== null && this.sourceWaitFailed !== true) {
+    if (this.sourceWait !== null && Date.now() - this.sourceWaitAt > 8000) {
       /* 等采集源就绪：超时/起不来就照旧起 screenrecord，下一轮 spawn 再试。 */
       const gen = this.generation
-      this.guard('scrcpy-wait', () => {
-        Promise.resolve(this.sourceWait())
+      const beganAt = Date.now()
+      const attempt = () => {
+        Promise.resolve(this.sourceWait(4000))
           .then((source) => {
             this.guard('scrcpy-wait-done', () => {
               if (this.stopping || this.generation !== gen || this.scrcpy !== null) return
               if (source !== null && source !== undefined && this.attachScrcpy(source)) return
-              this.sourceWaitFailed = true
+              /* 通道还在连就别掉到录屏：那会先出一张 720p 再切回来，用户看到的是十几秒的等待。 */
+              const state = this.sourceState === null ? 'idle' : this.sourceState()
+              /* 只要通道不是明确失败就继续等：冷启动时 adb 正忙着推 server，
+                 4 秒等不到很正常，这时候掉到录屏会把编码器抢走，反而让 scrcpy 彻底起不来。 */
+              if (state !== 'failed' && Date.now() - beganAt < 12000) {
+                this.guard('scrcpy-wait-again', () => { attempt() })
+                return
+              }
+              this.sourceWaitAt = Date.now()
               this.spawnRecorder()
             })
           })
           .catch(() => {
             this.guard('scrcpy-wait-fail', () => {
               if (this.stopping || this.generation !== gen || this.scrcpy !== null) return
-              this.sourceWaitFailed = true
+              this.sourceWaitAt = Date.now()
               this.spawnRecorder()
             })
           })
-      })
+      }
+      this.guard('scrcpy-wait', () => { attempt() })
       return
     }
     const source = this.pickSource()
@@ -748,18 +836,35 @@ export class LiveStream {
     this.scrcpy = source
     const gen = this.generation
     let fed = 0
+    /* liveFed 只数真从设备来的包：prelude 回放也算 fed，用它判断「有没有出画面」会被骗，
+       首帧探测一上来就以为有帧，静止画面就永远黑着。 */
+    let liveFed = 0
+    const attachAt = Date.now()
+    this.fedCount = 0
     const onPacket = (packet) => this.guard('scrcpy-packet', () => {
       if (gen !== this.generation || this.stopping || this.scrcpy !== source) return
       const data = packet?.data
       if (!Buffer.isBuffer(data) || data.length === 0) return
       fed += 1
+      liveFed += 1
+      this.fedCount += 1
+      if (liveFed === 1) {
+        this.firstPacketAt = Date.now()
+        this.debug('scrcpy 首包 +' + String(Date.now() - attachAt) + 'ms')
+      }
+      this.frameTries = 0
+      if (this.frameRetryTimer !== null) {
+        clearTimeout(this.frameRetryTimer)
+        this.frameRetryTimer = null
+      }
       if (this.scrcpyTimer !== null) {
         clearTimeout(this.scrcpyTimer)
         this.scrcpyTimer = null
       }
-      this.feedRaw(data)
+      this.feedRaw(data, packet?.pts)
     })
     const onGone = () => this.guard('scrcpy-gone', () => {
+      this.debug('scrcpy 通道断开 gen=' + String(gen))
       if (gen !== this.generation) return
       this.detachScrcpy()
       if (this.stopping) return
@@ -779,18 +884,69 @@ export class LiveStream {
       const warm = Buffer.isBuffer(source.replay) ? source.replay : source.prelude
       if (Buffer.isBuffer(warm) && warm.length > 0) {
         fed += 1
+        this.fedCount += 1
         this.feedRaw(warm)
       }
     })
-    /* 通道可能「连着但不出帧」：1.5 秒没包就拆掉退回 screenrecord，别让画面一直黑。 */
-    this.scrcpyTimer = setTimeout(() => this.guard('scrcpy-first-frame', () => {
+    /* 静止画面下 server 起流后可能一张都不发：主动要一帧，观众才有画面可看。
+       控制通道可能比视频通道晚连上，所以头两秒重试几次，拿到包就停。 */
+    this.guard('scrcpy-request-frame', () => {
+      if (fed === 0) this.requestFrame()
+    })
+    let tries = 0
+    const askAgain = () => {
+      this.frameRetryTimer = null
+      if (gen !== this.generation || this.stopping || this.scrcpy !== source || fed > 0) return
+      tries += 1
+      this.requestFrame()
+      if (tries < 3) {
+        this.frameRetryTimer = setTimeout(askAgain, 700)
+        this.frameRetryTimer.unref?.()
+      }
+    }
+    this.frameRetryTimer = setTimeout(askAgain, 500)
+    this.frameRetryTimer.unref?.()
+    /* 通道可能「连着但不出帧」。注意静止画面本来就不出帧，所以不能一没包就判死：
+       先用控制消息请它出一帧，请不到（控制通道不可写 / 请了几次仍然没包）才退回 screenrecord。 */
+    let probes = 0
+    let blind = 0
+    const probeFirstFrame = () => {
       this.scrcpyTimer = null
-      if (gen !== this.generation || this.stopping || fed > 0 || this.scrcpy === null) return
-      this.debug('scrcpy 首帧超时，退回 screenrecord')
-      this.scrcpyHoldUntil = Date.now() + 8000
+      /* 停的条件是「已经能从这条流解出 moov」，不是「收到过包」：
+         server 起流时先发一个只有 SPS/PPS 的配置包，liveFed 立刻变 1，但一帧画面都没有，
+         照旧按 liveFed 停探针，就会一直等到编码器下一次碰巧出帧（实测 5~7 秒）。 */
+      if (gen !== this.generation || this.stopping || this.init !== null || this.scrcpy === null) return
+      probes += 1
+      const asked = this.requestFrame()
+      if (!asked) blind += 1
+      if (probes >= 3 && blind === probes) {
+        this.debug('scrcpy 控制通道不可用，退回 screenrecord')
+        this.scrcpyHoldUntil = Date.now() + 8000
+        this.detachScrcpy()
+        if (this.clients.size > 0 || this.waiting.size > 0) this.spawnRecorder()
+        return
+      }
+      if (probes < 8) {
+        this.scrcpyTimer = setTimeout(probeFirstFrame, 700)
+        this.scrcpyTimer.unref?.()
+        return
+      }
+      /* 请了 8 次还是不出帧：先换一条 scrcpy 通道（设备端 server 可能是死的、socket 半开），
+         换不到才退回 screenrecord。之前直接掉到 screenrecord，那条路出一帧都难，
+         于是整条链路在「重建 → 还是黑 → 再重建」里空转，冷启动永远起不来。 */
+      this.debug('scrcpy 请帧无效，重接通道')
+      this.scrcpyHoldUntil = Date.now() + 1500
       this.detachScrcpy()
-      if (this.clients.size > 0 || this.waiting.size > 0) this.spawnRecorder()
-    }), 1500)
+      if (this.clients.size > 0 || this.waiting.size > 0) this.guard('reprobe-source', () => {
+        setTimeout(() => this.guard('reprobe-spawn', () => {
+          this.scrcpyHoldUntil = 0
+          this.spawnRecorder()
+        }), 1500).unref?.()
+      })
+    }
+    /* 冷启动时 scrcpy 还在往设备推 server、编码器还没起，太早请帧没人接：
+       第一次放到 2.5 秒，之后每秒再请一次，共 4 次（约 6 秒）。 */
+    this.scrcpyTimer = setTimeout(probeFirstFrame, 800)
     this.scrcpyTimer.unref?.()
     this.debug('scrcpy 采集源已接上 gen=' + String(gen))
     return true
@@ -804,6 +960,10 @@ export class LiveStream {
     if (this.scrcpyTimer !== null) {
       this.guard('scrcpy-timer-clear', () => clearTimeout(this.scrcpyTimer))
       this.scrcpyTimer = null
+    }
+    if (this.frameRetryTimer !== null) {
+      this.guard('frame-timer-clear', () => clearTimeout(this.frameRetryTimer))
+      this.frameRetryTimer = null
     }
     if (bound === null) return
     this.guard('scrcpy-detach', () => {
@@ -828,7 +988,7 @@ export class LiveStream {
   }
 
   /** 有裸流分片就交给 ffmpeg；顺手记录编码参数。 @param {Buffer} chunk - 裸 H.264。 @returns {void} */
-  feedRaw(chunk) {
+  feedRaw(chunk, ptsUs = null) {
     this.bytes += chunk.length
     this.lastAt = Date.now()
     if (this.firstFrameAt === 0) this.firstFrameAt = this.lastAt
@@ -871,7 +1031,29 @@ export class LiveStream {
       return
     }
     try {
-      if (mp4In.write(chunk) === false) this.pauseForRemuxer(remuxer)
+      /* 时间戳来源每段 ffmpeg 只认一种：scrcpy 给的是设备开机微秒（实测 2 亿多毫秒，远大于
+         任何主机时间），screenrecord 回退路径没有逐帧时间，只能按到达时刻算；两者混用会让
+         一端永远「更小」，于是每帧都被压成 +16 ms 的固定步长，时间轴整段失真。
+         closeRemuxer() 会清空 ptsOriginUs，切换采集源时重新起算。 */
+      let stamp
+      if (ptsUs === null || ptsUs === undefined) {
+        const now = Date.now() * 1000
+        if (this.ptsOriginUs === 0) this.ptsOriginUs = now
+        stamp = now - this.ptsOriginUs
+      } else {
+        const real = Number(ptsUs) || 0
+        if (real > 0) {
+          if (this.ptsOriginUs === 0) this.ptsOriginUs = real
+          stamp = real - this.ptsOriginUs
+        } else {
+          /* 参数集、会话包的 pts 是 0：不推进时间轴，跟着上一帧走。 */
+          stamp = this.lastPtsUs
+        }
+      }
+      if (stamp <= this.lastPtsUs) stamp = this.lastPtsUs + 16000
+      this.lastPtsUs = stamp
+      const muxed = this.tsMux.push(chunk, stamp)
+      if (muxed.length > 0 && mp4In.write(muxed) === false) this.pauseForRemuxer(remuxer)
     } catch {
       this.closeRemuxer()
     }
@@ -939,12 +1121,13 @@ export class LiveStream {
       /* 千万不要加 -fflags nobuffer：它会让裸流输入一帧都进不来（实测 ffmpeg 只吐 moov）。
          40 ms 一片，画面一变就有一片推出去，静止时不产生流量。 */
       '-flags', 'low_delay',
-      /* 裸 H.264 没有时间戳，默认会按 1200000fps 编时间轴，一片只有几毫秒、播起来像定格；
-         用到达时间当时间戳，静止不动就不涨、动起来才走，正好对上真实节奏。 */
-      '-use_wallclock_as_timestamps', '1',
-      '-f', 'h264', '-i', 'pipe:0',
-      /* 绝对时间戳太大，挪回从 0 起，前端才不用跟着跳到几小时的刻度上。 */
-      '-copyts', '-start_at_zero',
+      /* 输入是我们自己封的 MPEG-TS：每一帧的 PTS 来自设备端，ffmpeg 不用再猜时间。
+         别再改回 -f h264 + -use_wallclock_as_timestamps：那条路把到达时刻当帧时刻，
+         成批到达的帧会被戳成一串近似相同的时间戳，时间轴失真、前端缓冲只有几十毫秒。 */
+      /* ffmpeg 默认要攒 5MB / 5 秒才认出流（probesize+analyzeduration）：静止画面下就是
+         5 秒黑屏。我们的 TS 是自己封的，第一包就带 SPS/PPS，给它 32KB / 0 秒足够认流。 */
+      '-probesize', '32000', '-analyzeduration', '0',
+      '-f', 'mpegts', '-i', 'pipe:0',
       '-c', 'copy', '-frag_duration', String(this.fragMs * 1000),
       '-movflags', 'empty_moov+default_base_moof',
       /* 每片写完立刻吐出去，别等内部缓冲攒满：一攒就是几十到上百毫秒的显示延迟。 */
@@ -993,17 +1176,105 @@ export class LiveStream {
     }
   }
 
+  /**
+   * 黑屏自愈：有观众却超过 8 秒还没拿到 moov，说明采集这条链已经死了（设备端残留、管道断了、
+   * 通道连着不出帧）。重建前先按自己的 pid 收掉设备端录屏，再换一条新链路。
+   * 只盯「没有初始化段」这一种：静止画面本来就不产帧，不能按帧龄判死。
+   * @returns {void}
+   */
+  checkHealth() {
+    if (this.stopping) return
+    const viewers = this.clients.size + this.waiting.size
+    if (viewers === 0) {
+      this.viewerSince = 0
+      this.revivedAt = 0
+      return
+    }
+    if (this.init !== null) {
+      this.viewerSince = Date.now()
+      this.revivedAt = 0
+      return
+    }
+    if (this.viewerSince === 0) {
+      this.viewerSince = Date.now()
+      return
+    }
+    if (Date.now() - this.viewerSince < WATCH_INIT_MS) return
+    if (this.revivedAt !== 0 && Date.now() - this.revivedAt < WATCH_COOLDOWN_MS) return
+    /* 先要一帧：静止画面本来就不出帧，为这个重建整条链路是白烧设备。 */
+    if (this.scrcpy !== null) {
+      const tries = Number(this.frameTries) || 0
+      if (tries === 0) {
+        this.frameTries = 1
+        if (this.requestFrame()) return
+      }
+    }
+    this.revivedAt = Date.now()
+    this.viewerSince = Date.now()
+    this.debug('看门狗：' + String(Math.round(WATCH_INIT_MS / 1000)) + ' 秒没有初始化段，重建采集链路')
+    this.reviveSource()
+  }
+
+  /** 起一个 2 秒的看门狗；没人看的时候它自己空转，不碰设备。 @returns {void} */
+  armWatch() {
+    if (this.watchTimer !== null) return
+    this.watchTimer = setInterval(() => this.guard('watchdog', () => this.checkHealth()), WATCH_TICK_MS)
+    this.watchTimer.unref?.()
+  }
+
+  /**
+   * 整条采集链路重建：本地进程、转封装、scrcpy 绑定都拆掉再起一份，
+   * 不能让「连着但不出帧」的通道一直挂着。
+   * @returns {void}
+   */
+  reviveSource() {
+    if (this.stopping) return
+    this.error = '采集卡住，已自动重建'
+    this.intentional = true
+    const child = this.recorder
+    this.recorder = null
+    this.guard('revive-kill-own', () => this.killOwnRecorder())
+    this.guard('revive-detach', () => this.detachScrcpy())
+    this.init = null
+    this.initAt = 0
+    this.lastKeyChunks = []
+    this.lastKeyBytes = 0
+    this.scrcpyHoldUntil = 0
+    this.sourceWaitAt = 0
+    this.guard('revive-close-remuxer', () => this.closeRemuxer())
+    if (child !== null) {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        /* 已经退了 */
+      }
+    }
+    this.guard('revive-spawn', () => {
+      /* 先试 scrcpy：设备端 server 还活着时它能立刻给一张 IDR，screenrecord 要从零起编码器。
+         之前这里直接 spawnRecorder，一次看门狗就把整条链路永久钉在回退路径上。 */
+      if (Date.now() - this.sourceWaitAt > 8000) {
+        const source = this.pickSource()
+        if (source !== null && this.attachScrcpy(source)) return
+      }
+      this.spawnRecorder()
+    })
+  }
+
   /** 关掉 ffmpeg，等下一次录屏重开。 @returns {void} */
   closeRemuxer() {
     const child = this.remuxer
     this.remuxer = null
     this.init = null
+    this.initAt = 0
     this.pending = Buffer.alloc(0)
     this.buffer = Buffer.alloc(0)
     this.initPending = Buffer.alloc(0)
     this.frag = Buffer.alloc(0)
     this.lastKeyChunks = []
     this.lastKeyBytes = 0
+    this.tsMux.reset()
+    this.lastPtsUs = 0
+    this.ptsOriginUs = 0
     if (child === null) return
     try {
       child.stdin.end()
@@ -1037,9 +1308,21 @@ export class LiveStream {
       if (type === 'moov') {
         /* moov 才是初始化段：先发 INIT，再把之前攒着、还不能解码的分片一起发出去。 */
         this.init = this.initPending.length > 0 ? Buffer.concat([this.initPending, box]) : box
+        this.debug('moov 就绪 +' + String(Date.now() - (Number(this.firstPacketAt) || Date.now())) + 'ms（自首包）')
+        this.initAt = Date.now()
         this.timescale = readTimescale(box)
         this.initPending = Buffer.alloc(0)
         this.broadcast(packFrame(FRAME_INIT, this.init))
+        /* 还在等 IDR 的观众也先收初始化段：他们缺的只是解码起点，不是解码器配置，
+           等下一张 IDR 再一起补，黑屏会多好几秒。 */
+        for (const sink of this.waiting) {
+          try {
+            sink(packFrame(FRAME_INIT, this.init))
+            sink.__initSent = true
+          } catch {
+            this.waiting.delete(sink)
+          }
+        }
         if (this.frag.length > 0) {
           const pending = this.frag
           this.frag = Buffer.alloc(0)
@@ -1096,9 +1379,17 @@ export class LiveStream {
     }
     /* 先广播这一帧，再给等待的观众补前情，避免同一个关键帧投三遍。 */
     const promoted = key && this.waiting.size > 0 ? Array.from(this.waiting) : []
-    if (promoted.length > 0) this.waiting.clear()
+    if (promoted.length > 0) {
+      this.waiting.clear()
+      this.debug('关键帧到达，放行 ' + String(promoted.length) + ' 人')
+    }
     this.broadcast(packFrame(FRAME_MEDIA, chunk))
+    /* 新观众进场：scrcpy 在静止画面上不出帧，光回放 INIT 等于给一张黑图。
+       不管是冷启动（还没 moov）还是热重连（有 moov、但画面停住），都要请一帧，
+       1.2 秒内最多一次，避免每次重连都轰设备。 */
+    if (this.scrcpy !== null && (this.init === null || Date.now() - (Number(this.lastAt) || 0) > 400) && Date.now() - (Number(this.frameReqAt) || 0) > 1200) this.requestFrame()
     for (const sink of promoted) {
+      /* 已经在新观众进场时统一请过帧，这里不再重复。 */
       this.sendPrelude(sink)
       this.clients.add(sink)
     }
@@ -1120,18 +1411,40 @@ export class LiveStream {
   }
 
   /**
+   * 请设备给一张 IDR。scrcpy 在静止画面上可以几十秒不出关键帧，
+   * 而新观众必须有 IDR 才能解码，所以每个「该有画面了」的节点都走这里，900ms 内只发一次。
+   * @param {string} why - 触发原因，写进调试日志。
+   * @returns {void}
+   */
+  askKeyFrame(why) {
+    if (this.scrcpy === null) return
+    if (Date.now() - (Number(this.frameReqAt) || 0) < 900) return
+    this.guard('ask-keyframe', () => {
+      this.debug('请关键帧：' + why)
+      this.requestFrame()
+    })
+  }
+
+  /**
    * 新观众入场：先给初始化段 + 最近一个 keyframe 起的分片，再进直播。
    * @param {(bytes: Buffer) => void} sink - 写响应的函数。
    * @returns {() => void} 退订函数。
    */
   subscribe(sink) {
     this.start()
+    this.debug('观众订阅 init=' + String(this.init !== null) + ' 源=' + String(this.scrcpy !== null) + ' 客户端=' + String(this.clients.size) + '/' + String(this.waiting.size))
+    this.lastViewerAt = Date.now()
+    if (this.viewerSince === 0) this.viewerSince = Date.now()
+    this.armWatch()
     if (this.init !== null && this.lastKeyChunks.length > 0) {
       this.sendPrelude(sink)
       this.clients.add(sink)
     } else {
       /* 手上没有能解码的起点，先挂着，下一张 IDR 到了再补，避免解码器起不来。 */
       this.waiting.add(sink)
+      this.debug('观众等关键帧 init=' + String(this.init !== null) + ' keyChunks=' + String(this.lastKeyChunks.length) + ' 源=' + String(this.scrcpy !== null))
+      /* 等着也是等：直接请设备给一张。静止画面下不请，可能就是几十秒黑屏。 */
+      this.askKeyFrame('观众等首帧')
       /* 设备只在开录时给一张 IDR，等下一张可能是几十秒；直接重开一次录屏换新 IDR。 */
       /* 刚起的录屏还没吐第一张 IDR 就别杀掉重开：等它自己出图。 */
       if (this.recorder !== null && this.restartTimer === null && Date.now() - this.startedAt > 700) this.rekey()
@@ -1140,6 +1453,7 @@ export class LiveStream {
     return () => {
       this.clients.delete(sink)
       this.waiting.delete(sink)
+      this.lastViewerAt = Date.now()
       if (this.clients.size === 0 && this.waiting.size === 0) this.scheduleIdleStop()
     }
   }
@@ -1154,13 +1468,24 @@ export class LiveStream {
       sink(packFrame(FRAME_META, Buffer.from(JSON.stringify({ codec: this.config.codec, width: this.config.width, height: this.config.height }))))
     }
     if (this.init === null) return
-    sink(packFrame(FRAME_INIT, this.init))
+    /* moov 一到就先给过初始化段的观众不要再收一次：重复 INIT 会让前端重建 MediaSource、
+       清空已缓冲的画面，看起来就是「忽然闪一下」。 */
+    if (sink.__initSent !== true) {
+      sink(packFrame(FRAME_INIT, this.init))
+      sink.__initSent = true
+    }
     for (const chunk of this.lastKeyChunks) sink(packFrame(FRAME_MEDIA, chunk))
   }
 
   /** 没人看了就停，别占着设备编码器。幂等：重复调用、对象已销毁都不抛。 @returns {void} */
   stop() {
     /* 换代：之前所有 in-flight 的退出/重启回调从此作废，停止之后不会自己复活。 */
+    if (this.watchTimer !== null) {
+      this.guard('stop-watch-timer', () => clearInterval(this.watchTimer))
+      this.watchTimer = null
+    }
+    this.viewerSince = 0
+    this.revivedAt = 0
     this.generation = (Number(this.generation) || 0) + 1
     if (this.idleTimer != null) {
       this.guard('stop-idle-timer', () => clearTimeout(this.idleTimer))
@@ -1178,6 +1503,7 @@ export class LiveStream {
     const child = this.recorder ?? null
     this.recorder = null
     /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */
+    this.guard('stop-sweep-recorders', () => this.sweepOwnRecorders())
     this.guard('stop-device-recorder', () => this.killOwnRecorder())
     if (child !== null) {
       try {
@@ -1209,6 +1535,11 @@ export class LiveStream {
       frames: this.framesSeen,
       started: this.startedAt,
       sessions: this.sessions,
+      initReady: this.init !== null,
+      waiting: this.waiting.size,
+      gop: this.lastKeyChunks.length,
+      framesSeen: this.framesSeen,
+      initAt: this.initAt,
       lastAt: this.lastAt,
       firstFrameAt: this.firstFrameAt,
       error: this.error,

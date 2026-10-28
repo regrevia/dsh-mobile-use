@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=200'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=210'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -606,7 +606,8 @@ async function deviceStory(device, windowMs = 120_000) {
   const top = await sh(device, 'dumpsys activity activities | grep -m1 "topResumedActivity"', 8000).catch(() => null)
   const topText = top && top.ok ? top.out.trim() : ''
   const topMatch = /topResumedActivity=ActivityRecord\{[^}]*?([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)/.exec(topText)
-  if (topMatch !== null) lines.push(`现在在前台：${topMatch[1]}`)
+  /* 前台这一行也要说人话：`com.miui.home/.launcher.Launcher` 对模型是包名，对用户是「桌面」。 */
+  if (topMatch !== null) lines.push(`现在在前台：${describe_foreground(topMatch[1])}`)
   const ev = await adb(['-s', device, 'shell', 'logcat', '-b', 'events', '-d', '-t', '300', '-v', 'time'], { timeout: 12_000 }).catch(() => null)
   const raw = ev && ev.ok ? ev.out : ''
   const keep = /am_focused_activity|wm_create_activity|am_proc_start|am_proc_died|am_crash|am_anr|am_kill/
@@ -616,12 +617,93 @@ async function deviceStory(device, windowMs = 120_000) {
     const age = logAge(line)
     /* 窗口外的不要：标注说的是「刚才」，回看太久反而误导。 */
     if (age === '' || /小时前/.test(age)) continue
-    const minutes = Number(/\[(\d+)分钟前\]/.exec(age)?.[1] ?? 0)
-    if (minutes * 60_000 > windowMs) continue
-    picked.push(`${age}${line.trim().slice(0, 150)}`)
+    const seconds = /\[(\d+)s前\]/.test(age) ? Number(/\[(\d+)s前\]/.exec(age)[1]) : Number(/\[(\d+)分钟前\]/.exec(age)?.[1] ?? 0) * 60
+    if (seconds * 1000 > windowMs) continue
+    /* 系统组件每几秒生死一次，混进来会把「用户真正做了什么」淹掉。 */
+    if (isSystemNoise(line)) continue
+    const said = describe_device_event(line)
+    if (said === '') continue
+    /* 同一件事连着刷屏（切页常常一次报三条）只留第一条，时间线要能一口气读完。 */
+    if (picked.length > 0 && picked[picked.length - 1].text === said) continue
+    /* 一次退出常同时报 am_kill + am_proc_died：同一应用同一秒只留一句，读起来才像时间线。 */
+    const prev = picked[picked.length - 1]
+    if (prev !== undefined && seconds - prev.seconds <= 2 && prev.pkgName === (describe_event_package(line))) continue
+    picked.push({ text: said, line: `${age}${said}`, seconds, pkgName: describe_event_package(line) })
   }
-  lines.push(...picked.slice(-6))
+  lines.push(...picked.slice(-6).map((item) => item.line))
   return lines
+}
+
+/**
+ * 把一行 logcat 事件翻成一句人话：agent 要能直接读懂「刚才发生了什么」，
+ * 而不是拿到 `am_proc_died: [0,1234,com.whale.pet,...]` 这种原始数组。
+ * @param {string} line - logcat -b events 的一行。
+ * @returns {string} 一句话；看不懂的返回空串（宁缺不猜）。
+ */
+/**
+ * 从一行事件里取包名（去重用）。 @param {string} line - logcat 事件行。 @returns {string} 包名，取不到为空串。
+ */
+function describe_event_package(line) {
+  const found = /\b(?:am_proc_start|am_proc_died|am_crash|am_anr|am_kill|am_focused_activity|wm_create_activity)\b[^\[]*\[([^\]]*)\]/.exec(String(line))
+  const parts = found === null ? [] : found[1].split(',').map((item) => item.trim())
+  return parts.find((item) => /^[a-zA-Z][\w.]*\.[\w.]+$/.test(item) && item.includes('.') && !item.includes('/')) ?? ''
+}
+
+/**
+ * 把 `包名/类名` 形式的前台描述翻成人话，认不出来的原样返回，别硬猜。
+ * @param {string} text - dumpsys 里那一段。
+ * @returns {string} 人话描述。
+ */
+function describe_foreground(text) {
+  const pair = /([\w.]+)\/([\w.$]+)/.exec(String(text))
+  const raw = pair === null ? String(text).trim() : `${pair[1]}/${pair[2]}`
+  const pkg = pair === null ? '' : pair[1]
+  const cls = pair === null ? '' : (pair[2].split('.').pop() ?? pair[2])
+  if (/^(com\.miui\.home|com\.android\.launcher|com\.google\.android\.apps\.nexuslauncher)$/.test(pkg)) return `桌面（${raw}）`
+  if (/^(com\.android\.settings|com\.miui\.settings)$/.test(pkg)) return `设置（${raw}）`
+  if (/^(com\.android\.camera|com\.miui\.camera)/.test(pkg)) return `相机（${raw}）`
+  if (pkg === '') return raw
+  return cls === '' ? raw : `${pkg}（${cls}）`
+}
+
+function describe_device_event(line) {
+  const text = String(line)
+  const tag = /\b(am_focused_activity|wm_create_activity|am_proc_start|am_proc_died|am_crash|am_anr|am_kill)\b/.exec(text)?.[1] ?? ''
+  if (tag === '') return ''
+  const body = text.slice(text.indexOf(tag + ':') + tag.length + 1)
+  /* 事件体是 [user,pid,uid,包名,类名,…]：包名总在第 4 个位置，类名第 5 个。 */
+  const parts = body.replace(/^\s*\[/, '').replace(/\]\s*$/, '').split(',').map((item) => item.trim())
+  /* 切页事件的载荷是 `包名/类名` 一整段，进程事件才是分开的字段：两种都要认。 */
+  const pair = parts.find((item) => /^[\w.$]+\/[\w.$]+$/.test(item)) ?? ''
+  const pkg = (pair !== '' ? pair.split('/')[0].trim() : '')
+    || parts.find((item) => /^[a-zA-Z][\w.]*\.[\w.]+$/.test(item)) || ''
+  const cls = (pair !== '' ? (pair.split('/')[1] ?? '') : '')
+    || parts.find((item) => /^[\w.$]+\/[\w.$]+$/.test(item)) || ''
+  const short = (value) => {
+    const last = value.split('/').pop() ?? value
+    return last.split('.').pop() ?? last
+  }
+  /** 桌面 / 设置 / 相机这类系统页面，说人话比念包名有用；其它应用保留包名，模型要能真去查。 */
+  const friendly = (name) => {
+    if (/^(com\.miui\.home|com\.android\.launcher|com\.google\.android\.apps\.nexuslauncher)/.test(name)) return '桌面'
+    if (/^(com\.android\.settings|com\.miui\.settings)/.test(name)) return '设置'
+    if (/^(com\.android\.camera|com\.miui\.camera)/.test(name)) return '相机'
+    if (/^com\.android\.systemui/.test(name)) return '通知栏'
+    return name
+  }
+  if (tag === 'am_focused_activity' || tag === 'wm_create_activity') {
+    if (pkg === '') return ''
+    const page = cls === '' ? '' : short(cls)
+    /* Launcher 之类的宿主页面不念类名，说「回到桌面」更像人话。 */
+    if (page === '' || /^(Launcher|MainActivity)$/.test(page) && friendly(pkg) !== pkg) return `切到 ${friendly(pkg)}`
+    return `切到 ${friendly(pkg)}（${page}）`
+  }
+  if (tag === 'am_proc_start') return pkg === '' ? '' : `${friendly(pkg)} 启动了`
+  if (tag === 'am_proc_died') return pkg === '' ? '' : `${friendly(pkg)} 退出了`
+  if (tag === 'am_crash') return pkg === '' ? '' : `${friendly(pkg)} 崩溃了`
+  if (tag === 'am_anr') return pkg === '' ? '' : `${friendly(pkg)} 无响应`
+  if (tag === 'am_kill') return pkg === '' ? '' : `${friendly(pkg)} 被系统杀掉`
+  return ''
 }
 
 /**
@@ -3166,6 +3248,13 @@ ctx.effect(() => ctx.tools.register({
       }
       const switches = evPicked.slice(-16).map((line) => `${logAge(line)}${line.slice(0, 200)}`)
       if (switches.length > 0) parts.push(`切页与进程事件（系统事件缓冲，最后 ${switches.length} 条）：\n${switches.join('\n')}`)
+
+      /* 原始事件是给排查用的；用户说「刚才它自己跳走了」时，模型需要的是人话。
+         同一批事件再翻一遍，去重、去掉系统组件噪声，一行一件事。 */
+      if (wanted === '') {
+        const story = await deviceStory(device, windowMs).catch(() => [])
+        if (story.length > 0) parts.push(`人话时间线（倒推，直接照着回答用户）：\n${story.join('\n')}`)
+      }
 
       /* 崩溃缓冲单独读：和上面混在一起时 FATAL 堆栈会被普通日志冲掉。 */
       const crash = await adb(['-s', device, 'shell', 'logcat', '-b', 'crash', '-d', '-t', '12'], { timeout: 12_000 }).catch(() => null)

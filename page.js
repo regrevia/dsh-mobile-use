@@ -62,7 +62,7 @@ export const PLAYER_HTML = `<!doctype html>
   var video = document.getElementById('video')
   var canvas = document.getElementById('canvas')
   var note = document.getElementById('note')
-  var mark = document.getElementById('mark')
+  var markBtn = document.getElementById('mark')
   var send = document.getElementById('send')
   var status = document.getElementById('status')
   var hint = document.getElementById('hint')
@@ -122,7 +122,21 @@ export const PLAYER_HTML = `<!doctype html>
   var initPayload = null
   var objectUrl = ''
 
+  /* 现场事件环：只在出问题时才需要，所以只留最近 12 条、不参与热路径。 */
+  function mark(what) {
+    stats.events = (stats.events || []).concat([[Math.round(performance.now()), what, mediaSource ? mediaSource.readyState : 'null', video.buffered.length ? +video.buffered.end(video.buffered.length - 1).toFixed(2) : 0]]).slice(-40)
+  }
+
+  /* 初始化段是不是同一份：采集链路重发、或观众重连补发时会重复给，字节一样就没有重建的必要。 */
+  function sameBytes(a, b) {
+    if (a === null || b === null || a.length !== b.length) return false
+    for (var i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false
+    return true
+  }
+
   function resetSource() {
+    mark('reset')
+    stats.resets = (stats.resets || 0) + 1
     queue = []
     appending = false
     sourceBuffer = null
@@ -139,6 +153,8 @@ export const PLAYER_HTML = `<!doctype html>
   var lastTimeSeen = -1
   var lastTimeAt = Date.now()
   var connectedAt = 0
+  /* 收到 META 的时间：META 到了却一直没有 INIT，说明宿主那边采集链路死了，光等没用。 */
+  var metaAt = 0
   window.__adbm = stats
 
   function appendNext() {
@@ -146,7 +162,11 @@ export const PLAYER_HTML = `<!doctype html>
     if (mediaSource && mediaSource.readyState !== 'open') return
     if (sourceBuffer.updating) return
     appending = true
-    try { sourceBuffer.appendBuffer(queue.shift()); stats.appends += 1 } catch (error) { appending = false; stats.appendErr = String(error && error.name) + ':' + String(error && error.message).slice(0, 60) }
+    var chunk = queue.shift()
+    var len = chunk && chunk.byteLength ? chunk.byteLength : 0
+    stats.appendBytes = (stats.appendBytes || 0) + len
+    if (stats.appends < 3) mark('ap' + String(stats.appends) + ':' + String(len))
+    try { sourceBuffer.appendBuffer(chunk); stats.appends += 1 } catch (error) { appending = false; stats.appendErr = String(error && error.name) + ':' + String(error && error.message).slice(0, 60) }
   }
 
   function attachSource() {
@@ -156,6 +176,7 @@ export const PLAYER_HTML = `<!doctype html>
     catch (error) {
       try { sourceBuffer = mediaSource.addSourceBuffer(codec) } catch (second) { startPolling(); return }
     }
+    mark('attach')
     sourceBuffer.mode = 'segments'
     sourceBuffer.addEventListener('error', function () { stats.appendErr = 'sb-error' })
     sourceBuffer.addEventListener('updateend', function () {
@@ -168,8 +189,12 @@ export const PLAYER_HTML = `<!doctype html>
           var lag = end - video.currentTime
           if (lag > 0.6) video.currentTime = Math.max(start, end - 0.06)
           else video.playbackRate = lag > 0.15 ? 1.25 : 1
+          tryPlay()
           if (end - start > 8 && sourceBuffer.updating === false) sourceBuffer.remove(start, end - 4)
           stats.buf = [Math.round(start * 100) / 100, Math.round(end * 100) / 100, sourceBuffer.buffered.length]
+          stats.elBuf = video.buffered.length
+          stats.msState = mediaSource ? mediaSource.readyState : 'null'
+        } else if (stats.appends < 6) { mark('nb' + String(stats.appends))
         }
       } catch (error) { /* 边界状态 */ }
       appendNext()
@@ -177,12 +202,33 @@ export const PLAYER_HTML = `<!doctype html>
     appendNext()
   }
 
+  /* 自动播放不是到处都成立（无声视频多数浏览器放行，但策略变了、或页面被当成弹窗时会被拦）：
+     主动 play 一次，被拦了就把「点一下开始播放」露出来，别让用户对着黑屏猜。 */
+  function tryPlay() {
+    if (video.paused === false) return
+    var result = video.play()
+    if (result && typeof result.catch === 'function') {
+      result.catch(function () { hint.textContent = '点一下画面开始播放'; hint.classList.add('on') })
+    }
+  }
+
   function ensureSource() {
-    if (mediaSource !== null || codec === '' || typeof window.MediaSource !== 'function') return
-    try { mediaSource = new window.MediaSource() } catch (error) { startPolling(); return }
-    objectUrl = URL.createObjectURL(mediaSource)
-    video.src = objectUrl
-    mediaSource.addEventListener('sourceopen', function () {
+    if (mediaSource !== null) { mark('ensure-skip'); return }
+    if (codec === '' || typeof window.MediaSource !== 'function') return
+    var created = null
+    try { created = new window.MediaSource(); stats.ms = (stats.ms || 0) + 1 } catch (error) { startPolling(); return }
+    mediaSource = created
+    mark('ensure-new')
+    objectUrl = URL.createObjectURL(created)
+    /* MediaSource 要有 element 的 src 指向它才会 open，所以 src 不能等 sourceopen。
+       竞态用下面的引用比较挡住：旧实例的 sourceopen 晚到时不会再挂到新实例上。 */
+    try { video.src = objectUrl } catch (error) { reportError('assign-src', error) }
+    tryPlay()
+    /* 只在「这个 MediaSource 还是当前那个」时才挂 src 和 sourceBuffer：
+       初始化段来得快时旧实例的 sourceopen 会晚到，挂错了就是 buffer 一直空、画面全黑。 */
+    created.addEventListener('sourceopen', function () {
+      if (mediaSource !== created) { mark('open-stale'); return }
+      mark('open')
       /* 顺序不能反：先挂初始化段，再挂 sourceBuffer；反过来 attachSource 会先把
          sourceopen 之前排队的分片吐出去，解复用器拿不到 moov 就报 APPEND_FAILED。 */
       if (initPayload !== null) { queue = [initPayload].concat(queue); initPayload = null }
@@ -192,7 +238,7 @@ export const PLAYER_HTML = `<!doctype html>
   }
 
   function onFrame(type, payload) {
-    if (type === 0) stats.meta += 1
+    if (type === 0) { stats.meta += 1; metaAt = Date.now() }
     if (type === 1) stats.init += 1
     if (type === 2) { stats.media += 1; if (queue.length > stats.queueMax) stats.queueMax = queue.length }
     if (type === 3) stats.end += 1
@@ -202,10 +248,31 @@ export const PLAYER_HTML = `<!doctype html>
         if (info && info.codec) codec = String(info.codec)
         if (info && info.width) screen = { w: Number(info.width), h: Number(info.height) }
       } catch (error) { /* 坏 meta 忽略 */ }
-      ensureSource()
+      try { ensureSource() } catch (error) { reportError('ensureSource', error) }
       return
     }
-    if (type === 1) { initPayload = payload; resetSource(); ensureSource(); return }
+    if (type === 1) {
+      metaAt = 0
+      /* 同一份初始化段重发（重连补发、链路重试）不该把已经在播的画面清掉：
+         之前每次都重建 MediaSource，观众看到的就是每隔几秒黑一下。 */
+      var playing = mediaSource !== null && mediaSource.readyState === 'open' && video.buffered.length > 0
+      var dup = sameBytes(initPayload, payload) && playing
+      initPayload = payload
+      if (dup) { mark('init-dup'); stats.dups = (stats.dups || 0) + 1; return }
+      if (!playing) {
+        /* 还没出画面：直接在现有 MediaSource 上换初始化段。重建会把 sourceopen/attach
+           再来一遍，冷启动时就成了每两秒黑一次的循环。 */
+        mark('init-replace')
+        stats.replaced = (stats.replaced || 0) + 1
+        queue = []
+        if (sourceBuffer !== null) { queue.push(payload); appendNext() }
+        else { try { ensureSource() } catch (error) { reportError('ensureSource.init', error) } }
+        return
+      }
+      resetSource()
+      try { ensureSource() } catch (error) { reportError('ensureSource.init', error) }
+      return
+    }
     if (type === 2) {
       queue.push(payload)
       if (queue.length > 60) { queue = queue.slice(-8); stats.dropped += 1 }
@@ -304,6 +371,30 @@ export const PLAYER_HTML = `<!doctype html>
 
   pumpStream()
 
+  /* 页面自身的异常也上报：黑屏时先看这里，不要靠猜。 */
+  function reportError(where, error) {
+    try {
+      fetch(ROUTE + '/diag', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pid: 'player', error: where + ': ' + String(error && (error.stack || error.message || error)) .slice(0, 400) }),
+      }).catch(function () { /* 上报失败不影响播放 */ })
+    } catch (e) { /* 同上 */ }
+  }
+  window.addEventListener('error', function (event) { reportError('error', event.error || event.message) })
+  window.addEventListener('unhandledrejection', function (event) { reportError('reject', event.reason) })
+
+  /* 现场上报：没有 CDP 也能从宿主 /diag 看到这一页实际收到了什么。 */
+  setInterval(function () {
+    try {
+      fetch(ROUTE + '/diag', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pid: 'player', stream: { meta: stats.meta, init: stats.init, media: stats.media, appends: stats.appends, stalls: stats.stalls, connects: stats.connects, ct: video.currentTime, rs: video.readyState, elBuf: video.buffered.length, paused: video.paused, end: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0, start: video.buffered.length > 0 ? video.buffered.start(0) : 0, ms: mediaSource ? mediaSource.readyState : 'null', q: queue.length, err: stats.appendErr, buf: stats.buf || null, ev: stats.events || null } }),
+      }).catch(function () { /* 上报失败不影响播放 */ })
+    } catch (error) { /* 同上 */ }
+  }, 3000)
+
   function armReconnect() {
     try { if (currentReader !== null) { const reader = currentReader; currentReader = null; reader.cancel().catch(function () {}) } } catch (error) { /* 已断 */ }
   }
@@ -318,6 +409,8 @@ export const PLAYER_HTML = `<!doctype html>
       if (t !== lastTimeSeen) { lastTimeSeen = t; lastTimeAt = now }
       /* 连上了却连 META 都没收到：冷启动时 stream 还没就绪，连接会一直空转。 */
       if (stats.meta === 0 && connectedAt > 0 && now - connectedAt > 2500) { stats.stalls += 1; armReconnect(); connectedAt = 0; return }
+      /* 有 META 没有 INIT：解码起点没来，画面必黑，重连比干等有用（宿主那边的看门狗会在这期间重建采集）。 */
+      if (metaAt > 0 && now - metaAt > 14000) { stats.stalls += 1; metaAt = 0; armReconnect(); return }
       if (queue.length > 4 && now - lastAppendAt > 2000) { stats.stalls += 1; armReconnect(); return }
       var end = 0
       if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
@@ -343,9 +436,9 @@ export const PLAYER_HTML = `<!doctype html>
   })
 
   /* ---- 圈选 ---- */
-  mark.addEventListener('click', function () {
+  markBtn.addEventListener('click', function () {
     marking = !marking
-    mark.setAttribute('aria-pressed', marking ? 'true' : 'false')
+    markBtn.setAttribute('aria-pressed', marking ? 'true' : 'false')
     hint.classList.toggle('on', marking)
     canvas.classList.toggle('on', marking)
     if (marking) {
@@ -433,7 +526,7 @@ export const PLAYER_HTML = `<!doctype html>
         note.value = ''
         rect = null
         marking = false
-        mark.setAttribute('aria-pressed', 'false')
+        markBtn.setAttribute('aria-pressed', 'false')
         canvas.classList.remove('on')
         hint.classList.remove('on')
         try { video.play() } catch (error) { /* 无所谓 */ }

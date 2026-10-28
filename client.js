@@ -11,7 +11,7 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '166'
+window.__ADBM_BUILD = '167'
 
 /* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
    factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。
@@ -173,6 +173,12 @@ if (window.__ADBM_LOADED__ !== true) {
       let lastTimeAt = Date.now()
       let connectedAt = 0
       let metaSeen = 0
+      /* META 到了却没有 INIT：解码起点没来，画面必黑，光等不会好。 */
+      let metaAt = 0
+      let initSeen = 0
+      let mediaSeen = 0
+      let stalling = false
+      let lastReportAt = 0
 
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
       const meta = (payload) => {
@@ -271,12 +277,15 @@ if (window.__ADBM_LOADED__ !== true) {
       const onFrame = (type, payload) => {
         if (type === STREAM_META) {
           metaSeen += 1
+          metaAt = Date.now()
           const info = meta(payload)
           if (info?.codec) codec = String(info.codec)
           ensureSource()
           return
         }
         if (type === STREAM_INIT) {
+          initSeen += 1
+          metaAt = 0
           initPayload = payload
           if (codec === '') codec = codecFromInit(payload)
           reset()
@@ -284,6 +293,7 @@ if (window.__ADBM_LOADED__ !== true) {
           return
         }
         if (type === STREAM_MEDIA) {
+          mediaSeen += 1
           queue.push(payload)
           /* 队列太长说明这台机器放不过来，丢到只剩最新几片，宁可卡一下也不无限堆积。 */
           if (queue.length > 60) queue = queue.slice(-8)
@@ -351,7 +361,10 @@ if (window.__ADBM_LOADED__ !== true) {
       video.addEventListener('loadeddata', () => options.onReady?.())
       video.addEventListener('loadedmetadata', () => options.onSize?.(video.videoWidth, video.videoHeight))
       video.addEventListener('resize', () => options.onSize?.(video.videoWidth, video.videoHeight))
-      video.addEventListener('playing', () => options.onReady?.())
+      video.addEventListener('playing', () => {
+        if (stalling) { stalling = false; options.onStall?.('') }
+        options.onReady?.()
+      })
       void video.play().catch(() => {})
       /* 三种「看着像崩了」的卡死各给一条出路：追加链停、播放时间停。
          命中就 abort 当前连接，外层按退避重连（重连会重发 INIT 和最近一个 GOP）。 */
@@ -366,6 +379,18 @@ if (window.__ADBM_LOADED__ !== true) {
             try { currentController?.abort() } catch { /* 已断 */ }
             connectedAt = 0
             return
+          }
+          /* 有 META 没有 INIT 超过 6 秒：宿主那边采集链路大概率死了，断开重连比干等有用。 */
+          if (metaAt > 0 && now - metaAt > 6000) {
+            metaAt = 0
+            report({ stall: 'no-init' })
+            if (!stalling) { stalling = true; options.onStall?.('no-init') }
+            try { currentController?.abort() } catch { /* 已断 */ }
+            return
+          }
+          if (now - lastReportAt > 3000) {
+            lastReportAt = now
+            report({ stream: { meta: metaSeen, init: initSeen, media: mediaSeen, queue: queue.length, ct: video.currentTime, rs: video.readyState, elBuf: video.buffered.length } })
           }
           if (queue.length > 4 && now - lastAppendAt > 2000) {
             try { currentController?.abort() } catch { /* 已断 */ }
@@ -605,6 +630,11 @@ if (window.__ADBM_LOADED__ !== true) {
           },
           onSize: (width, height) => {
             if (alive && width > 0) setFrameSize({ w: width, h: height })
+          },
+          onStall: (reason) => {
+            if (!alive) return
+            if (reason === '') { if (!ready) return; setStatus('') };
+            if (reason === 'no-init') setStatus('画面没有响应，正在重新连接')
           },
           onFail: () => {
             fails += 1

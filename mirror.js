@@ -20,9 +20,9 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=161'
-import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=5'
-import { PLAYER_HTML } from './page.js?v=12'
+import { LiveStream, packFrame } from './stream.js?v=204'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=9'
+import { PLAYER_HTML } from './page.js?v=28'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -1148,8 +1148,22 @@ export function setupMirror(ctx, tools) {
    */
   function channelFor(serial, autoStart = true) {
     let entry = channels.get(serial)
+    /* failed 不能是永久判决：设备侧 server 偶发起不来一次，之后所有观众都被钉在
+       screenrecord 回退路径上。失败 10 秒后允许再试。 */
+    /* 失败冷却别设太长：冷却期内只能退回 screenrecord，那条路更慢还会抢编码器。
+       4 秒足够挡掉启动风暴，又不至于让人等半天才恢复高清。 */
+    if (entry !== undefined && entry.failed === true && Date.now() - (Number(entry.failedAt) || 0) > 4000) {
+      entry.failed = false
+      entry.failedAt = 0
+    }
+    /* 通道对象被 closed 回调清成 null 之后，这个 entry 就永远等不到 ready 了：
+       之前没人把它扔掉，于是「重建后一直退回录屏」。这里补上重造。 */
+    if (entry !== undefined && entry.channel === null && entry.starting !== true && entry.failed !== true) {
+      channels.delete(serial)
+      entry = undefined
+    }
     if (entry === undefined) {
-      entry = { channel: null, ready: null, failed: false, starting: false }
+      entry = { channel: null, ready: null, failed: false, starting: false, failedAt: 0 }
       channels.set(serial, entry)
       try {
         channelSeq += 1
@@ -1163,9 +1177,17 @@ export function setupMirror(ctx, tools) {
           log: (note) => ctx.logger?.debug?.(`[scrcpy] ${String(note)}`),
         })
         entry.channel = channel
-        channel.on?.('closed', () => { entry.ready = null })
+        /* 通道是一次性的：stop()/对端断开之后再 start() 只会立刻失败，而这个 entry 会一直
+           缓存着那个死对象，于是「等采集源」永远等不到，只能退回 screenrecord 那条死路。
+           断开就把它扔掉，下一次 channelFor 重新 new 一条（新端口、新 scid）。 */
+        channel.on?.('closed', () => {
+          entry.ready = null
+          entry.channel = null
+          entry.starting = false
+        })
       } catch {
         entry.failed = true
+        entry.failedAt = Date.now()
       }
     }
     if (autoStart && entry.failed !== true && entry.ready === null && entry.starting !== true && entry.channel !== null) {
@@ -1175,11 +1197,23 @@ export function setupMirror(ctx, tools) {
         .then((ok) => {
           entry.starting = false
           if (ok === true) entry.ready = entry.channel
-          else entry.failed = true
+          else {
+            /* 起不来也扔掉这条通道，给下一次留一次重新 new 的机会；
+               失败原因必须留痕，否则只看到「一直退回录屏」却不知道为什么。 */
+            entry.channel = null
+            entry.failed = true
+            entry.failedAt = Date.now()
+            streamFor(serial).debug('scrcpy 通道启动失败（start 返回非 true），退回 screenrecord')
+            ctx.logger?.warn?.('[scrcpy] 通道启动失败，退回 screenrecord（4 秒后再试）')
+          }
         })
-        .catch(() => {
+        .catch((error) => {
           entry.starting = false
+          entry.channel = null
           entry.failed = true
+          entry.failedAt = Date.now()
+          streamFor(serial).debug('scrcpy 通道启动抛错：' + String(error?.message ?? error))
+          ctx.logger?.warn?.('[scrcpy] 通道启动抛错：' + String(error?.message ?? error))
         })
     }
     return entry.ready
@@ -1190,12 +1224,26 @@ export function setupMirror(ctx, tools) {
    * @param {string} serial - 设备。
    * @returns {Promise<any | null>} 就绪的通道。
    */
-  async function waitSource(serial) {
+  /**
+   * 采集源现在处于哪一步：通道还在连的时候调用方应该继续等，而不是掉到录屏。
+   * @param {string} serial - 设备。
+   * @returns {'ready' | 'starting' | 'failed' | 'idle' | 'none'} 状态。
+   */
+  function channelState(serial) {
+    const entry = channels.get(serial)
+    if (entry === undefined) return 'none'
+    if (entry.ready !== null && entry.ready !== undefined) return 'ready'
+    if (entry.failed === true) return 'failed'
+    if (entry.starting === true) return 'starting'
+    return 'idle'
+  }
+
+  async function waitSource(serial, timeoutMs = 2500) {
     const ready = channelFor(serial)
     if (ready !== null) return ready
     const entry = channels.get(serial)
     if (entry === undefined || entry.failed === true) return null
-    const deadline = Date.now() + 2500
+    const deadline = Date.now() + (Number(timeoutMs) > 0 ? Number(timeoutMs) : 2500)
     while (Date.now() < deadline) {
       await tick(120)
       if (entry.ready !== null) return entry.ready
@@ -1359,7 +1407,8 @@ export function setupMirror(ctx, tools) {
         /* 有低延迟通道就用它的 H.264：连续出帧、少一个设备编码器；没就绪退回 screenrecord。 */
         sourceReady: () => channelFor(serial),
         /* 通道还在连的时候等它一下（≤2.5s），别先起 screenrecord 再切。 */
-        sourceWait: () => waitSource(serial),
+        sourceWait: (ms) => waitSource(serial, ms),
+        sourceState: () => channelState(serial),
       })
       /* 空闲回收前先问一句：镜像还有人在看（/live 常连或刚拉过帧）就别停。 */
       stream.stillWanted = () => {
@@ -1909,31 +1958,78 @@ export function setupMirror(ctx, tools) {
         let closed = false
         /* 先占位再订阅：subscribe 可能同步补发初始化段，那时 unsubscribe 还没赋值。 */
         let unsubscribe = () => {}
-        unsubscribe = stream.subscribe((bytes) => {
-          if (closed) return
-          /* 积压超过 2 MB 就断开重连：宁可重连一次，也不要让延迟越滚越大。 */
-          if (res.writableLength > 2 << 20) {
-            closed = true
-            unsubscribe()
-            res.destroy()
-            return
-          }
-          res.write(bytes)
-        })
         const close = () => {
           if (closed) return
           closed = true
-          unsubscribe()
+          try {
+            unsubscribe()
+          } catch {
+            /* 退订本身不能再往外抛：这条链路已经在收尾了。 */
+          }
         }
+        /* 清理必须先挂上：subscribe 里同步补发初始化段可能抛（对端已断），
+           一旦抛在挂清理之前，这个观众就永远留在 waiting 里，采集链路会被反复重建。 */
         req.on('close', close)
         res.on('close', close)
         res.on('error', close)
+        req.socket?.on('close', close)
+        try {
+          unsubscribe = stream.subscribe((bytes) => {
+            if (closed) return
+            /* 积压超过 2 MB 就断开重连：宁可重连一次，也不要让延迟越滚越大。 */
+            if (res.writableLength > 2 << 20) {
+              close()
+              res.destroy()
+              return
+            }
+            res.write(bytes)
+          })
+        } catch (error) {
+          this?.logger?.warn?.('stream 订阅失败：' + String(error?.message ?? error))
+          close()
+          res.destroy()
+        }
         return
       }
 
       if (path === '/stream/info' && req.method === 'GET') {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         return json(streamFor(serial).info())
+      }
+
+      /* 调试用：看设备最近发生了什么（和标注回传给模型的是同一份人话时间线）。 */
+      if (path === '/story') {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        const lines = await tools.deviceStory(serial, 180_000).catch(() => [])
+        return json({ serial, lines })
+      }
+
+      /* 调试用：把推流和采集通道立刻收掉，省得为了测冷启动等两分钟宽限。
+         必须显式 confirm=1，避免误触。 */
+      if (path === '/stream/stop' && url.searchParams.get('confirm') === '1') {
+        const stopped = []
+        for (const [serial, stream] of streams) {
+          try {
+            stream.stop()
+            stopped.push(serial)
+          } catch {
+            /* 单台收尾失败不影响其它 */
+          }
+        }
+        for (const [serial, entry] of channels) {
+          try {
+            entry.channel?.stop?.()
+            entry.ready = null
+            entry.channel = null
+            entry.starting = false
+            /* 显式停止就是「从头再来」：连失败冷却一起清掉，别让下一次开流白白退回录屏。 */
+            entry.failed = false
+            entry.failedAt = 0
+          } catch {
+            /* 同上 */
+          }
+        }
+        return json({ stopped })
       }
 
       if (path === '/dev/mse' && req.method === 'GET' && DEV === true) {
@@ -2109,7 +2205,9 @@ export function setupMirror(ctx, tools) {
         note(`手势 ${points.length} 指 ${ms}ms`)
         const fast = await scrcpyGesture(serial, points, ms)
         if (fast !== null) return json(fast)
-        return json(await gesture(serial, points, ms))
+        /* 回退路径慢一个数量级（实测 172ms vs 20ms），必须把用的哪条路说清楚。 */
+        const slow = await gesture(serial, points, ms)
+        return json({ ...slow, engine: slow.engine ?? 'adb-input' })
       }
 
       if (path === '/raw' && req.method === 'POST') {
@@ -2123,7 +2221,9 @@ export function setupMirror(ctx, tools) {
         ]]
         const fast = await scrcpyGesture(serial, points, ms)
         if (fast !== null) return json(fast)
-        return json(await gesture(serial, points, ms))
+        /* 回退路径慢一个数量级（实测 172ms vs 20ms），必须把用的哪条路说清楚。 */
+        const slow = await gesture(serial, points, ms)
+        return json({ ...slow, engine: slow.engine ?? 'adb-input' })
       }
 
       if (path === '/pinch' && req.method === 'POST') {

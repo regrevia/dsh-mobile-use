@@ -23,6 +23,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { stat } from 'node:fs/promises'
 import { randomInt } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { connect } from 'node:net'
@@ -591,7 +592,9 @@ export function keycodeFor(key) {
  * scrcpy-server 启动命令（纯函数，便于文档/测试核对）
  * ==========================================================*/
 
-const DEFAULT_DEVICE_SERVER_PATH = '/data/local/tmp/scrcpy-server.jar'
+/* 用插件自己的文件名，别和别的 scrcpy 工具抢 /data/local/tmp/scrcpy-server.jar：
+   同机共存时互相覆盖会让「跳过推送」的尺寸判断失真。 */
+const DEFAULT_DEVICE_SERVER_PATH = '/data/local/tmp/dsh-mobile-use-scrcpy-server.jar'
 
 function shellQuote(value) {
   const text = String(value)
@@ -823,6 +826,23 @@ export class ScrcpyChannel extends EventEmitter {
 
   async _pushServer() {
     if (!this._options.pushServer) return true
+    /* 设备上已经有同尺寸的 server 就直接用：每次冷启动都 push 一遍要多花 300~600ms，
+       而这段时间里用户看到的就是「点了没反应」。尺寸不同才重推（版本变了 jar 大小必变）。 */
+    if (process.env.ADBM_FORCE_PUSH !== '1') {
+      try {
+        const local = await stat(this._options.serverPath)
+        const remote = await this._runCommand([
+          ...this._adbBaseArgs(), 'shell', `stat -c %s ${String(this._options.deviceServerPath)} 2>/dev/null`,
+        ])
+        const size = Number(String(remote.stdout ?? '').trim())
+        if (remote.ok && Number.isFinite(size) && size === local.size) {
+          this._log('设备端已有同版本 scrcpy-server，跳过推送')
+          return true
+        }
+      } catch {
+        /* 查不到就照旧推，别为了省时间把启动搞坏 */
+      }
+    }
     const result = await this._runCommand([
       ...this._adbBaseArgs(),
       'push',
@@ -1182,6 +1202,16 @@ export class ScrcpyChannel extends EventEmitter {
   }
 
   /**
+   * 要设备端立刻重发一帧关键帧（`RESET_VIDEO`，scrcpy 3.x 控制消息 17）。
+   * 静止画面下编码器不产帧：面板刚打开时只能干等下一次界面变化，看起来就是黑屏；
+   * 这条消息让 server 重置视频编码，立刻给一张新的 IDR。
+   * @returns {boolean} 控制通道是否真的可写
+   */
+  requestKeyFrame() {
+    return this._send(() => Buffer.from([CONTROL_MSG_TYPE.RESET_VIDEO]), 'requestKeyFrame')
+  }
+
+  /**
    * 注入按键。
    * @param {Parameters<typeof encodeKeycode>[0]} input
    * @returns {boolean}
@@ -1297,7 +1327,25 @@ export class ScrcpyChannel extends EventEmitter {
     return true
   }
 
+  /**
+   * 收掉设备端这一次起起来的 scrcpy-server 进程。
+   * adb forward 删掉不会杀死它：服务进程会一直占着编码器，下一次启动就撞车（实测表现为
+   * 「换源后没有帧」）。按 scid 精确定位，绝不误伤别的 scrcpy 会话。
+   * @returns {void}
+   */
+  _killDeviceServer() {
+    const hex = (this._scid >>> 0).toString(16).padStart(8, '0')
+    const tag = `scid=${hex}`
+    const script = `pkill -9 -f '${tag}' 2>/dev/null; ps -A -o PID,ARGS 2>/dev/null | grep -F '${tag}' | grep -v grep | awk '{print $1}' | while read r; do kill -9 "$r" 2>/dev/null; done; echo ok`
+    this._guard('kill device server', () => {
+      void this._runCommand([...this._adbBaseArgs(), 'shell', script], { timeoutMs: 3000 })
+    })
+  }
+
   _dispose() {
+    // 0) 收掉设备端的服务进程：只删 forward 会留下僵尸，占着编码器
+    this._killDeviceServer()
+
     // 0) 收掉 forward 隧道（失败也不影响收尾，回调已 guard）
     this._guard('dispose forward', () => {
       const port = String(this._options.port)
