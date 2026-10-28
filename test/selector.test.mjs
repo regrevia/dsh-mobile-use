@@ -348,4 +348,16 @@ it('可输入框在树上标 [edit]，密码框标 [pwd]，两者不重复标', 
   assert.ok(!/\[edit\]|\[pwd\]/.test(tree.lines[2]))
   assert.equal(selectNodes({ nodes, refs: tree.refs, tree }, { editable: true }).length, 2)
 })
+
+it('swipeLine 按方向与 percent 出直线，默认行程与旧版一致，越界会夹住', () => {
+  const box = { x: 0, y: 0, w: 100, h: 200 }
+  assert.deepEqual(swipeLine(box, 'up'), [50, 170, 50, 30])
+  assert.deepEqual(swipeLine(box, 'down'), [50, 30, 50, 170])
+  assert.deepEqual(swipeLine(box, 'left'), [85, 100, 15, 100])
+  assert.deepEqual(swipeLine(box, 'right'), [15, 100, 85, 100])
+  assert.deepEqual(swipeLine(box, 'up', 0.4), [50, 140, 50, 60])
+  assert.deepEqual(swipeLine(box, 'up', 5), [50, 200, 50, 0])
+  assert.deepEqual(swipeLine(box, 'up', 0), [50, 110, 50, 90])
+  assert.deepEqual(swipeLine(box, 'up', NaN), [50, 170, 50, 30])
+})
 console.log(`\n${pass} 项通过\n`)

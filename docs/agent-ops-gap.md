@@ -145,6 +145,8 @@
 | 清空输入框 | `element.clear()` 走 W3C 一次往返 | 一次 Ctrl+A+DEL（约 120ms，与长度无关）+ 一次核对 dump；自绘控件忽略时退回单次 DEL 连发 | `52545f9` |
 | 步骤预校验 | 走到一半才发现参数写错 | `validateSteps` 在注入前逐条查：动作冲突、regex、`scroll` 范围、`scroll_direction` 取值，一次报清「第几步要改什么」 | `6aad1d1` / `39388c2` |
 
+| 按方向滑/按框滑（`adb_gesture {direction, percent, from}`） | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | 本轮 |
+
 ### 明确不抄
 
 - **Appium 整机那套**（server + session + W3C 协议）：为跨端一致性付的抽象税，对本插件是纯延迟。

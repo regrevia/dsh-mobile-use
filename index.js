@@ -1773,17 +1773,52 @@ function scrollFrames(state, size) {
  * @param {string} direction - up/down/left/right。
  * @returns {number[]} [x1,y1,x2,y2]。
  */
-function swipeLine(box, direction) {
+function swipeLine(box, direction, percent) {
+  /* percent 是走掉的行程占这条边的比例（默认 0.7，和原来 0.85→0.15 一致）：
+     小一点更稳（长列表短滑），大一点更容易甩出去。始终以中线为轴对称，起点终点都留在框内。 */
+  const travel = Math.min(1, Math.max(0.1, Number.isFinite(Number(percent)) ? Number(percent) : 0.7))
+  const from = 0.5 + travel / 2
+  const to = 0.5 - travel / 2
   const cx = Math.round(box.x + box.w / 2)
   const cy = Math.round(box.y + box.h / 2)
-  const low = Math.round(box.y + box.h * 0.85)
-  const high = Math.round(box.y + box.h * 0.15)
-  const left = Math.round(box.x + box.w * 0.15)
-  const right = Math.round(box.x + box.w * 0.85)
+  const high = Math.round(box.y + box.h * to)
+  const low = Math.round(box.y + box.h * from)
+  const left = Math.round(box.x + box.w * to)
+  const right = Math.round(box.x + box.w * from)
   return direction === 'down' ? [cx, high, cx, low]
     : direction === 'left' ? [right, cy, left, cy]
       : direction === 'right' ? [left, cy, right, cy]
         : [cx, low, cx, high]
+}
+
+/**
+ * 按控件取矩形（手势要「在某个框里滑」而不是滑一个点）。
+ * @param {string} device - 设备序列号。
+ * @param {object} sel - {ref} 或 {text|id|desc|cls, index}。
+ * @returns {Promise<{x:number,y:number,w:number,h:number}>} 矩形。
+ */
+async function rectForSelector(device, sel) {
+  const want = sel || {}
+  const state = await snapshotForSelector(device, want.snapshot_id)
+  let node
+  if (want.ref !== undefined && want.ref !== null) {
+    node = nodeForRef(device, Number(want.ref), want.snapshot_id)
+  } else {
+    node = nodeForSelector(device, {
+      text: want.text,
+      id: want.id,
+      desc: want.desc,
+      cls: want.cls,
+      exact: want.exact,
+      index: want.index,
+      snapshotId: want.snapshot_id,
+    })
+  }
+  const hit = clickTarget(nodesOf(state), node)
+  const w = Math.round(hit.x2 - hit.x1)
+  const h = Math.round(hit.y2 - hit.y1)
+  if (w < 4 || h < 4) throw new Error(`「${oneLine(node.text || node.desc || shortClass(node.cls), 16)}」没有面积（${w}×${h}），在它里面滑不动。`)
+  return { x: Math.round(hit.x1), y: Math.round(hit.y1), w, h }
 }
 
 /** 框的标识，用来记住「这个框已经滑不动了」。 */
@@ -2966,7 +3001,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_gesture',
-    description: '轨迹手势/拖拽：两个点走 input swipe（一条命令连续注入，延迟低、手感连续，适合甩动和拖拽）；三个点以上逐点发 DOWN/MOVE/UP，能画曲线、按住再拖、慢速滑。每条约 35ms 下限，单次段数 3–40。',
+    description: '轨迹手势/拖拽：给 direction 就在框里按方向滑一条直线（不用算坐标，翻了再滑几次）；给 from+to 按控件拖；给 points 画任意轨迹（三个点以上逐点发 DOWN/MOVE/UP，能画曲线、慢速滑）。两个点走 input swipe 连续注入，延迟低。每条约 35ms 下限，单次段数 3–40。',
     parameters: {
       type: 'object',
       properties: {
@@ -3004,7 +3039,9 @@ export function apply(ctx, config) {
           },
           additionalProperties: false,
         },
-        duration_ms: { type: 'integer', description: '整段耗时，默认 500' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: '手指方向（up 把下面的内容拉上来）：按方向在框里滑一条直线，不用自己算坐标。给了 points 就不要再给' },
+        percent: { type: 'number', description: '配 direction：行程占框长边的比例，0.1–1，默认 0.7；长列表想小步滑就给 0.3' },
+        duration_ms: { type: 'integer', description: '整段耗时，默认 500（direction 滑动默认 320）' },
         hold_ms: { type: 'integer', description: '起点按住多久再移动，默认 0；长按拖动给 500' },
       },
       required: [],
@@ -3027,6 +3064,30 @@ export function apply(ctx, config) {
       const device = await serial()
       const started = Date.now()
       let points = (args.points ?? []).map((pair) => pair.map((value) => Math.round(Number(value))))
+      if (args.direction !== undefined && args.direction !== null) {
+        if (points.length >= 2) throw new Error('给了 points 就不要再给 direction：两种写法选一种。')
+        if (args.percent !== undefined && !(Number(args.percent) > 0 && Number(args.percent) <= 1)) {
+          throw new Error('percent 要写 0.1–1 之间的小数，比如 0.6。')
+        }
+        /* 在哪个框里滑：给了 from 就滑它，否则挑屏上最内层的可滚容器，都没有才整屏。 */
+        const hasAnchor = args.from && ['ref', 'text', 'id', 'desc', 'cls'].some((key) => args.from[key] !== undefined && args.from[key] !== null)
+        let box
+        if (hasAnchor) {
+          box = await rectForSelector(device, args.from)
+        } else {
+          const size = await screenSize(device)
+          const state = await dumpState(device, { ocr: 'off' }).catch(() => null)
+          const frames = state === null ? [] : scrollFrames(state, size)
+          box = frames[0] ?? {
+            x: Math.round(size.width * 0.15),
+            y: Math.round(size.height * 0.2),
+            w: Math.round(size.width * 0.7),
+            h: Math.round(size.height * 0.6),
+          }
+        }
+        const line = swipeLine(box, args.direction, args.percent)
+        points = [[line[0], line[1]], [line[2], line[3]]]
+      }
       if (points.length < 2 && args.from && args.to) {
         /* 按控件拖拽：先定位再动手，页面在这两步之间变了会自动重读，不拿旧坐标拖。 */
         const start = await pointForSelector(device, args.from)
@@ -3038,7 +3099,7 @@ export function apply(ctx, config) {
       for (const pair of points) {
         if (pair.length !== 2 || pair.some((value) => !Number.isFinite(value))) throw new Error('每个点都要写成 [x,y]。')
       }
-      const duration = Math.max(60, Number(args.duration_ms ?? 500))
+      const duration = Math.max(60, Number(args.duration_ms ?? (args.direction ? 320 : 500)))
       const hold = Math.max(0, Number(args.hold_ms ?? 0))
       /* 每个点沿折线按长度均分，段数受 35ms/条的设备端下限约束。 */
       const steps = Math.max(3, Math.min(40, Math.round(duration / 40)))
@@ -5194,6 +5255,7 @@ export const __internals = {
   screenSize,
   scrollFrames,
   swipeLine,
+  rectForSelector,
   guardOutput,
   awaitChange,
   tapMissReason,
