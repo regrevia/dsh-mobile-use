@@ -13,8 +13,18 @@ const arg = (name, fallback) => {
 const times = Math.max(1, Math.min(20, Number(arg('n', 5)) || 5))
 const write = argv.includes('--write')
 const { resolveSerial, dumpState, foregroundActivity, waitFor, scrollToText, screenSize, selectNodes } = __internals
-/* 内部原语都按序列号直连 `adb -s`：不传就自己选一台，跟宿主的选择规则一致。 */
-const serial = await resolveSerial({ serial: arg('serial', process.env.ADB_SERIAL ?? '') })
+/* 内部原语都按序列号直连 `adb -s`：不传就自己选一台，跟宿主的选择规则一致。
+   自动选不出来时（没插设备、adb 没起、多台没指定）立刻说清楚，别拿着空序列号往下跑。 */
+const picked = await resolveSerial({ serial: arg('serial', process.env.ADB_SERIAL ?? '') }).catch((error) => {
+  console.error(`选设备失败：${error?.message ?? error}`)
+  console.error('先 adb devices 看一眼，或用 --serial <序列号> 指定。')
+  process.exit(1)
+})
+const serial = String(picked ?? '').trim()
+if (!serial) {
+  console.error('没选中设备：用 --serial <序列号> 指定，或先确认 adb devices 里有一台 device 状态。')
+  process.exit(1)
+}
 
 const rows = []
 const time = async (name, run) => {

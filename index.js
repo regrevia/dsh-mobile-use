@@ -964,6 +964,7 @@ function parseNodes(xml) {
       checked: read('checked') === 'true',
       selected: read('selected') === 'true',
       focused: read('focused') === 'true',
+      password: read('password') === 'true',
       x1: bounds ? Number(bounds[1]) : 0,
       y1: bounds ? Number(bounds[2]) : 0,
       x2: bounds ? Number(bounds[3]) : 0,
@@ -1330,7 +1331,7 @@ function interesting(node, full) {
  * 压缩文本树：去掉纯容器，合并父子重复文字，给可操作节点发 ref。
  * 输出格式（尽量短）：
  *   `#12 Button "登录" #login_btn @300,412 *`  — * 可点击
- *   `   ~ 可滚动   [x] 已勾选   [s] 选中   [f] 焦点`
+ *   `   ~ 可滚动   [x] 已勾选   [s] 选中   [f] 焦点   [pwd] 密码框`
  * @param {any[]} nodes - parseNodes 的结果。
  * @param {{full?: boolean, maxNodes?: number}} options - 参数。
  * @returns {{lines: string[], refs: Array<{ref: number, node: any}>, kept: number, total: number}} 结果。
@@ -1363,6 +1364,8 @@ function compactTree(nodes, options) {
       if (node.checked) tail += ' [x]'
       else if (node.selected) tail += ' [s]'
       if (node.focused) tail += ' [f]'
+      /* 密码框内容读出来是掩码，模型不该把它当普通文本填：行上直接标出来。 */
+      if (node.password) tail += ' [pwd]'
       if (node.enabled === false) tail += ' [off]'
       const ref = refs.length + 1
       refs.push({ ref, node })
@@ -1922,6 +1925,16 @@ function selectNodes(state, sel) {
     if (want.clickable === true && !(node.clickable || node.longClickable)) return false
     if (want.enabled === true && node.enabled === false) return false
     if (want.visible === true && (node.x2 - node.x1) * (node.y2 - node.y1) <= 0) return false
+    /* 控件状态按 Appium 的元素属性对齐：true 只留满足的，false 只留不满足的（「找没勾上的复选框」）。 */
+    for (const state of ['checked', 'selected', 'scrollable', 'focused', 'editable', 'password']) {
+      const wantState = want[state]
+      if (wantState === undefined || wantState === null) continue
+      const has = state === 'editable'
+        ? /EditText|AutoComplete|SearchView/i.test(String(node.cls || ''))
+        : node[state] === true
+      if (wantState === true && !has) return false
+      if (wantState === false && has) return false
+    }
     if (!inBox(node)) return false
     return true
   }
@@ -3905,7 +3918,7 @@ function matchNode(nodes, sel) {
 
 ctx.effect(() => ctx.tools.register({
   name: 'adb_find',
-  description: '按选择器搜控件，一次拿到全部命中：序号、ref（可直接 adb_tap ref=）、id、文字、描述、矩形、中心点、是否可点/可用；命中后同一快照内可直接操作，不必再 adb_ui。用于「先确认有几个、在哪、能不能点」再动手。',
+  description: '按选择器搜控件，一次拿到全部命中：序号、ref（可直接 adb_tap ref=）、id、文字、描述、矩形、中心点、是否可点/可用/勾选/选中/可滚/有焦点；命中后同一快照内可直接操作，不必再 adb_ui。用于「先确认有几个、在哪、能不能点」再动手。',
   parameters: {
     type: 'object',
     properties: {
@@ -3920,6 +3933,11 @@ ctx.effect(() => ctx.tools.register({
       clickable: { type: 'boolean', description: '只看可点控件' },
       enabled: { type: 'boolean', description: '只看可用控件' },
       visible: { type: 'boolean', description: '只看有面积的控件' },
+      checked: { type: 'boolean', description: '按勾选状态挑：true 只留已勾选，false 只留没勾选' },
+      selected: { type: 'boolean', description: '按选中状态挑（Tab/列表项）' },
+      scrollable: { type: 'boolean', description: '按可滚动挑（找列表容器时用 true）' },
+      focused: { type: 'boolean', description: '按焦点挑（找当前输入框时用 true）' },
+      editable: { type: 'boolean', description: '按能不能输入挑（EditText 一类）' },
       within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找' },
       all: { type: 'boolean', description: '保留同一处的所有层（默认按落点归并，只留最精确那层）' },
       index: { type: 'integer', description: '只返回第几个匹配，从 0 开始' },
@@ -3967,6 +3985,11 @@ ctx.effect(() => ctx.tools.register({
       clickable: args.clickable,
       enabled: args.enabled,
       visible: args.visible,
+      checked: args.checked,
+      selected: args.selected,
+      scrollable: args.scrollable,
+      focused: args.focused,
+      editable: args.editable,
       within_ref: args.within_ref,
       all: args.all,
       index: args.index,

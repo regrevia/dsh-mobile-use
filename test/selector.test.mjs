@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes } = __internals
+const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes, compactTree } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -290,5 +290,42 @@ it('步骤预检认识 wait_activity：等页面跳转，正则写错在连设�
   const bad = validateSteps([{ wait_activity: 'Scan(' }])
   assert.equal(bad.ok, false)
   assert.match(bad.problems[0], /不是合法正则/)
+})
+
+it('选择器能按控件状态挑：勾选 / 选中 / 可滚 / 焦点 / 可输入，且 false 是「没这个状态」', () => {
+  const mk = (over) => ({
+    depth: 1, text: '', id: '', cls: 'TextView', desc: '', clickable: false, longClickable: false,
+    scrollable: false, enabled: true, checked: false, selected: false, focused: false,
+    x1: 0, y1: 0, x2: 100, y2: 40, parent: -1, ...over,
+  })
+  const nodes = [
+    mk({ text: '记住我', cls: 'CheckBox', checked: true }),
+    mk({ text: '记住我', cls: 'CheckBox', checked: false, y1: 40, y2: 80 }),
+    mk({ text: '手机号', cls: 'EditText', focused: true, y1: 80, y2: 120 }),
+    mk({ cls: 'RecyclerView', scrollable: true, y1: 120, y2: 400 }),
+    mk({ text: '未读', cls: 'Tab', selected: true, y1: 400, y2: 440 }),
+  ]
+  const state = { nodes, refs: [], tree: { lines: [], refs: [], kept: nodes.length, total: nodes.length } }
+  assert.equal(selectNodes(state, { text: '记住我', checked: true }).length, 1)
+  assert.equal(selectNodes(state, { text: '记住我', checked: false }).length, 1)
+  assert.equal(selectNodes(state, { scrollable: true })[0].cls, 'RecyclerView')
+  assert.equal(selectNodes(state, { focused: true })[0].text, '手机号')
+  assert.equal(selectNodes(state, { editable: true, focused: true }).length, 1)
+  assert.equal(selectNodes(state, { editable: false, cls: 'CheckBox', text: '记住我' }).length, 2)
+  assert.equal(selectNodes(state, { selected: true })[0].text, '未读')
+  /* 状态选择器和别的条件一起用时是 AND：勾选 + 没勾上的文字不一样时不能串。 */
+  assert.equal(selectNodes(state, { text: '未读', checked: true }).length, 0)
+})
+
+it('密码框在树上标 [pwd]，也能按 password 挑出来', () => {
+  const xml = '<hierarchy><node class="android.widget.EditText" text="••••" password="true" focused="true" bounds="[0,0][400,120]" /><node class="android.widget.EditText" text="张三" bounds="[0,120][400,240]" /></hierarchy>'
+  const nodes = parseNodes(xml)
+  const tree = compactTree(nodes, {})
+  assert.match(tree.lines[0], /\[pwd\]/)
+  assert.equal(nodes[0].password, true)
+  assert.equal(nodes[1].password, false)
+  const state = { nodes, refs: tree.refs, tree }
+  assert.equal(selectNodes(state, { password: true }).length, 1)
+  assert.equal(selectNodes(state, { password: false }).length, 1)
 })
 console.log(`\n${pass} 项通过\n`)
