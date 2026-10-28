@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=150'
+import { LiveStream, packFrame } from './stream.js?v=151'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -1141,7 +1141,10 @@ export function setupMirror(ctx, tools) {
 
   /** 通知所有页面：打开「实时ADB」这一栏。 @returns {number} 通知到几个页面。 */
   function open(sessionId) {
-    wantSession = String(sessionId ?? '')
+    const wanted = String(sessionId ?? '')
+    /* 没有明确的目标会话就不广播：广播出去只可能落到「当前可见」的那一栏，也就是别的会话。 */
+    if (wanted === '') return 0
+    wantSession = wanted
     wantAt = Date.now()
     wantTitle = ''
     /* 标题只用来兜底认窗口：有些窗口是多栏的，mounted 报的是另一栏的会话。 */

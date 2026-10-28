@@ -15,14 +15,15 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, open, stat, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=173'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=175'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -742,7 +743,27 @@ async function u2Alive(port) {
 }
 
 /**
- * 在设备上把 u2 服务拉起来（jar 不在就先推）。
+ * 设备上那份 u2.jar 跟插件自带的是不是同一份。
+ * 只看「文件在不在」会把旧版 jar 当成好的，之后服务行为对不上很难查。
+ * @param {string} serial - 设备。
+ * @param {string} localPath - 本地 jar。
+ * @returns {Promise<boolean>} 一致（或设备拿不到哈希）为 true。
+ */
+async function u2JarMatches(serial, localPath) {
+  let localHash = ''
+  try {
+    localHash = createHash('sha256').update(readFileSync(localPath)).digest('hex')
+  } catch {
+    return false
+  }
+  const remote = await adb(['-s', serial, 'shell', 'sha256sum', '/data/local/tmp/u2.jar'], { timeout: 8000 })
+  const shown = (remote.out || '').trim().split(/\s+/)[0] ?? ''
+  if (remote.code !== 0 || !/^[0-9a-f]{64}$/i.test(shown)) return true
+  return shown.toLowerCase() === localHash
+}
+
+/**
+ * 在设备上把 u2 服务拉起来（jar 不在、或跟本地不是同一份就先推）。
  * @param {string} serial - 设备。
  * @returns {Promise<void>} 无。
  */
@@ -750,7 +771,8 @@ async function u2Start(serial) {
   const jar = join(U2_VENDOR, 'u2.jar')
   /* 按退出码判断文件在不在：`ls` 失败时把路径打进报错里，用「输出含 u2.jar」判断永远为真。 */
   const has = await adb(['-s', serial, 'shell', 'test', '-f', '/data/local/tmp/u2.jar'], { timeout: 8000 })
-  if (has.code !== 0) {
+  const needPush = has.code !== 0 || !(await u2JarMatches(serial, jar))
+  if (needPush) {
     if (!existsSync(jar)) throw new Error('插件缺 vendor/u2.jar，无法启动 uiautomator2 服务')
     const pushed = await adb(['-s', serial, 'push', jar, '/data/local/tmp/u2.jar'], { timeout: 120_000 })
     if (pushed.code !== 0) throw new Error(`推送 u2.jar 失败：${oneLine(pushed.err || pushed.out, 140)}`)
@@ -762,25 +784,52 @@ async function u2Start(serial) {
     { timeout: 8000 })
 }
 
+/** serial → 正在进行的冷启动：同一台设备的并发调用合并成一次，不重复拉起服务。 @type {Map<string, Promise<string>>} */
+const u2Starting = new Map()
+
 /**
  * 让某个 forward 端口后面的 u2 服务可用：没起来就拉起再等它就绪。
+ * 同一设备的并发调用共享同一次启动；只等这一个端口，不重发任何动作请求。
  * @param {string} serial - 设备。
  * @param {number} port - 本机端口。
  * @returns {Promise<string>} 空串表示可用，否则是失败原因。
  */
 async function ensureU2On(serial, port) {
   if (await u2Alive(port)) return ''
-  let error = ''
+  const running = u2Starting.get(serial)
+  if (running !== undefined) {
+    await running.catch(() => '')
+    return (await u2Alive(port)) ? '' : 'uiautomator2 服务没有起来'
+  }
+  const task = (async () => {
+    let error = ''
+    try {
+      await u2Start(serial)
+    } catch (failure) {
+      error = failure instanceof Error ? failure.message : String(failure)
+    }
+    for (let i = 0; i < 40; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      if (await u2Alive(port)) return ''
+    }
+    return error || 'uiautomator2 服务没有起来'
+  })()
+  u2Starting.set(serial, task)
   try {
-    await u2Start(serial)
-  } catch (failure) {
-    error = failure instanceof Error ? failure.message : String(failure)
+    return await task
+  } finally {
+    u2Starting.delete(serial)
   }
-  for (let i = 0; i < 40; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    if (await u2Alive(port)) return ''
-  }
-  return error || 'uiautomator2 服务没有起来'
+}
+
+/**
+ * adb 的报错说明设备根本不可达（离线、未授权、找不到设备）。
+ * 这类失败换端口也救不回来，不能当成「不支持 tcp:0」去抢固定端口。
+ * @param {string} text - 报错文本。
+ * @returns {boolean} 是设备不可达为 true。
+ */
+function deviceUnreachable(text) {
+  return /unauthorized|offline|no devices|device not found|device '.*' not found|more than one device|closed/i.test(String(text))
 }
 
 /**
@@ -797,6 +846,9 @@ async function u2Port(serial) {
     u2Cache.delete(serial)
   }
   const list = await adb(['-s', serial, 'forward', '--list'], { timeout: 8000 })
+  if (list.code !== 0) {
+    throw new Error(`uiautomator2 不可用：${oneLine(list.err || list.out || 'adb forward --list 失败', 160)}`)
+  }
   const reused = forwardFor(list.out, serial, `tcp:${U2_PORT}`)
   const reusedPort = reused === null ? 0 : Number(reused.local.replace(/^tcp:/, ''))
   if (Number.isFinite(reusedPort) && reusedPort > 0 && await u2Alive(reusedPort)) {
@@ -804,8 +856,7 @@ async function u2Port(serial) {
     return reusedPort
   }
   let lastError = ''
-  /* 主路：让 adb 自己分配端口（`tcp:0`），加 `--no-rebind` 保证不顶掉别人的转发。
-     旧注释说 37.0.1 上 tcp:0 会失败，本机 37.0.1 实测可用；失败才走下面的固定端口兜底。 */
+  /* 主路：让 adb 自己分配端口（`tcp:0`），加 `--no-rebind` 保证不顶掉别人的转发。 */
   const fresh = await adb(['-s', serial, 'forward', '--no-rebind', 'tcp:0', `tcp:${U2_PORT}`], { timeout: 8000 })
   const freshPort = Number((fresh.out ?? '').trim())
   if (fresh.code === 0 && Number.isFinite(freshPort) && freshPort > 0) {
@@ -815,20 +866,25 @@ async function u2Port(serial) {
       u2Cache.set(serial, { port: freshPort, at: Date.now() })
       return freshPort
     }
+    if (deviceUnreachable(lastError)) throw new Error(`uiautomator2 不可用：${lastError}`)
   } else {
     lastError = oneLine(fresh.err || fresh.out || `adb forward 退出码 ${fresh.code}`, 160)
+    /* 设备离线/未授权/找不到设备：换固定端口也救不回来，不抢别人的端口。 */
+    if (deviceUnreachable(lastError)) throw new Error(`uiautomator2 不可用：${lastError}`)
   }
-  /* 兜底：系统分配不可用时自己挑几个端口试；同样 `--no-rebind`，不抢别人已经在用的。 */
+  /* 兜底：只有「这版 adb 不支持 tcp:0」才试固定端口；同样 `--no-rebind`，不抢别人已经在用的。 */
   for (const port of [19108, 19208, 19308]) {
     const created = await adb(['-s', serial, 'forward', '--no-rebind', `tcp:${port}`, `tcp:${U2_PORT}`], { timeout: 8000 })
     if (created.code !== 0) {
       lastError = oneLine(created.err || created.out || `adb forward 退出码 ${created.code}`, 160)
+      if (deviceUnreachable(lastError)) break
       continue
     }
     ownForward(serial, `tcp:${port}`, `tcp:${U2_PORT}`)
     const failed = await ensureU2On(serial, port)
     if (failed !== '') {
       lastError = failed
+      if (deviceUnreachable(lastError)) break
       continue
     }
     u2Cache.set(serial, { port, at: Date.now() })
@@ -3390,7 +3446,11 @@ ctx.effect(() => ctx.tools.register({
     execute: async (args, exec) => {
       if (args.action === 'open') {
         const device = await serial()
-        const sid = exec?.agent?.session?.id
+        /* 只能开在「发起这次调用的会话」自己的右栏里：拿不到会话就什么都不开，绝不退回到屏幕上那一栏。 */
+        const sid = String(exec?.agent?.session?.id ?? exec?.session?.id ?? exec?.agent?.sessionId ?? exec?.sessionId ?? '')
+        if (sid === '') {
+          return { summary: '找不到发起这次调用的会话，没有打开侧栏（避免开到别人的会话里）。' }
+        }
         const opened = mirror.open(sid)
         const state = await mirror.status(device)
         return {

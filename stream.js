@@ -223,6 +223,29 @@ const REMUX_STALL_MS = 2000
 /** 本进程的随机标识：设备端 pid 文件名带上它，多开/重启不会互相认领对方的录屏。 */
 const RUN_TAG = Math.random().toString(36).slice(2, 8)
 
+/**
+ * 定时器 / 子进程回调 / 清理路径的统一兜底：这里漏出去的异常会冒到 host 顶层，
+ * 整个 DSH 直接以 1 退出（2026-10-27 `this.killStale is not a function` 两次事故）。
+ * 日志本身也可能失败（对象已销毁、debug 未注入），所以连写日志都要再包一层。
+ * @param {(note: string) => void} log - 写诊断日志的函数。
+ * @param {string} where - 出问题的路径。
+ * @param {() => void} run - 要执行的事。
+ * @returns {boolean} 是否正常跑完（不抛）。
+ */
+export function guardCall(log, where, run) {
+  try {
+    run()
+    return true
+  } catch (error) {
+    try {
+      log?.(`guard ${where}: ${String(error?.stack ?? error).slice(0, 400)}`)
+    } catch {
+      /* 日志也失败就算了：绝不让它变成新的未捕获异常 */
+    }
+    return false
+  }
+}
+
 export class LiveStream {
   /**
    * @param {{serial: string, adb: string, width?: number, height?: number, bitrate?: number}} options - 设备与画质。
@@ -548,11 +571,7 @@ export class LiveStream {
    * @returns {void}
    */
   guard(where, run) {
-    try {
-      run()
-    } catch (error) {
-      this.debug(`guard ${where}: ${String(error?.stack ?? error).slice(0, 400)}`)
-    }
+    guardCall((note) => this.debug(note), where, run)
   }
 
   /** 起一次录屏。 @returns {void} */
@@ -951,25 +970,26 @@ export class LiveStream {
     for (const chunk of this.lastKeyChunks) sink(packFrame(FRAME_MEDIA, chunk))
   }
 
-  /** 没人看了就停，别占着设备编码器。 @returns {void} */
+  /** 没人看了就停，别占着设备编码器。幂等：重复调用、对象已销毁都不抛。 @returns {void} */
   stop() {
     /* 换代：之前所有 in-flight 的退出/重启回调从此作废，停止之后不会自己复活。 */
-    this.generation += 1
-    if (this.idleTimer !== null) {
-      clearTimeout(this.idleTimer)
+    this.generation = (Number(this.generation) || 0) + 1
+    if (this.idleTimer != null) {
+      this.guard('stop-idle-timer', () => clearTimeout(this.idleTimer))
       this.idleTimer = null
     }
     this.stopping = true
-    if (this.restartTimer !== null) {
-      clearTimeout(this.restartTimer)
+    if (this.restartTimer != null) {
+      this.guard('stop-restart-timer', () => clearTimeout(this.restartTimer))
       this.restartTimer = null
     }
-    this.closeRemuxer()
-    this.closeJpeg()
-    const child = this.recorder
+    /* 清理方法可能没注入/已被替换（历史事故就是这么打崩 host 的），每一步单独兜底。 */
+    this.guard('stop-remuxer', () => this.closeRemuxer())
+    this.guard('stop-jpeg', () => this.closeJpeg())
+    const child = this.recorder ?? null
     this.recorder = null
     /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */
-    this.killOwnRecorder()
+    this.guard('stop-device-recorder', () => this.killOwnRecorder())
     if (child !== null) {
       try {
         child.kill('SIGKILL')
@@ -982,7 +1002,7 @@ export class LiveStream {
     this.init = null
     this.lastKeyChunks = []
     this.lastKeyBytes = 0
-    this.waiting.clear()
+    this.waiting?.clear?.()
     this.config = null
     this.firstFrameAt = 0
   }

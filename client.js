@@ -11,9 +11,15 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '154'
+window.__ADBM_BUILD = '155'
 
-window.__ModuleLoader__.load({
+/* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
+   factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。
+   注册本身若抛错则撤掉标记，让下一次还能重试。 */
+if (window.__ADBM_LOADED__ !== true) {
+  window.__ADBM_LOADED__ = true
+  try {
+    window.__ModuleLoader__.load({
   id: 'dsh-mobile-use',
   factory(require) {
     const React = require('react')
@@ -1362,11 +1368,10 @@ window.__ModuleLoader__.load({
             /* 空串和 undefined 一样，都是「右栏没挂上任何会话」：右栏收起时就是这个值。
                这不是许可，但也不该立刻放弃——挂上来只需要几十毫秒，等一下再看。 */
             const blank = mounted === undefined || mounted === null || mounted === ''
-            /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏。 */
+            /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏；标题相近不算，绝不串栏。 */
             if (typeof body.title === 'string' && body.title !== '') lastWantTitle = body.title
             const wantedTitle = String(body.title ?? lastWantTitle ?? '')
-            const sameWindow = wantedTitle !== '' && String(document.title ?? '').startsWith(wantedTitle)
-            if (mounted !== want && !sameWindow && directedLogged === false) {
+            if (mounted !== want && directedLogged === false) {
               directedLogged = true
               const names = (svc) => {
                 if (svc === undefined) return 'missing'
@@ -1380,7 +1385,7 @@ window.__ModuleLoader__.load({
               }
               report({ event: 'svc-sidebar', right: names(scope.get('sidebarRight')), tabs: names(scope.get('sidebarRightTabs')) })
             }
-            if (mounted !== want && !sameWindow) {
+            if (mounted !== want) {
               /* 不在前台也能定向开：往本会话自己的布局里建页签，不碰屏幕上的那一栏。 */
               const directed = scope.get('sidebarRight')
               if (typeof directed?.openTabIn === 'function') {
@@ -1486,4 +1491,9 @@ window.__ModuleLoader__.load({
       },
     }
   },
-})
+    })
+  } catch (error) {
+    window.__ADBM_LOADED__ = false
+    throw error
+  }
+}
