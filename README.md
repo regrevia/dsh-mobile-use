@@ -11,6 +11,15 @@ cd dsh-mobile-use
 
 环境变量（可选，都可不设）：`ADB`（adb 路径）、`ANDROID_SERIAL`（默认设备）、`FFMPEG`（转码路径）。见 `.env.example`。
 
+## 1.2（实测：画面不再播 6 秒后卡死，单帧 168 ms 上屏）
+
+| 故障 | 之前 | 现在 |
+| --- | --- | --- |
+| 播几秒后永久卡住 | 客户端拼包每帧 `Array.from` + `[].concat`，1 MB 关键帧下是 O(n²)，追不上服务端 2 MB 积压被断开，重连又补同一个 GOP，看起来就是「播 6 秒定格」 | 拼包改成「追加只拷贝一次、解析用游标」，实测连续滑动 4 秒 111 帧上屏、`readyState 4`、缓冲持续前进 |
+| 画面全黑、控制台 `APPEND_FAILED` | `sourceopen` 里先 `addSourceBuffer` 再把 INIT 排进队列，排队分片先喂给解复用器 | 先把 INIT 排到队首再挂 sourceBuffer，实测首屏直接可播（`3200x2136`） |
+| 延迟没法归因 | 只有「帧数」计数，分不清是采集慢还是播放器落后 | `stream.info()` 新增 `lastPts` / `ptsAgeMs`（最近一片的解码时间与年龄）；页面 `window.__adbm` 暴露 meta/init/media/appends/appendErr/buffer 计数，归因一次就看出来 |
+| 端到端延迟 | 未测 | 边滑动边用 `requestVideoFrameCallback` 量已上屏帧：最小 **152 ms**、中位 **168 ms**、最大 436 ms（含一次重连追赶） |
+
 ## 1.1.1（实测：宿主不再被清理路径打崩，右栏只开给发起会话）
 
 | 故障 | 之前 | 现在 |

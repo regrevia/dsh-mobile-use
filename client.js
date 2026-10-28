@@ -11,7 +11,7 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '155'
+window.__ADBM_BUILD = '161'
 
 /* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
    factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。
@@ -164,11 +164,24 @@ if (window.__ADBM_LOADED__ !== true) {
       let queue = []
       let appending = false
       let codec = ''
+      let lastLagAt = 0
       let controller = new AbortController()
 
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
       const meta = (payload) => {
         try { return JSON.parse(new TextDecoder().decode(payload)) } catch { return null }
+      }
+      /* meta.codec 缺失时（采集端还没解析出 SPS）从 init 的 avcC 直接取 profile/level：
+         否则 codec 一直是空串，MSE 永远不建，画面全黑且没有任何报错。 */
+      const codecFromInit = (bytes) => {
+        if (bytes === null || bytes === undefined || bytes.length < 16) return ''
+        const tag = [0x61, 0x76, 0x63, 0x43]
+        for (let i = 0; i + 8 < bytes.length; i += 1) {
+          if (bytes[i] !== tag[0] || bytes[i + 1] !== tag[1] || bytes[i + 2] !== tag[2] || bytes[i + 3] !== tag[3]) continue
+          const hex = (value) => value.toString(16).padStart(2, '0').toUpperCase()
+          return 'avc1.' + hex(bytes[i + 5]) + hex(bytes[i + 6]) + hex(bytes[i + 7])
+        }
+        return ''
       }
       let initPayload = null
       const reset = () => {
@@ -195,8 +208,9 @@ if (window.__ADBM_LOADED__ !== true) {
         video.src = objectUrl
         video.muted = true
         mediaSource.addEventListener('sourceopen', () => {
+          /* 先挂初始化段再挂 sourceBuffer：反了会先吐出 sourceopen 前排队的裸分片，解复用器报 APPEND_FAILED。 */
+          if (initPayload !== null) { queue = [initPayload, ...queue]; initPayload = null }
           attach()
-          if (initPayload !== null && queue.length === 0) queue = [initPayload]
           appendNext()
         })
       }
@@ -214,7 +228,9 @@ if (window.__ADBM_LOADED__ !== true) {
       const attach = () => {
         if (mediaSource === null || sourceBuffer !== null || codec === '') return
         try {
-          sourceBuffer = mediaSource.addSourceBuffer(codec)
+          /* 裸 codec 不被 Chrome 接受（NotSupportedError），必须是完整 MIME；两种都试。 */
+          try { sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"') }
+          catch (mimeError) { sourceBuffer = mediaSource.addSourceBuffer(codec) }
         } catch {
           options.onFail?.('codec')
           return
@@ -226,9 +242,17 @@ if (window.__ADBM_LOADED__ !== true) {
             if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) {
               const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
               const start = sourceBuffer.buffered.start(0)
-              /* 追到直播边缘，并扔掉 4 s 之前的，内存不会越吃越多。 */
-              if (end - video.currentTime > 1.2) video.currentTime = Math.max(start, end - 0.15)
+              /* 追到直播边缘：落后 0.6 s 直接跳到尾部，落后一点用 1.25 倍速追
+                 （小漂移不会自己收敛，不追就一直落后）；顺手扔掉 4 s 之前的。 */
+              const lag = end - video.currentTime
+              if (lag > 0.6) video.currentTime = Math.max(start, end - 0.06)
+              else video.playbackRate = lag > 0.15 ? 1.25 : 1
               if (end - start > 8 && sourceBuffer.updating === false) sourceBuffer.remove(start, end - 4)
+              /* 延迟的唯一可观测口径：把落后直播边缘多少报给宿主，/state 里看得到。 */
+              if (Date.now() - lastLagAt > 2000) {
+                lastLagAt = Date.now()
+                report({ lag_ms: Math.round(lag * 1000), buffered_s: Math.round((end - start) * 10) / 10, rate: video.playbackRate })
+              }
             }
           } catch { /* 边界状态，忽略 */ }
           appendNext()
@@ -244,6 +268,7 @@ if (window.__ADBM_LOADED__ !== true) {
         }
         if (type === STREAM_INIT) {
           initPayload = payload
+          if (codec === '') codec = codecFromInit(payload)
           reset()
           ensureSource()
           return
@@ -270,15 +295,22 @@ if (window.__ADBM_LOADED__ !== true) {
         while (!stopped) {
           const { value, done } = await reader.read()
           if (done) break
-          buf = buf.length === 0 ? value : new Uint8Array([...buf, ...value])
-          while (buf.length >= 5) {
-            const type = buf[0]
-            const len = buf[1] * 16777216 + (buf[2] << 16) + (buf[3] << 8) + buf[4]
-            if (buf.length < 5 + len) break
-            const payload = buf.slice(5, 5 + len)
-            buf = buf.slice(5 + len)
-            onFrame(type, payload)
+          /* 追加只拷贝一次、解析用游标；按帧 slice 在 1 MB 帧下是 O(n²)，会追不上积压。 */
+          if (buf.length === 0) { buf = value } else {
+            const merged = new Uint8Array(buf.length + value.length)
+            merged.set(buf)
+            merged.set(value, buf.length)
+            buf = merged
           }
+          let off = 0
+          while (buf.length - off >= 5) {
+            const type = buf[off]
+            const len = buf[off + 1] * 16777216 + (buf[off + 2] << 16) + (buf[off + 3] << 8) + buf[off + 4]
+            if (buf.length - off < 5 + len) break
+            onFrame(type, buf.subarray(off + 5, off + 5 + len))
+            off += 5 + len
+          }
+          if (off > 0) buf = buf.subarray(off)
         }
       }
       const run = async () => {

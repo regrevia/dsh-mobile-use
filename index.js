@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=175'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=194'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -575,6 +575,53 @@ async function sh(serial, cmd, timeout = 15_000) {
   } finally {
     release()
   }
+}
+
+/**
+ * logcat 行首是「MM-DD HH:MM:SS.mmm」：标出距现在多久，免得把旧崩溃当成刚发生的。
+ * @param {string} line - 原始日志行。
+ * @returns {string} 形如 `[42s前] `；解析不出时间就返回空串。
+ */
+function logAge(line) {
+  const found = /^(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\.(\d\d\d)/.exec(String(line))
+  if (found === null) return ''
+  const now = new Date()
+  const at = new Date(now.getFullYear(), Number(found[1]) - 1, Number(found[2]), Number(found[3]), Number(found[4]), Number(found[5]), Number(found[6]))
+  if (Number.isNaN(at.getTime())) return ''
+  const seconds = Math.max(0, Math.round((Date.now() - at.getTime()) / 1000))
+  if (seconds < 90) return `[${seconds}s前] `
+  if (seconds < 5400) return `[${Math.round(seconds / 60)}分钟前] `
+  return `[${Math.round(seconds / 3600)}小时前] `
+}
+
+/**
+ * 这台设备最近发生了什么：前台是谁、最近切页/进程生死/崩溃，带「多久之前」。
+ * 标注回传时和操作时间线一起给模型，让它能把「我圈的这个」和「刚才发生了什么」对上。
+ * @param {string} device - 序列号。
+ * @param {number} windowMs - 回看窗口，毫秒。
+ * @returns {Promise<string[]>} 一行一条，最多 8 行；读不到给空数组。
+ */
+async function deviceStory(device, windowMs = 120_000) {
+  const lines = []
+  const top = await sh(device, 'dumpsys activity activities | grep -m1 "topResumedActivity"', 8000).catch(() => null)
+  const topText = top && top.ok ? top.out.trim() : ''
+  const topMatch = /topResumedActivity=ActivityRecord\{[^}]*?([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)/.exec(topText)
+  if (topMatch !== null) lines.push(`现在在前台：${topMatch[1]}`)
+  const ev = await adb(['-s', device, 'shell', 'logcat', '-b', 'events', '-d', '-t', '300', '-v', 'time'], { timeout: 12_000 }).catch(() => null)
+  const raw = ev && ev.ok ? ev.out : ''
+  const keep = /am_focused_activity|wm_create_activity|am_proc_start|am_proc_died|am_crash|am_anr|am_kill/
+  const picked = []
+  for (const line of raw.split('\n')) {
+    if (!keep.test(line)) continue
+    const age = logAge(line)
+    /* 窗口外的不要：标注说的是「刚才」，回看太久反而误导。 */
+    if (age === '' || /小时前/.test(age)) continue
+    const minutes = Number(/\[(\d+)分钟前\]/.exec(age)?.[1] ?? 0)
+    if (minutes * 60_000 > windowMs) continue
+    picked.push(`${age}${line.trim().slice(0, 150)}`)
+  }
+  lines.push(...picked.slice(-6))
+  return lines
 }
 
 /** 最近的操作时间线，标注回传时一起交给模型。 @type {Array<{ at: number, what: string }>} */
@@ -1667,6 +1714,13 @@ export function apply(ctx, config) {
     resolveSerial: serial,
     uiInRect,
     recentActions,
+    /* 人手在侧栏点/滑/打字也要进同一条时间线：否则 agent 只看得到自己做过什么，
+       用户说「我刚点了没反应」时它无法判断到底有没有点、点在哪。 */
+    deviceStory,
+    noteAction: (what) => {
+      lastActions.push({ at: Date.now(), what: `人手${String(what).slice(0, 60)}` })
+      if (lastActions.length > 400) lastActions.splice(0, lastActions.length - 400)
+    },
     typeText: typeViaClipboard,
   })
   ctx.effect(() => () => {
@@ -1764,9 +1818,18 @@ export function apply(ctx, config) {
       } else {
         lastUiLines.set(device, filtered)
       }
+      /* 一眼看懂这一屏：能点几个、能滚几个、焦点在哪个输入框。
+         游戏/自绘界面文本树是空的，这里直接说清该换哪条路（截图看画面、adb_motion 量动效）。 */
+      const clickable = lines.filter((line) => line.trimEnd().endsWith('*')).length
+      const scrollable = lines.filter((line) => line.includes('~')).length
+      const focusLine = lines.find((line) => /\[f\]/.test(line) || /EditText/.test(line))
+      const digest = state.tree.kept === 0
+        ? '文本树为空（游戏或自绘界面）：用 adb_shot 看画面，动效差异用 adb_motion 量'
+        : [`可点 ${clickable}`, scrollable > 0 ? `可滚 ${scrollable}` : '', focusLine ? `焦点 ${oneLine(focusLine.replace(/\s+/g, ' ').trim(), 30)}` : ''].filter(Boolean).join(' / ')
       const summary = [
         `${state.serial} · ${state.activity || '未知页面'}`,
         `${state.tree.kept}/${state.tree.total} 节点${args.filter ? `，匹配 ${filtered.length}` : ''} · ${state.ms}ms`,
+        digest,
         state.source === 'uiautomator2' ? '' : `· 来源 ${state.source}`,
         state.ocrNote ?? '',
         state.changed ? '' : '（与上一次读取相同）',
@@ -1799,6 +1862,8 @@ export function apply(ctx, config) {
         desc: { type: 'string', description: 'content-desc 内容' },
         point: { type: 'string', description: '绝对坐标 "x,y"（屏幕像素）' },
         long: { type: 'boolean', description: '长按 600ms' },
+        repeat: { type: 'integer', description: '连点几次，1–8，默认 1；连招、双击缩放用它' },
+        interval_ms: { type: 'integer', description: '连点间隔毫秒，默认 100' },
         dry_run: { type: 'boolean', description: '只算落点、不真点（先用它确认点的是对的，避免点错返工）' },
         wait_for_text: { type: 'string', description: '点完等这段文字出现再返回，省掉一次 adb_ui 往返' },
         wait_for_id: { type: 'string', description: '点完等这个资源 id 出现' },
@@ -1865,10 +1930,29 @@ export function apply(ctx, config) {
           elapsed_ms: Date.now() - started,
         }
       }
-      const r = args.long
-        ? await sh(device, `input swipe ${x} ${y} ${x} ${y} 600`, 10_000)
-        : await sh(device, `input tap ${x} ${y}`, 10_000)
-      if (!r.ok) throw new Error(failureNote(args.long ? '长按' : '点击', r))
+      const times = Math.max(1, Math.min(8, Math.round(Number(args.repeat ?? 1))))
+      const gap = Math.max(0, Math.round(Number(args.interval_ms ?? 100)))
+      /* 快通道优先：scrcpy 控制 socket 一次写 0–1ms，没有 adb 往返；通道没就绪再退回 input。 */
+      let engine = 'adb'
+      let fastDone = fastInput.tap !== null
+      if (fastDone) {
+        for (let i = 0; i < times; i += 1) {
+          const fast = await fastInput.tap(device, x, y, { long: args.long === true })
+          if (fast === null) {
+            fastDone = false
+            break
+          }
+          if (i + 1 < times && gap > 0) await new Promise((resolve) => setTimeout(resolve, gap))
+        }
+        if (fastDone) engine = 'scrcpy'
+      }
+      if (!fastDone) {
+        /* 连点（连招、双击缩放）串在同一次 shell 里：每次仍是一条约 35ms 的 input，中间按间隔等待。 */
+        const one = args.long ? `input swipe ${x} ${y} ${x} ${y} 600` : `input tap ${x} ${y}`
+        const cmd = times === 1 ? one : Array.from({ length: times }, () => one).join(`; sleep ${(gap / 1000).toFixed(3)}; `)
+        const r = await sh(device, cmd, 10_000 + times * (gap + 900))
+        if (!r.ok) throw new Error(failureNote(args.long ? '长按' : '点击', r))
+      }
 
       lastActions.push({ at: Date.now(), what: `${args.long ? '长按' : '点击'} ${target}` })
       /* 点完顺手等结果：一次工具调用顶「点一下 + 再读一次树」，省一个模型回合。 */
@@ -1885,14 +1969,15 @@ export function apply(ctx, config) {
           ? `，等待命中 ${waited.elapsedMs}ms · 当前 ${activity || '未知页面'}`
           : `，等待超时 ${args.timeout_ms ?? 10_000}ms，界面没出现预期变化`
       }
-      const message = `${args.long ? '长按' : '点击'} ${target} 完成（${r.ms}ms）${detail || '。界面变化用 adb_ui 确认。'}`
+      const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
+      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}（${r.ms}ms）${detail || '。界面变化用 adb_ui 确认。'}`
       return { ok: true, target, activity, matched, message, elapsed_ms: Date.now() - started }
     },
   }), 'adb: adb_tap')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_gesture',
-    description: '真人轨迹手势：给一串坐标点，设备端逐点发 DOWN/MOVE/UP。两个点是直线，多个点是曲线；能做曲线拖拽、按住再拖、慢速滑，比 input swipe 的直线更像手指。逐条 input 有约 35ms 下限，单次段数 3–40。',
+    description: '轨迹手势/拖拽：两个点走 input swipe（一条命令连续注入，延迟低、手感连续，适合甩动和拖拽）；三个点以上逐点发 DOWN/MOVE/UP，能画曲线、按住再拖、慢速滑。每条约 35ms 下限，单次段数 3–40。',
     parameters: {
       type: 'object',
       properties: {
@@ -1952,13 +2037,34 @@ export function apply(ctx, config) {
         const to = points[cursor + 1] ?? points[cursor]
         path.push([Math.round(from[0] + (to[0] - from[0]) * ratio), Math.round(from[1] + (to[1] - from[1]) * ratio)])
       }
-      const pause = Math.max(0, duration / steps / 1000 - 0.035).toFixed(3)
-      const script = [`input motionevent DOWN ${path[0].join(' ')}`]
-      if (hold > 0) script.push(`sleep ${(hold / 1000).toFixed(3)}`)
-      for (const point of path.slice(1)) script.push(`sleep ${pause}`, `input motionevent MOVE ${point.join(' ')}`)
-      script.push(`input motionevent UP ${path[path.length - 1].join(' ')}`)
-      const r = await sh(device, script.join('; '), 30_000)
-      if (!r.ok) throw new Error(failureNote('手势', r))
+      /* 直线拖拽/甩动走 swipes：一条命令完成整段注入（Android 按 duration 自己连续发 MOVE），
+         比逐点 motionevent 少一个数量级的进程开销，手感也更连续；曲线和「按住再拖」仍走 motionevent。 */
+      if (points.length === 2 && hold === 0) {
+        const fastSwipe = fastInput.swipe === null ? null : await fastInput.swipe(device, points[0][0], points[0][1], points[1][0], points[1][1], Math.round(duration))
+        if (fastSwipe === null) {
+          const swipe = await sh(device, `input swipe ${points[0][0]} ${points[0][1]} ${points[1][0]} ${points[1][1]} ${Math.round(duration)}`, 30_000)
+          if (!swipe.ok) throw new Error(failureNote('滑动', swipe))
+        }
+        lastActions.push({ at: Date.now(), what: `滑动 ${points[0].join(',')}→${points[1].join(',')}（${duration}ms）` })
+        return {
+          ok: true,
+          message: `直线滑动完成：${points[0].join(',')}→${points[1].join(',')} / 约 ${Math.round(duration)}ms，${Date.now() - started}ms 返回。曲线或按住再拖给 3 个以上点。`,
+          elapsed_ms: Date.now() - started,
+        }
+      }
+      /* 轨迹点本来就插过值，通道可以直接按同样节奏走；按住再拖仍是设备侧 motionevent 更准。 */
+      const fastCurve = hold === 0 && fastInput.gesture !== null
+        ? await fastInput.gesture(device, [path], duration)
+        : null
+      if (fastCurve === null) {
+        const pause = Math.max(0, duration / steps / 1000 - 0.035).toFixed(3)
+        const script = [`input motionevent DOWN ${path[0].join(' ')}`]
+        if (hold > 0) script.push(`sleep ${(hold / 1000).toFixed(3)}`)
+        for (const point of path.slice(1)) script.push(`sleep ${pause}`, `input motionevent MOVE ${point.join(' ')}`)
+        script.push(`input motionevent UP ${path[path.length - 1].join(' ')}`)
+        const r = await sh(device, script.join('; '), 30_000)
+        if (!r.ok) throw new Error(failureNote('手势', r))
+      }
       lastActions.push({ at: Date.now(), what: `手势 ${points[0].join(',')}→${points[points.length - 1].join(',')}（${duration}ms）` })
       return {
         ok: true,
@@ -2026,8 +2132,13 @@ export function apply(ctx, config) {
         const values = args.swipe.map((value) => Number(value))
         if (values.length < 4) throw new Error('swipe 至少给 4 个数：x1,y1,x2,y2')
         const duration = values[4] ?? 300
-        const r = await sh(device, `input swipe ${values.slice(0, 4).join(' ')} ${duration}`, 15_000)
-        if (!r.ok) throw new Error(failureNote('滑动', r))
+        const fastSwipe = fastInput.swipe === null
+          ? null
+          : await fastInput.swipe(device, values[0], values[1], values[2], values[3], duration)
+        if (fastSwipe === null) {
+          const r = await sh(device, `input swipe ${values.slice(0, 4).join(' ')} ${duration}`, 15_000)
+          if (!r.ok) throw new Error(failureNote('滑动', r))
+        }
         lastActions.push({ at: Date.now(), what: `滑动 ${values.slice(0, 4).join(',')}` })
         messages.push(`已滑动 ${values.slice(0, 4).join(',')}（${duration}ms）`)
       }
@@ -2241,16 +2352,22 @@ export function apply(ctx, config) {
             const y = Math.round((hit.y1 + hit.y2) / 2)
             target = { x, y, label: `「${oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)}」@${x},${y}` }
           }
-          const r = await sh(device, `input tap ${target.x} ${target.y}`, 10_000)
-          if (!r.ok) throw new Error(`第 ${at} 步${failureNote('点击', r)}`)
+          const fastStep = fastInput.tap === null ? null : await fastInput.tap(device, target.x, target.y, {})
+          if (fastStep === null) {
+            const r = await sh(device, `input tap ${target.x} ${target.y}`, 10_000)
+            if (!r.ok) throw new Error(`第 ${at} 步${failureNote('点击', r)}`)
+          }
           lastActions.push({ at: Date.now(), what: `点击 ${target.label}` })
           done.push(`点 ${target.label}`)
         } else if (step.swipe !== undefined) {
           const s4 = step.swipe
           if (!Array.isArray(s4) || s4.length < 4) throw new Error(`第 ${at} 步 swipe 要写 [x1,y1,x2,y2,毫秒]。`)
           const ms = s4[4] ?? 300
-          const r = await sh(device, `input swipe ${s4[0]} ${s4[1]} ${s4[2]} ${s4[3]} ${ms}`, 15_000)
-          if (!r.ok) throw new Error(`第 ${at} 步${failureNote('滑动', r)}`)
+          const fastStep = fastInput.swipe === null ? null : await fastInput.swipe(device, s4[0], s4[1], s4[2], s4[3], ms)
+          if (fastStep === null) {
+            const r = await sh(device, `input swipe ${s4[0]} ${s4[1]} ${s4[2]} ${s4[3]} ${ms}`, 15_000)
+            if (!r.ok) throw new Error(`第 ${at} 步${failureNote('滑动', r)}`)
+          }
           done.push(`滑 ${s4[0]},${s4[1]}→${s4[2]},${s4[3]}`)
         } else if (step.key !== undefined) {
           const code = /^\d+$/.test(String(step.key)) ? String(step.key) : String(step.key).toUpperCase()
@@ -2897,6 +3014,107 @@ ctx.effect(() => ctx.tools.register({
       return { message: parts.join('\n\n'), crashes, anr, elapsed_ms: Date.now() - began }
     },
   }), 'adb: adb_crash')
+
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_events',
+    description: [
+      '最近这台设备上发生的事，按时间倒推一行一条：人手在侧栏点了/滑了/打了什么、agent 自己做过什么、页面切到了哪个 Activity、有没有崩溃 / ANR / 被系统杀进程。',
+      '用户说「刚才那个」「它自己跳走了」「我点了没反应」「又崩了」时先看这里，不要让他复述，也不要拿截图猜。',
+      '默认回看 3 分钟；只看某个应用的记录就传 package。',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        seconds: { type: 'integer', description: '回看多少秒，默认 180（5–900）' },
+        package: { type: 'string', description: '只看这个包名相关的事件（子串匹配）' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string' },
+          actions: { type: 'integer' },
+          events: { type: 'integer' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['message', 'actions', 'events', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const windowMs = Math.min(900, Math.max(5, Number(args.seconds ?? 180))) * 1000
+      const wanted = typeof args.package === 'string' ? args.package.trim() : ''
+      const parts = []
+
+      /* 前台是谁：两行就够，别把整份 dumpsys 拖进来。 */
+      const top = await sh(device, 'dumpsys activity activities | grep -E "topResumedActivity|mResumedActivity" | head -2', 8000).catch(() => null)
+      const topText = top && top.ok ? top.out.trim() : ''
+      parts.push(`当前前台：${topText === '' ? '读不到（可能锁屏或界面正在切）' : topText.split('\n')[0].trim()}`)
+
+      /* 操作时间线：人手与 agent 用不同前缀，谁动的设备一眼看得出来。 */
+      const actions = recentActions(windowMs)
+      parts.push(actions.length === 0
+        ? `最近 ${Math.round(windowMs / 1000)} 秒没有任何点击 / 输入操作`
+        : `最近的操作（倒推）：\n${actions.join('\n')}`)
+
+      /* 页面切换、进程生死、崩溃标记：一次 logcat 读完再筛，比按 tag 分别读快。 */
+      const log = await adb(['-s', device, 'shell', 'logcat', '-d', '-t', '600', '-v', 'time'], { timeout: 20_000 }).catch(() => null)
+      const raw = log && log.ok ? log.out : ''
+      /* 只认事件本身，不要求同一行带 tag：不同 ROM 的 tag 名不一样，卡 tag 会把切换记录全筛掉。 */
+      const keep = /START u0|Displayed com\.|Force finishing|ANR in |am_crash|am_proc_died|am_kill|WIN DEATH|Start proc |FATAL EXCEPTION/
+      const picked = []
+      if (raw !== '') {
+        for (const line of raw.split('\n')) {
+          if (!keep.test(line)) continue
+          if (wanted !== '' && !line.includes(wanted)) continue
+          picked.push(line.trim())
+        }
+      }
+      const events = picked.slice(-24).map((line) => `${logAge(line)}${line.slice(0, 240)}`)
+      if (events.length === 0) parts.push(wanted === '' ? '日志里没有页面切换 / 进程事件' : `日志里没有 ${wanted} 的页面切换 / 进程事件`)
+      else parts.push(`页面与进程事件（最后 ${events.length} 条）：\n${events.join('\n')}`)
+
+      /* 默认 main 缓冲里通常没有 ActivityTaskManager 的切页记录（都被应用日志挤掉了），
+         系统自己的切换在 events 缓冲里：am_focused_activity / am_proc_start / wm_create_activity 才是准的。 */
+      const evLog = await adb(['-s', device, 'shell', 'logcat', '-b', 'events', '-d', '-t', '400', '-v', 'time'], { timeout: 15_000 }).catch(() => null)
+      const evRaw = evLog && evLog.ok ? evLog.out : ''
+      const evKeep = /am_focused_activity|wm_create_activity|wm_destroy_activity|am_proc_start|am_proc_died|am_crash|am_anr|am_kill|am_activity_launch_time|wm_on_resume_called/
+      const evPicked = []
+      if (evRaw !== '') {
+        for (const line of evRaw.split('\n')) {
+          if (!evKeep.test(line)) continue
+          if (wanted !== '' && !line.includes(wanted)) continue
+          evPicked.push(line.trim())
+        }
+      }
+      const switches = evPicked.slice(-16).map((line) => `${logAge(line)}${line.slice(0, 200)}`)
+      if (switches.length > 0) parts.push(`切页与进程事件（系统事件缓冲，最后 ${switches.length} 条）：\n${switches.join('\n')}`)
+
+      /* 崩溃缓冲单独读：和上面混在一起时 FATAL 堆栈会被普通日志冲掉。 */
+      const crash = await adb(['-s', device, 'shell', 'logcat', '-b', 'crash', '-d', '-t', '12'], { timeout: 12_000 }).catch(() => null)
+      const crashText = crash && crash.ok ? crash.out.trim() : ''
+      if (crashText !== '' && (wanted === '' || crashText.includes(wanted))) {
+        /* 缓冲里的旧记录不能当成「刚刚崩了」：每行标出距现在多久，边界按整行切。 */
+        const crashLines = crashText.split('\n').slice(-14).map((line) => `${logAge(line)}${line.slice(0, 240)}`)
+        parts.push(`崩溃缓冲（最近 ${crashLines.length} 行，标了距现在多久）：\n${crashLines.join('\n')}`)
+      } else if (crashText !== '' && wanted !== '') {
+        parts.push(`崩溃缓冲里有记录，但和 ${wanted} 无关`)
+      }
+
+      parts.push('要更早的记录用 adb_sh 跑 logcat -d；要看某个应用的完整堆栈用 adb_crash。')
+      return {
+        message: parts.join('\n\n'),
+        actions: actions.length,
+        events: events.length,
+        elapsed_ms: Date.now() - began,
+      }
+    },
+  }), 'adb: adb_events')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_web',

@@ -20,10 +20,29 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=151'
+import { LiveStream, packFrame } from './stream.js?v=160'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=3'
+import { PLAYER_HTML } from './page.js?v=7'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
+
+/**
+ * 低延迟注入入口：setupMirror 里装上实现；没装/没就绪时每个方法都回 null，调用方退回 adb。
+ * 返回 null 是「这条路不通」，不是失败，所以调用方必须自己兜底。
+ */
+export const fastInput = {
+  /** @type {null | ((serial: string, x: number, y: number, options?: any) => Promise<any>)} */
+  tap: null,
+  /** @type {null | ((serial: string, x1: number, y1: number, x2: number, y2: number, ms: number) => Promise<any>)} */
+  swipe: null,
+  /** @type {null | ((serial: string, tracks: number[][][], ms: number) => Promise<any>)} */
+  gesture: null,
+  /** @type {null | ((serial: string, keycode: number, options?: any) => Promise<any>)} */
+  key: null,
+  /** @type {null | ((serial: string) => any)} */
+  raw: null,
+}
 
 /**
  * 节拍器回调兜底：异常冒到 host 顶层会直接把整个 DSH 带走（2026-10-27 事故），
@@ -1100,10 +1119,223 @@ export class Mirror {
  * @returns {{ open: () => number, status: (serial?: string) => Promise<object>, stopAll: () => void }} 给工具层用的入口。
  */
 export function setupMirror(ctx, tools) {
+  /**
+   * 人手在侧栏的动作也写进宿主的时间线：agent 要能回答「用户到底点了没有」。
+   * 时间线坏了不能挡住输入，所以整段包在 try 里。
+   * @param {string} what - 动作描述。
+   * @returns {void}
+   */
+  const note = (what) => {
+    try {
+      tools.noteAction?.(what)
+    } catch { /* 时间线不是关键路径 */ }
+  }
   const mirrors = new Map()
   const events = new Set()
   /** 每台设备的 H.264 推流。 @type {Map<string, LiveStream>} */
   const streams = new Map()
+
+  /* 低延迟通道：一台设备一条 scrcpy 连接，懒启动，失败就永久退回 adb。
+     host 不能因为它崩：起停全在 guard 里，启动 Promise 失败也只记一个 failed。 */
+  const channels = new Map()
+  let channelSeq = 0
+
+  /**
+   * 拿一台设备的低延迟通道，没就绪就顺手启动（异步，不阻塞调用方）。
+   * @param {string} serial - 设备。
+   * @param {boolean} [autoStart] - 没就绪时是否启动。
+   * @returns {any | null} 已就绪的通道；没就绪给 null。
+   */
+  function channelFor(serial, autoStart = true) {
+    let entry = channels.get(serial)
+    if (entry === undefined) {
+      entry = { channel: null, ready: null, failed: false, starting: false }
+      channels.set(serial, entry)
+      try {
+        channelSeq += 1
+        const channel = new ScrcpyChannel({
+          serial,
+          adbPath: tools.adb.path,
+          port: 27185 + channelSeq,
+          log: (note) => ctx.logger?.debug?.(`[scrcpy] ${String(note)}`),
+        })
+        entry.channel = channel
+        channel.on?.('closed', () => { entry.ready = null })
+      } catch {
+        entry.failed = true
+      }
+    }
+    if (autoStart && entry.failed !== true && entry.ready === null && entry.starting !== true && entry.channel !== null) {
+      entry.starting = true
+      void Promise.resolve()
+        .then(() => entry.channel.start())
+        .then((ok) => {
+          entry.starting = false
+          if (ok === true) entry.ready = entry.channel
+          else entry.failed = true
+        })
+        .catch(() => {
+          entry.starting = false
+          entry.failed = true
+        })
+    }
+    return entry.ready
+  }
+
+  /**
+   * 等一台设备的低延迟通道就绪：最多 2.5 秒。等不到给 null，调用方退回 screenrecord。
+   * @param {string} serial - 设备。
+   * @returns {Promise<any | null>} 就绪的通道。
+   */
+  async function waitSource(serial) {
+    const ready = channelFor(serial)
+    if (ready !== null) return ready
+    const entry = channels.get(serial)
+    if (entry === undefined || entry.failed === true) return null
+    const deadline = Date.now() + 2500
+    while (Date.now() < deadline) {
+      await tick(120)
+      if (entry.ready !== null) return entry.ready
+      if (entry.failed === true) return null
+    }
+    return null
+  }
+
+  /** 触控消息的公共字段：坐标空间 = 视频尺寸 = 设备像素。 @returns {any | null} 尺寸没读到给 null。 */
+  function touchBase(channel) {
+    const info = channel?.info ?? null
+    const width = Number(info?.width) || 0
+    const height = Number(info?.height) || 0
+    if (!(width > 0) || !(height > 0)) return null
+    return { screenWidth: width, screenHeight: height, pressure: 1, buttons: 1 }
+  }
+
+  /** 微秒级等待。 @returns {Promise<void>} */
+  function tick(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
+  }
+
+  /**
+   * 点一下（可选长按）。
+   * @returns {Promise<{ok: boolean, engine: string} | null>} null 表示这条路不通，调用方退回 adb。
+   */
+  async function scrcpyTap(serial, x, y, options = {}) {
+    const channel = channelFor(serial)
+    if (channel === null) return null
+    const base = touchBase(channel)
+    if (base === null) return null
+    const px = Math.round(Number(x) || 0)
+    const py = Math.round(Number(y) || 0)
+    if (channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: px, y: py }) !== true) return null
+    if (options.long === true) await tick(Math.max(120, Math.min(3000, Number(options.holdMs) || 620)))
+    const ok = channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: px, y: py, pressure: 0, buttons: 0 })
+    return ok === true ? { ok: true, engine: 'scrcpy' } : null
+  }
+
+  /** 一条直线滑动：12~24 个 MOVE，按总时长均分，手感接近真实手指。 @returns {Promise<any | null>} 结果。 */
+  async function scrcpySwipe(serial, x1, y1, x2, y2, ms) {
+    const channel = channelFor(serial)
+    if (channel === null) return null
+    const base = touchBase(channel)
+    if (base === null) return null
+    const total = Math.max(16, Math.min(4000, Math.round(Number(ms) || 300)))
+    /* 一次注入的离散点：60 Hz 起步（16 ms 一步），上限 60 步；pushTouch 只要 0.28 ms，密一点不会拖慢。 */
+    const steps = Math.max(3, Math.min(60, Math.round(total / 16)))
+    const fromX = Math.round(Number(x1) || 0)
+    const fromY = Math.round(Number(y1) || 0)
+    const toX = Math.round(Number(x2) || 0)
+    const toY = Math.round(Number(y2) || 0)
+    if (channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: fromX, y: fromY }) !== true) return null
+    for (let i = 1; i <= steps; i += 1) {
+      const k = i / steps
+      channel.pushTouch({
+        ...base,
+        action: TOUCH_ACTION.MOVE,
+        x: Math.round(fromX + (toX - fromX) * k),
+        y: Math.round(fromY + (toY - fromY) * k),
+      })
+      await tick(total / steps)
+    }
+    const ok = channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: toX, y: toY, pressure: 0, buttons: 0 })
+    return ok === true ? { ok: true, engine: 'scrcpy' } : null
+  }
+
+  /**
+   * 多条轨迹同时走（单指滑动、双指缩放都走这里）。
+   * @returns {Promise<any | null>} 结果；多于 5 指或多步轨迹长度不一致时不接。
+   */
+  async function scrcpyGesture(serial, tracks, ms) {
+    const channel = channelFor(serial)
+    if (channel === null) return null
+    const base = touchBase(channel)
+    if (base === null) return null
+    if (!Array.isArray(tracks) || tracks.length === 0 || tracks.length > 5) return null
+    if (!tracks.every((track) => Array.isArray(track) && track.length >= 2)) return null
+    const total = Math.max(16, Math.min(4000, Math.round(Number(ms) || 300)))
+    const steps = Math.max(3, Math.min(24, Math.round(total / 40)))
+    const at = (track, k) => {
+      const pos = k * (track.length - 1)
+      const index = Math.min(track.length - 2, Math.floor(pos))
+      const frac = pos - index
+      const ax = Number(track[index][0]) || 0
+      const ay = Number(track[index][1]) || 0
+      const bx = Number(track[index + 1][0]) || 0
+      const by = Number(track[index + 1][1]) || 0
+      return [Math.round(ax + (bx - ax) * frac), Math.round(ay + (by - ay) * frac)]
+    }
+    const pointers = tracks.map((track, index) => ({ track, pointerId: index }))
+    /* 第一根手指就是普通 DOWN；后面的手指用 POINTER_DOWN 挂上去。 */
+    const first = at(pointers[0].track, 0)
+    if (channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: first[0], y: first[1], pointerId: 0 }) !== true) return null
+    for (const pointer of pointers.slice(1)) {
+      const spot = at(pointer.track, 0)
+      channel.pushTouch({ ...base, action: TOUCH_ACTION.POINTER_DOWN, x: spot[0], y: spot[1], pointerId: pointer.pointerId })
+    }
+    for (let i = 1; i <= steps; i += 1) {
+      const k = i / steps
+      for (const pointer of pointers) {
+        const spot = at(pointer.track, k)
+        channel.pushTouch({ ...base, action: TOUCH_ACTION.MOVE, x: spot[0], y: spot[1], pointerId: pointer.pointerId })
+      }
+      await tick(total / steps)
+    }
+    for (const pointer of pointers.slice(1).reverse()) {
+      const spot = at(pointer.track, 1)
+      channel.pushTouch({ ...base, action: TOUCH_ACTION.POINTER_UP, x: spot[0], y: spot[1], pointerId: pointer.pointerId, pressure: 0, buttons: 0 })
+    }
+    const last = at(pointers[0].track, 1)
+    const ok = channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: last[0], y: last[1], pointerId: 0, pressure: 0, buttons: 0 })
+    return ok === true ? { ok: true, engine: 'scrcpy' } : null
+  }
+
+  /** 按键（keycode 数字）。 @returns {Promise<any | null>} 结果。 */
+  async function scrcpyKey(serial, keycode, options = {}) {
+    const channel = channelFor(serial)
+    if (channel === null) return null
+    const code = Number(keycode)
+    if (!Number.isFinite(code) || code <= 0) return null
+    if (channel.pushKeycode({ action: KEY_ACTION.DOWN, keycode: code, metastate: Number(options.metastate) || 0 }) !== true) return null
+    if (options.holdMs !== undefined && Number(options.holdMs) > 0) await tick(Number(options.holdMs))
+    const ok = channel.pushKeycode({ action: KEY_ACTION.UP, keycode: code, metastate: Number(options.metastate) || 0 })
+    return ok === true ? { ok: true, engine: 'scrcpy' } : null
+  }
+
+  fastInput.tap = scrcpyTap
+  fastInput.swipe = scrcpySwipe
+  fastInput.gesture = scrcpyGesture
+  fastInput.key = scrcpyKey
+  fastInput.raw = (serial) => {
+    const channel = channelFor(serial)
+    if (channel === null) return null
+    const base = touchBase(channel)
+    if (base === null) return null
+    return {
+      engine: 'scrcpy',
+      down: (x, y, pointerId = 0) => channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: Math.round(x), y: Math.round(y), pointerId }),
+      move: (x, y, pointerId = 0) => channel.pushTouch({ ...base, action: TOUCH_ACTION.MOVE, x: Math.round(x), y: Math.round(y), pointerId }),
+      up: (x, y, pointerId = 0) => channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: Math.round(x), y: Math.round(y), pointerId, pressure: 0, buttons: 0 }),
+    }
+  }
 
   /**
    * 拿一台设备的镜像，没有就建。
@@ -1118,7 +1350,14 @@ export function setupMirror(ctx, tools) {
   function streamFor(serial) {
     let stream = streams.get(serial)
     if (stream === undefined) {
-      stream = new LiveStream({ serial, adb: tools.adb.path })
+      stream = new LiveStream({
+        serial,
+        adb: tools.adb.path,
+        /* 有低延迟通道就用它的 H.264：连续出帧、少一个设备编码器；没就绪退回 screenrecord。 */
+        sourceReady: () => channelFor(serial),
+        /* 通道还在连的时候等它一下（≤2.5s），别先起 screenrecord 再切。 */
+        sourceWait: () => waitSource(serial),
+      })
       /* 空闲回收前先问一句：镜像还有人在看（/live 常连或刚拉过帧）就别停。 */
       stream.stillWanted = () => {
         const mirror = mirrors.get(serial)
@@ -1193,7 +1432,6 @@ export function setupMirror(ctx, tools) {
       const bare = session.replace(/^session-/, '')
       const known = items.find((item) => String(item.sessionId) === session)
         ?? items.find((item) => String(item.sessionId).replace(/^session-/, '') === bare)
-        ?? items.find((item) => String(item.sessionId).endsWith(bare))
       if (known !== undefined) session = String(known.sessionId)
     } catch { /* 列不出来就按原样试一次 */ }
     const controller = ctx.get?.('sessionController')
@@ -1216,6 +1454,11 @@ export function setupMirror(ctx, tools) {
     }
     const timeline = typeof tools.recentActions === 'function' ? tools.recentActions(90_000) : []
     if (timeline.length > 0) lines.push(`圈选前的操作（时间倒推）：\n${timeline.join('\n')}`)
+    /* 用户圈一下不说话时，「刚才设备上发生了什么」才是能对上他意思的那条线。 */
+    if (typeof tools.deviceStory === 'function') {
+      const story = await tools.deviceStory(String(input.serial ?? ''), 120_000).catch(() => [])
+      if (story.length > 0) lines.push(`最近这台设备上发生的事：\n${story.join('\n')}`)
+    }
     const strip = await mirrorFor(String(input.serial ?? '')).recentStrip(6).catch(() => null)
     lastStripBytes = strip?.length ?? 0
     if (strip !== null) {
@@ -1316,6 +1559,16 @@ export function setupMirror(ctx, tools) {
    * @param {string[]} args - input 之后的参数。
    * @returns {Promise<{ ok: boolean, reason?: string }>} 结果。
    */
+  /* 快通道要数字 keycode；没收录的名字就退回 adb。 */
+  const KEYCODE_BY_NAME = Object.freeze({
+    HOME: 3, BACK: 4, CALL: 5, ENDCALL: 6, VOLUME_UP: 24, VOLUME_DOWN: 25, POWER: 26,
+    CAMERA: 27, TAB: 61, ENTER: 66, DEL: 67, MENU: 82, NOTIFICATION: 83, SEARCH: 84,
+    MEDIA_PLAY_PAUSE: 85, MEDIA_STOP: 86, MEDIA_NEXT: 87, MEDIA_PREVIOUS: 88,
+    PAGE_UP: 92, PAGE_DOWN: 93, APP_SWITCH: 187, WAKEUP: 224, SLEEP: 223,
+    ESCAPE: 111, SPACE: 62, DPAD_UP: 19, DPAD_DOWN: 20, DPAD_LEFT: 21, DPAD_RIGHT: 22,
+    DPAD_CENTER: 23, MOVE_HOME: 122, FORWARD_DEL: 112,
+  })
+
   async function input(serial, args) {
     const result = await tools.adb(['-s', serial, 'shell', 'input', ...args], { timeout: 8000 })
     if (!result.ok) return { ok: false, reason: result.err.slice(0, 200) || 'adb 执行失败' }
@@ -1580,6 +1833,11 @@ export function setupMirror(ctx, tools) {
       return
     }
     try {
+      if (path === '/' && req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        return res.end(PLAYER_HTML)
+      }
+
       if (path === '/events' && req.method === 'GET') {
         res.writeHead(200, {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -1750,6 +2008,14 @@ export function setupMirror(ctx, tools) {
           serial,
           build: CLIENT_BUILD,
           stream: (streams.get(serial) ?? null)?.info() ?? null,
+          /* 低延迟通道状态：ready 就代表注入走 socket 写，不再吃 adb 往返。 */
+          fastInput: (() => {
+            const entry = channels.get(serial)
+            if (entry === undefined) return { state: 'idle' }
+            if (entry.failed === true) return { state: 'fallback' }
+            if (entry.ready !== null) return { state: 'ready', port: Number(entry.channel?._options?.port) || 0 }
+            return { state: entry.starting === true ? 'starting' : 'idle' }
+          })(),
           started: mirror.startedAt,
           frames: mirror.frames,
           fps: mirror.measuredFps(),
@@ -1771,7 +2037,7 @@ export function setupMirror(ctx, tools) {
           error: mirror.error,
           pages: events.size,
           want: wantSession,
-          clients: [...clients.values()].map(({ pid, at, mounted, title, beat }) => ({ pid, at, mounted, title, beat })),
+          clients: [...clients.values()].map(({ pid, at, mounted, title, beat, lag_ms }) => ({ pid, at, mounted, title, beat, lag_ms })),
           diag,
         })
       }
@@ -1784,11 +2050,15 @@ export function setupMirror(ctx, tools) {
 
       if (path === '/tap' && req.method === 'POST') {
         const body = await readJson(req)
+        const serial = String(body.serial ?? '')
+        note(`${body.long === true ? '长按' : '点击'} ${Math.round(Number(body.x))},${Math.round(Number(body.y))}`)
+        const fast = await scrcpyTap(serial, Number(body.x), Number(body.y), { long: body.long === true })
+        if (fast !== null) return json(fast)
         const x = String(Math.round(body.x))
         const y = String(Math.round(body.y))
         /* 长按用同点 swipe 顶住 700 ms：input 没有 longpress 子命令。 */
         const args = body.long === true ? ['swipe', x, y, x, y, '700'] : ['tap', x, y]
-        return json(await input(String(body.serial ?? ''), args))
+        return json(await input(serial, args))
       }
 
       if (path === '/scroll' && req.method === 'POST') {
@@ -1803,11 +2073,16 @@ export function setupMirror(ctx, tools) {
         const from = dy > 0 ? y + span / 2 : y - span / 2
         const to = dy > 0 ? y - span / 2 : y + span / 2
         const ms = String(Math.max(120, Math.min(320, Math.round(span * 0.5))))
+        const fast = await scrcpySwipe(serial, x, from, x, to, Number(ms))
+        if (fast !== null) return json(fast)
         return json(await input(serial, ['swipe', String(x), String(Math.round(from)), String(x), String(Math.round(to)), ms]))
       }
 
       if (path === '/swipe' && req.method === 'POST') {
         const body = await readJson(req)
+        note(`滑动 ${Math.round(Number(body.x1))},${Math.round(Number(body.y1))}→${Math.round(Number(body.x2))},${Math.round(Number(body.y2))}`)
+        const fastSwipe = await scrcpySwipe(String(body.serial ?? ''), body.x1, body.y1, body.x2, body.y2, Number(body.ms ?? 300))
+        if (fastSwipe !== null) return json(fastSwipe)
         return json(await input(String(body.serial ?? ''), [
           'swipe',
           String(Math.round(body.x1)), String(Math.round(body.y1)),
@@ -1827,7 +2102,11 @@ export function setupMirror(ctx, tools) {
               && Number.isFinite(Number(point[0])) && Number.isFinite(Number(point[1]))))
         if (!ok) return json({ ok: false, reason: '轨迹格式不对' })
         const ms = Math.max(16, Math.min(2000, Number(body.ms ?? 240)))
-        return json(await gesture(serial, tracks.map((track) => track.map((point) => [Number(point[0]), Number(point[1])])), ms))
+        const points = tracks.map((track) => track.map((point) => [Number(point[0]), Number(point[1])]))
+        note(`手势 ${points.length} 指 ${ms}ms`)
+        const fast = await scrcpyGesture(serial, points, ms)
+        if (fast !== null) return json(fast)
+        return json(await gesture(serial, points, ms))
       }
 
       if (path === '/raw' && req.method === 'POST') {
@@ -1835,10 +2114,13 @@ export function setupMirror(ctx, tools) {
         const serial = String(body.serial ?? '')
         if (serial === '') return json({ ok: false, reason: '缺少参数' })
         const ms = Math.max(16, Math.min(2000, Number(body.ms ?? 200)))
-        return json(await gesture(serial, [[
+        const points = [[
           [Number(body.x1 ?? 0), Number(body.y1 ?? 0)],
           [Number(body.x2 ?? 0), Number(body.y2 ?? 0)],
-        ]], ms))
+        ]]
+        const fast = await scrcpyGesture(serial, points, ms)
+        if (fast !== null) return json(fast)
+        return json(await gesture(serial, points, ms))
       }
 
       if (path === '/pinch' && req.method === 'POST') {
@@ -1860,6 +2142,7 @@ export function setupMirror(ctx, tools) {
         const serial = String(body.serial ?? '')
         const text = String(body.text ?? '').slice(0, 400)
         if (serial === '' || text === '') return json({ ok: false, reason: '缺少参数' })
+        note(`输入 ${text.length} 字`)
         if (/[^\x20-\x7e]/.test(text)) {
           /* 中文没有 input text 可用：剪贴板 + 长按粘贴，由宿主传下来。 */
           try {
@@ -1875,7 +2158,15 @@ export function setupMirror(ctx, tools) {
 
       if (path === '/key' && req.method === 'POST') {
         const body = await readJson(req)
-        return json(await input(String(body.serial ?? ''), ['keyevent', String(body.key ?? 'BACK')]))
+        const serial = String(body.serial ?? '')
+        const name = String(body.key ?? 'BACK').toUpperCase()
+        note(`按键 ${name}`)
+        const keycode = Number.isFinite(Number(body.keycode)) ? Number(body.keycode) : KEYCODE_BY_NAME[name]
+        if (keycode !== undefined) {
+          const fast = await scrcpyKey(serial, keycode, { holdMs: Number(body.holdMs) || 0 })
+          if (fast !== null) return json(fast)
+        }
+        return json(await input(serial, ['keyevent', name]))
       }
 
       if (path === '/want' && req.method === 'GET') {
@@ -2007,6 +2298,15 @@ export function setupMirror(ctx, tools) {
         try { stream.stop() } catch { /* 已经停了 */ }
       }
       streams.clear()
+      for (const entry of channels.values()) {
+        try { void entry.channel?.stop?.() } catch { /* 已经停了 */ }
+      }
+      channels.clear()
+      fastInput.tap = null
+      fastInput.swipe = null
+      fastInput.gesture = null
+      fastInput.key = null
+      fastInput.raw = null
       for (const mirror of mirrors.values()) mirror.stop()
       mirrors.clear()
       for (const res of events) {

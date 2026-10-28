@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-use",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": false,
   "description": "真机调试插件：界面文本树、动效数据、实时画面侧栏与圈选标注",
   "type": "module",
@@ -63,6 +63,6 @@
     "debugging"
   ],
   "scripts": {
-    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs"
+    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs"
   }
 }

@@ -111,8 +111,15 @@ const shot = await call('adb_shot', { scale: 600 })
 ok('截图', `${shot.value.path} ${shot.value.width}x${shot.value.height} ${Math.round(shot.value.bytes / 1024)}KB, ${shot.ms}ms`)
 
 console.log('\n[7] adb_ui 等待命中（已存在的文字应立刻返回）')
-const waited = await call('adb_ui', { wait_for_text: needle, timeout_ms: 3000 })
-if (waited.value.matched) ok(`wait_for_text="${needle}"`, `${waited.ms}ms`)
+let waited = await call('adb_ui', { wait_for_text: needle, timeout_ms: 3000 })
+if (!waited.value.matched) {
+  /* 首页翻页指示这类文字每帧都在变，第一次挑中的 needle 可能已经消失：
+     换一个当次读到的文字重试，别把偶发当成缺陷（要查的是等待机制本身）。 */
+  const again = await call('adb_ui', {})
+  const alt = again.value.tree.split('\n').map((line) => /"([^"]{2,})"/.exec(line)?.[1]).find((each) => each && each !== needle)
+  if (alt) waited = await call('adb_ui', { wait_for_text: alt, timeout_ms: 3000 })
+}
+if (waited.value.matched) ok(`wait_for_text`, `${waited.ms}ms`)
 else bad('等待没命中', waited.value.summary)
 
 console.log('\n[8] 错误路径：不存在的 ref')
@@ -145,15 +152,18 @@ console.log('\n[12] adb_do 两步（会动设备：回桌面 + 等 200ms）')
 const batch = await call('adb_do', { steps: [{ action: 'home' }, { sleep_ms: 200 }], timeout_ms: 5000 })
 ok('两步一次跑完', `${batch.value.steps} 步 / ${batch.ms}ms`)
 
-console.log('\n[13] 推流接口（/stream/info + /stream 3 秒）')
+console.log('\n[13] 推流接口（/stream/info + /stream 9 秒）')
 /* 宿主端口会变：从环境变量取，默认当前的 GUI 端口。 */
 const base = process.env.DSH_ADB_BASE ?? 'http://127.0.0.1:' + (process.env.DSH_PORT ?? '55409') + '/dsh-mobile-use'
 const info = await fetch(`${base}/stream/info?serial=${encodeURIComponent(device.value.serial)}`).then((res) => res.json()).catch(() => null)
 if (info === null) bad('拿不到 /stream/info')
 else ok('/stream/info 可读', `codec=${info.codec || '(未开)'} clients=${info.clients}`)
 try {
+  /* 冷启动要 push jar、拉 scrcpy、等 ffmpeg 吐 moov（实测 1.5–3 s）：先抓一帧把链路预热，
+     否则 3 秒窗口经常连初始化段都还没到，测的是启动时间不是链路。 */
+  await fetch(`${base}/frame?serial=${encodeURIComponent(device.value.serial)}`).then((res) => res.arrayBuffer()).catch(() => null)
   const control = new AbortController()
-  const timer = setTimeout(() => control.abort(), 3000)
+  const timer = setTimeout(() => control.abort(), 9000)
   const res = await fetch(`${base}/stream?serial=${encodeURIComponent(device.value.serial)}`, { signal: control.signal })
   const reader = res.body.getReader()
   let bytes = 0
