@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes } = __internals
+const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -224,7 +224,6 @@ it('界面树解实体：换行、&、引号、十六进制都能还原，认不
   assert.equal(nodes[1].text, '坏实体&#xZZ; 与裸&')
 })
 
-console.log(`\n${pass} 项通过\n`)
 
 it('报错建议按查找维度给：按 id 提示 id、按类名提示类名、按文字提示文字', () => {
   const screen = {
@@ -247,3 +246,39 @@ it('报错建议按查找维度给：按 id 提示 id、按类名提示类名、
   assert.equal(nearMiss(screen, { cls: '' }), '')
   assert.equal(nearMiss({ nodes: [] }, { text: '设置' }), '')
 })
+
+it('等待条件能一次等多个 / 任一 / 某个包，缺失的单一条件都不算过', () => {
+  const screen = {
+    activity: 'com.whale.pet/.MainActivity',
+    nodes: [
+      { text: '加载完成', desc: '', id: 'okTip', pkg: 'com.whale.pet', cls: 'TextView' },
+      { text: '重试', desc: '', id: 'retryBtn', pkg: 'com.whale.pet', cls: 'Button' },
+      { text: '网络异常', desc: '', id: 'errTip', pkg: 'com.whale.pet', cls: 'TextView' },
+    ],
+  }
+  assert.equal(matches(screen, { texts: ['加载完成', '重试'] }), true)
+  assert.equal(matches(screen, { texts: ['加载完成', '确定'] }), false)
+  assert.equal(matches(screen, { any_texts: ['确定', '重试'] }), true)
+  assert.equal(matches(screen, { any_texts: ['确定', '取消'] }), false)
+  assert.equal(matches(screen, { any_texts: [] }), true)
+  assert.equal(matches(screen, { pkg: 'whale' }), true)
+  assert.equal(matches(screen, { pkg: 'com.tencent.mm' }), false)
+  assert.equal(matches(screen, { activity: 'mainactivity', texts: ['重试'] }), true)
+  assert.equal(matches(screen, { gone: '网络异常' }), false)
+  assert.equal(matches(screen, { gone: '网络异常', any_texts: ['加载完成'] }), false)
+})
+
+it('步骤预检认识 wait_all / wait_any：空数组、非文字、超 8 条都在连设备之前拒掉', () => {
+  assert.equal(validateSteps([{ wait_all: ['加载完成', '确定'] }]).ok, true)
+  assert.equal(validateSteps([{ tap: '确定', wait_any: ['已发送', '失败'] }]).ok, true)
+  const empty = validateSteps([{ wait_all: [] }])
+  assert.equal(empty.ok, false)
+  assert.match(empty.problems[0], /wait_all 要写文字数组/)
+  const bad = validateSteps([{ wait_any: ['好的', 42] }])
+  assert.equal(bad.ok, false)
+  assert.match(bad.problems[0], /每一项都要是非空文字/)
+  const many = validateSteps([{ wait_all: Array.from({ length: 9 }, (_, i) => `条件${i}`) }])
+  assert.equal(many.ok, false)
+  assert.match(many.problems[0], /最多 8 条/)
+})
+console.log(`\n${pass} 项通过\n`)

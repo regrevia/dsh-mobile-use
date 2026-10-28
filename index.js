@@ -202,7 +202,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_text', 'wait_gone', 'assert_text', 'assert_gone', 'sleep_ms']
+  const preconditions = ['wait_idle', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'assert_text', 'assert_gone', 'sleep_ms']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -234,6 +234,17 @@ function validateSteps(steps) {
     }
     if (step.sleep_ms !== undefined && !(Number.isFinite(Number(step.sleep_ms)) && Number(step.sleep_ms) >= 0)) {
       problems.push(`第 ${at} 步 sleep_ms 要写非负毫秒数。`)
+    }
+    for (const key of ['wait_all', 'wait_any']) {
+      if (step[key] === undefined) continue
+      const list = Array.isArray(step[key]) ? step[key] : null
+      if (list === null || list.length === 0) {
+        problems.push(`第 ${at} 步 ${key} 要写文字数组，例如 ["加载完成","确定"]。`)
+      } else if (list.length > 8) {
+        problems.push(`第 ${at} 步 ${key} 最多 8 条，太多就等于没条件。`)
+      } else if (!list.every((item) => typeof item === 'string' && item.trim() !== '')) {
+        problems.push(`第 ${at} 步 ${key} 里每一项都要是非空文字。`)
+      }
     }
   }
   return { ok: problems.length === 0, problems }
@@ -1403,33 +1414,53 @@ const lastUiLines = new Map()
 
 /**
  * 判断 waitPredicate 是否满足。
+ * text/id/desc/texts/any_texts/gone 都按「文字、描述、id 里包含」判断；activity 当正则；
+ * pkg 同时看前台 Activity 和节点上的包名（u2 树里系统浮层也会带别的包名）。
  * @param {any} state - 一次 dump 的状态。
- * @param {{text?: string, id?: string, desc?: string, activity?: string, gone?: string}} want - 条件。
+ * @param {{text?: string, id?: string, desc?: string, activity?: string, gone?: string, texts?: string[], any_texts?: string[], pkg?: string}} want - 条件。
  * @returns {boolean} 是否满足。
  */
 function matches(state, want) {
-  const present = (needle) => {
-    if (!needle) return true
-    const lower = needle.toLowerCase()
+  const hit = (needle) => {
+    const lower = String(needle).toLowerCase()
     return state.nodes.some((node) => `${node.text} ${node.desc} ${node.id}`.toLowerCase().includes(lower))
   }
-  const absent = (needle) => {
-    if (!needle) return true
-    const lower = needle.toLowerCase()
-    return !state.nodes.some((node) => `${node.text} ${node.desc} ${node.id}`.toLowerCase().includes(lower))
-  }
+  const present = (needle) => (needle ? hit(needle) : true)
+  const absent = (needle) => (needle ? !hit(needle) : true)
   if (want.activity && !new RegExp(want.activity, 'i').test(state.activity)) return false
+  if (want.pkg) {
+    const pkg = String(want.pkg).toLowerCase()
+    const somewhere = String(state.activity || '').toLowerCase().includes(pkg)
+      || state.nodes.some((node) => String(node.pkg || '').toLowerCase().includes(pkg))
+    if (!somewhere) return false
+  }
   if (!present(want.text)) return false
   if (!present(want.id)) return false
   if (!present(want.desc)) return false
   if (!absent(want.gone)) return false
+  /* 全部都要在：一次等两个条件（标题 + 按钮），省掉两次往返。 */
+  for (const needle of normalList(want.texts)) if (!hit(needle)) return false
+  /* 满足任意一个就算过：加载完 / 报错弹窗，两种结局都能继续往下走。 */
+  const anyOf = normalList(want.any_texts)
+  if (anyOf.length > 0 && !anyOf.some((needle) => hit(needle))) return false
   return true
+}
+
+/**
+ * 把「一段文字或一组文字」统一成去空数组。
+ * @param {any} value - 字符串或字符串数组。
+ * @returns {string[]} 非空字符串数组。
+ */
+function normalList(value) {
+  if (value === undefined || value === null) return []
+  const list = Array.isArray(value) ? value : [value]
+  return list.map((item) => String(item).trim()).filter(Boolean)
 }
 
 /**
  * 等待界面满足条件，替代 sleep + 截图。每 120ms 一次 dump（u2 一次约 0.12s）。
  * @param {string} serial - 设备。
- * @param {{text?: string, id?: string, desc?: string, activity?: string, gone?: string}} want - 条件。
+ * @param {{text?: string, id?: string, desc?: string, activity?: string, gone?: string, texts?: string[], any_texts?: string[], pkg?: string}} want - 条件。
  * @param {number} timeoutMs - 超时。
  * @returns {Promise<{matched: boolean, elapsedMs: number, state: any}>} 结果。
  */
@@ -3339,6 +3370,8 @@ export function apply(ctx, config) {
               action: { type: 'string', description: '系统动作：home / back / recents / lock / wake / notifications / quick_settings' },
               wait_text: { type: 'string', description: '等这段文字出现再做下一步' },
               wait_gone: { type: 'string', description: '等这段文字消失再做下一步' },
+              wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
+              wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
               assert_gone: { type: 'string', description: '这一步做完核对这段文字必须消失' },
               sleep_ms: { type: 'integer', description: '硬等多久（尽量用 wait_text 代替）' },
@@ -3460,11 +3493,23 @@ export function apply(ctx, config) {
           done.push(`等静止 ${Date.now() - idleStart}ms`)
         }
 
-        if (step.wait_text !== undefined || step.wait_gone !== undefined) {
-          const waited = await waitFor(device, { text: step.wait_text, gone: step.wait_gone }, limit)
+        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined) {
+          const waited = await waitFor(device, {
+            text: step.wait_text,
+            gone: step.wait_gone,
+            texts: step.wait_all,
+            any_texts: step.wait_any,
+          }, limit)
           activity = waited.state.activity
-          if (!waited.matched) throw new Error(`第 ${at} 步等界面超时 ${limit}ms：${step.wait_text ? `没等到「${step.wait_text}」` : `「${step.wait_gone}」还在`}`)
-          done.push(`等 ${step.wait_text ?? '界面变化'} ${waited.elapsedMs}ms`)
+          if (!waited.matched) {
+            const wanted = step.wait_text ? `没等到「${step.wait_text}」`
+              : step.wait_gone ? `「${step.wait_gone}」还在`
+                : step.wait_all ? `「${normalList(step.wait_all).join('」「')}」没全出现`
+                  : `「${normalList(step.wait_any).join('」「')}」一个都没出现`
+            throw new Error(`第 ${at} 步等界面超时 ${limit}ms：${wanted}`)
+          }
+          const what = step.wait_text ?? (step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
+          done.push(`等 ${what} ${waited.elapsedMs}ms`)
         } else if (step.sleep_ms !== undefined) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.sleep_ms) || 0, 15_000)))
           done.push(`等 ${step.sleep_ms}ms`)
@@ -4960,7 +5005,7 @@ ctx.effect(() => ctx.tools.register({
         '',
         '判定顺序：先 `adb_state`（前台 Activity + 窗口栈 + 键盘 + 方向，约 0.5s），再 `adb_ui`（界面文本树）。不要用截图回答「页面对不对 / 有没有弹窗 / 键盘挡住没 / 跳没跳页 / 有没有报错」——报错用 `adb_sh logcat -d -t 200`。',
         '要等接口返回、跳转或弹窗，传 `wait_for_text` / `wait_for_activity`，不要 sleep 后再截图；`adb_tap` 点完会自己回执界面有没有变，没变就是可疑信号（被挡住/没点中/还在动画）。',
-        '连着做的一串动作（点开→等加载→输入→发送、或先回桌面再进目标页）用 `adb_do` 一次调用跑完，比一步一调少好几个回合；每一步可带 `assert_text` / `assert_gone` 核对，失败会停在那一步并报出当前页面。',
+        '连着做的一串动作（点开→等加载→输入→发送、或先回桌面再进目标页）用 `adb_do` 一次调用跑完，比一步一调少好几个回合；每一步可带 `assert_text` / `assert_gone` 核对，也可带 `wait_all`（几段文字全出现）/ `wait_any`（任一出现就算过，加载完或报错弹窗两种结局都往下走），失败会停在那一步并报出当前页面和屏上的文字。',
         '只想知道「刚才点了之后变了什么」用 `adb_ui changed_only=true`（只给新增/消失的行）。桌面、返回、最近任务、锁屏、亮屏、转屏、通知栏、夜间模式用 `adb_action` 一条命令，不要再去界面里找按钮。',
         '点击用 `adb_tap`（ref / 文字 / id，自己或最近可点祖先里挑更准的落点；ref 来自最近一次 `adb_ui`），不确定有哪些就先 `adb_find`（一次拿全部命中 + ref + 坐标），列表里找不到用 `adb_scroll_to` 边滑边找；输入用 `adb_input`，装包启停用 `adb_app`。要拖拽、曲线滑、按住再拖这种手指轨迹，用 `adb_gesture`（逐点 DOWN/MOVE/UP，比 `input swipe` 的直线更像真人）。顶部状态、开关这类一步就能改的，直接 `adb_sh`（如 `settings put system font_scale 1.15`、`svc wifi enable`、`pm grant`），比点 UI 快且不会点歪。设备已 root 时 `adb_sh root=true cmd="cat /data/data/<包名>/shared_prefs/x.xml"` 能直接读应用存储、数据库、dropbox —— 状态类问题先读存储，比走 UI 点进去更准。',
         '`adb_shot` 只在这些时候用：颜色/布局/相机扫码画面/图表，或文本树几乎全是空节点（Flutter、自绘、部分 WebView）。图缩到长边 900px，配 `read_image` 看。「文本树看着是空的」先别急着截图：`adb_ui` 发现可读文字少于 4 个会自动跑一次 macOS 视觉 OCR，把识别出的文字当成可点击节点补进树里（来源标记 `+ocr`），慢 200ms 但省掉一次截图回合。',
