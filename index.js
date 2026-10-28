@@ -192,6 +192,54 @@ function oneLine(value, limit) {
 }
 
 /**
+ * 一次调用跑一串动作之前，先在本地把 steps 检查一遍：有错当场说清第几步哪里矛盾，
+ * 不要连上设备跑一半再停。纯函数，不碰设备。
+ * @param {any[]} steps - adb_do 的 steps。
+ * @returns {{ok: boolean, problems: string[]}} problems 是给人看的一句话列表。
+ */
+function validateSteps(steps) {
+  const problems = []
+  const list = Array.isArray(steps) ? steps : []
+  if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
+  const actions = ['tap', 'id', 'ref', 'swipe', 'key', 'text', 'action', 'scroll_to']
+  const preconditions = ['wait_idle', 'wait_text', 'wait_gone', 'assert_text', 'assert_gone', 'sleep_ms']
+  const directions = ['up', 'down', 'left', 'right']
+  for (const [index, step] of list.entries()) {
+    const at = index + 1
+    if (step === null || typeof step !== 'object' || Array.isArray(step)) {
+      problems.push(`第 ${at} 步不是一个对象。`)
+      continue
+    }
+    const used = actions.filter((key) => step[key] !== undefined)
+    if (used.length === 0 && !preconditions.some((key) => step[key] !== undefined)) {
+      problems.push(`第 ${at} 步什么都没做：给一个动作（tap/id/ref/scroll_to/swipe/key/text/action）。`)
+      continue
+    }
+    if (used.length > 1) {
+      problems.push(`第 ${at} 步同时给了 ${used.slice(0, 3).join(' 和 ')}：一步只做一个动作。`)
+    }
+    if (step.long !== undefined && !['tap', 'id', 'ref'].includes(used[0] ?? '')) {
+      problems.push(`第 ${at} 步 long 只能配 tap / id / ref 用。`)
+    }
+    if (step.ref !== undefined && !(Number.isInteger(step.ref) && step.ref >= 1)) {
+      problems.push(`第 ${at} 步 ref 要从 1 开始的整数。`)
+    }
+    if (step.swipe !== undefined) {
+      const ok = Array.isArray(step.swipe) && step.swipe.length >= 4
+        && step.swipe.slice(0, 4).every((item) => Number.isFinite(Number(item)))
+      if (!ok) problems.push(`第 ${at} 步 swipe 要写 [x1,y1,x2,y2] 四个数，最后一位毫秒可选。`)
+    }
+    if (step.direction !== undefined && !directions.includes(String(step.direction))) {
+      problems.push(`第 ${at} 步 direction 只能是 up / down / left / right。`)
+    }
+    if (step.sleep_ms !== undefined && !(Number.isFinite(Number(step.sleep_ms)) && Number(step.sleep_ms) >= 0)) {
+      problems.push(`第 ${at} 步 sleep_ms 要写非负毫秒数。`)
+    }
+  }
+  return { ok: problems.length === 0, problems }
+}
+
+/**
  * 失败现场的一行摘要：从界面树里挑最能说明「现在屏上有什么」的几行文字。
  * 失败回执自带这一段，agent 不用再多调一次 adb_ui 才知道自己停在哪屏。
  * @param {string[]} lines - compactTree 输出的行，形如 ` 3 TextView "登录" @540,1200 *`。
@@ -3237,6 +3285,9 @@ export function apply(ctx, config) {
       render: (_args, value) => textBlock(value.summary),
     },
     execute: async (args) => {
+      /* 先在本地把整串检查一遍：写错了当场报第几步，不要跑一半停住把界面留在半路。 */
+      const checked = validateSteps(args.steps)
+      if (!checked.ok) throw new Error(`steps 有 ${checked.problems.length} 处要改：${checked.problems.join('；')}`)
       const device = await serial()
       const began = Date.now()
       const limit = args.timeout_ms ?? 8000
@@ -4853,6 +4904,7 @@ export const __internals = {
   shortId,
   displaySizeFrom,
   digestLine,
+  validateSteps,
   scrollFrames,
   swipeLine,
   guardOutput,

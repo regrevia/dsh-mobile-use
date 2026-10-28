@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine } = __internals
+const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -195,6 +195,22 @@ it('失败现场摘要：只取带文字的控件行、去重、截行数，空�
   assert.equal(digestLine([], 4), '')
   assert.equal(digestLine(null, 4), '')
   assert.match(digestLine(lines, 5), /…$/)
+})
+
+it('步骤预检：空 steps、一步两个动作、long 配错、swipe/ref/direction 写坏，都在连设备之前说清第几步', () => {
+  assert.equal(validateSteps([]).ok, false)
+  assert.match(validateSteps([]).problems[0], /至少要写一步/)
+  assert.equal(validateSteps([{ tap: '登录' }, { wait_text: '首页' }]).ok, true)
+  assert.equal(validateSteps([{ scroll_to: '关于手机' }, { wait_idle: true }]).ok, true)
+  const both = validateSteps([{ tap: '登录' }, { tap: '确定', key: 'BACK' }])
+  assert.equal(both.ok, false)
+  assert.match(both.problems[0], /^第 2 步同时给了 tap 和 key/)
+  assert.match(validateSteps([{ tap: '登录', long: true }, { text: '你好', long: true }]).problems[0], /long 只能配/)
+  assert.match(validateSteps([{ ref: 0 }]).problems[0], /ref 要从 1 开始/)
+  assert.match(validateSteps([{ swipe: [1, 2, 3] }]).problems[0], /swipe 要写/)
+  assert.match(validateSteps([{ scroll_to: '设置', direction: 'up2' }]).problems[0], /direction 只能是/)
+  assert.match(validateSteps([{ sleep_ms: -1 }]).problems[0], /sleep_ms 要写非负/)
+  assert.match(validateSteps([{ note: 'x' }]).problems[0], /什么都没做/)
 })
 
 console.log(`\n${pass} 项通过\n`)
