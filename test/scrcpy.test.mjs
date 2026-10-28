@@ -614,7 +614,7 @@ it('buildServerShellCommand 用 CLASSPATH + app_process 启动', () => {
   const command = buildServerShellCommand({ scid: 1 })
   assert.equal(
     command,
-    'CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server ' +
+    'CLASSPATH=/data/local/tmp/dsh-mobile-use-scrcpy-server.jar app_process / com.genymobile.scrcpy.Server ' +
       '5.0.1 scid=00000001 log_level=info tunnel_forward=false video=true audio=false control=true',
   )
   assert.ok(buildServerShellCommand({ deviceServerPath: '/tmp/x.jar' }).startsWith('CLASSPATH=/tmp/x.jar '))

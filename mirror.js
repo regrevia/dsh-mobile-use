@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=204'
-import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=9'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=11'
 import { PLAYER_HTML } from './page.js?v=28'
 
 /** 客户端与宿主共用的路由前缀。 */
@@ -1181,6 +1181,13 @@ export function setupMirror(ctx, tools) {
            缓存着那个死对象，于是「等采集源」永远等不到，只能退回 screenrecord 那条死路。
            断开就把它扔掉，下一次 channelFor 重新 new 一条（新端口、新 scid）。 */
         channel.on?.('closed', () => {
+          /* 丢掉对象之前必须 stop 一次：server 在设备侧是靠 dispose 才收掉的，
+             光丢掉引用会留下一个占着编码器的僵尸（实测下一轮「连上就断」）。 */
+          try {
+            channel.stop?.()
+          } catch {
+            /* 已经停了 */
+          }
           entry.ready = null
           entry.channel = null
           entry.starting = false

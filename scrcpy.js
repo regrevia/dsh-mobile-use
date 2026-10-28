@@ -795,6 +795,10 @@ export class ScrcpyChannel extends EventEmitter {
     this._log(`scrcpy 通道启动: scid=${this._scid.toString(16)} port=${this._options.port}`)
 
     try {
+      /* 上一轮被丢弃的通道可能把设备端 server 留在那儿占着编码器（新 server 拿到
+         header 后立刻断，表现为「连上就掉」的抖动）。本站的 jar 路径是插件独占的，
+         起新进程前先清干净，绝不误伤别的 scrcpy 会话。 */
+      await this._reapOwnServers()
       if (!(await this._pushServer())) return this._fail('推送 scrcpy-server 失败')
       if (this._stopped) return false
       if (!this._spawnServer()) return this._fail('启动 scrcpy-server 失败')
@@ -807,6 +811,7 @@ export class ScrcpyChannel extends EventEmitter {
       if (this._stopped) return false
       if (!ready) return this._fail('等待 scrcpy socket 超时')
       this._state = 'running'
+      this._videoRedials = 0
       this._log('scrcpy 通道已就绪')
       this.emitSafe('ready')
       return true
@@ -864,6 +869,8 @@ export class ScrcpyChannel extends EventEmitter {
    */
   async _forward() {
     const port = String(this._options.port)
+    /* 上一轮可能留下同端口的 forward，旧隧道会先 accept 再断，先摘掉再加。 */
+    await this._runCommand([...this._adbBaseArgs(), 'forward', '--remove', `tcp:${port}`]).catch(() => null)
     const name = `localabstract:scrcpy_${this._scid.toString(16).padStart(8, '0')}`
     const result = await this._runCommand([...this._adbBaseArgs(), 'forward', `tcp:${port}`, name])
     if (!result.ok) {
@@ -1074,17 +1081,69 @@ export class ScrcpyChannel extends EventEmitter {
 
   _attachVideo(socket) {
     this._video = socket
+    this._videoBytes = 0
+    this._videoAttachAt = Date.now()
     this._log('视频 socket 已连接')
     socket.on('data', (chunk) => {
+      this._videoBytes += chunk.length
       this._guard('video data', () => this._onVideoData(chunk))
     })
     socket.on('close', () => {
       this._guard('video close', () => {
-        this._log('视频 socket 已关闭')
         this._video = null
-        if (this._state === 'running') this.emitSafe('closed')
+        if (this._state !== 'running') return
+        /* adb forward 的旧隧道会先 accept 再断：这种 socket 连上时 0 字节、几十毫秒就没。
+           它不是「server 死了」，重建整条链路要多花 1~3 秒，重拨一次更便宜。 */
+        const transient = this._videoBytes === 0
+          && Date.now() - this._videoAttachAt < 2000
+          && this._videoRedials < 3
+          && this._stopped !== true
+        if (transient) {
+          this._videoRedials += 1
+          this._log(`视频 socket 刚连上就断（0 字节），重拨第 ${this._videoRedials} 次`)
+          const timer = setTimeout(() => {
+            this._guard('video redial', () => this._redialVideo())
+          }, 120)
+          timer.unref?.()
+          return
+        }
+        this._log('视频 socket 已关闭')
+        this.emitSafe('closed')
       })
     })
+  }
+
+  /** 重拨视频 socket：失败累计到 3 次才判定整条通道失效。 */
+  _redialVideo() {
+    if (this._stopped === true || this._state !== 'running') return
+    Promise.resolve()
+      .then(() => this._dial())
+      .then((socket) => {
+        this._guard('video redial done', () => {
+          if (this._stopped === true || this._state !== 'running') {
+            socket?.destroy?.()
+            return
+          }
+          if (socket !== null && socket !== undefined) {
+            this._attachSocket(socket)
+            return
+          }
+          if (this._videoRedials < 3) {
+            this._videoRedials += 1
+            const timer = setTimeout(() => {
+              this._guard('video redial again', () => this._redialVideo())
+            }, 200)
+            timer.unref?.()
+            return
+          }
+          this._fail('视频 socket 重拨 3 次都失败')
+        })
+      })
+      .catch((error) => {
+        this._guard('video redial catch', () => {
+          this._fail(`视频 socket 重拨异常: ${error?.message ?? error}`)
+        })
+      })
   }
 
   _attachControl(socket) {
@@ -1333,6 +1392,19 @@ export class ScrcpyChannel extends EventEmitter {
    * 「换源后没有帧」）。按 scid 精确定位，绝不误伤别的 scrcpy 会话。
    * @returns {void}
    */
+  /** 清掉设备上跑着本站 jar 的残留 server（只认插件独占路径）。 */
+  async _reapOwnServers() {
+    try {
+      await this._runCommand([
+        ...this._adbBaseArgs(),
+        'shell',
+        "pkill -9 -f 'dsh-mobile-use-scrcpy-server.jar' 2>/dev/null; echo ok",
+      ], { timeoutMs: 2000 })
+    } catch {
+      /* 清不掉就照旧起，别为了收尾把启动搞坏 */
+    }
+  }
+
   _killDeviceServer() {
     const hex = (this._scid >>> 0).toString(16).padStart(8, '0')
     const tag = `scid=${hex}`

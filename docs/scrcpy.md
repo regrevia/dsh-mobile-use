@@ -341,3 +341,23 @@ server 参数拼装、`stop()` 幂等与敌对对象（child 无 `kill`、socket
 | `engine: "adb-input"`（通道不可用回退） | p50 172ms |
 
 回退要如实标注：`{"ok":true,"engine":"adb-input"}`。两条路差一个数量级，模型据此判断手感对不对，别让它猜。
+
+## 14. 通道抖动与设备端僵尸 server（2026-10-28 实测）
+
+冷启动本来是 1006–1516ms，某天连测三轮变成 2014 / 2538 / 7557ms，`sessions` 一路 1→3→6，`stalls` 出现。日志里的形状很固定：
+
+```
+scrcpy 采集源已接上 gen=2
+scrcpy 通道断开 gen=2        ← 10ms 后
+```
+
+**根因**：上一轮被丢弃的通道对象把设备端 `app_process … scrcpy-server` 留在那儿，一直占着 `c2.qti.avc.encoder`。新 server 能连上 socket、能收到 12 字节头，但编码器拿不到帧，于是它自己退出 → 视频 socket 立刻断。stream 看见断就重建 → 又留下一个僵尸 → 越测越慢。设备上 `ps -A -o PID,ARGS | grep -F dsh-mobile-use-scrcpy` 一次能查到 20 分钟前的进程。
+
+**三处修法**：
+1. `channel.on('closed')` 里先 `channel.stop()` 再丢掉引用——只丢引用不 dispose，server 永远不会收。
+2. `start()` 起新进程前 `pkill -9 -f 'dsh-mobile-use-scrcpy-server.jar'`（jar 路径是插件独占的，不会误伤别人的 scrcpy）。
+3. 视频 socket **连上 0 字节就断**且 2 秒内、重拨未满 3 次时，只重拨 socket（约 120ms），不重建整条链路；只有收到过字节的真断才 `emitSafe('closed')`。另外 `_forward()` 先 `forward --remove` 再 `add`，摘掉上一轮残留的同端口隧道（旧隧道会先 accept 再断，就是这个 0 字节来源）。
+
+修完同样三轮：**2021 / 1510 / 1510ms，1600×1068，init 1，stalls 0**，首包 +212~275ms、moov 再 +78~254ms，僵尸进程只剩正在跑的那一个。
+
+判读口径：`sessions` 每轮 +1 是正常的（每次开流新建一个采集源）；**同一轮里涨 3 次以上**才说明在抖动。
