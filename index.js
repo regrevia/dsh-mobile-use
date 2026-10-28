@@ -192,6 +192,28 @@ function oneLine(value, limit) {
 }
 
 /**
+ * 失败现场的一行摘要：从界面树里挑最能说明「现在屏上有什么」的几行文字。
+ * 失败回执自带这一段，agent 不用再多调一次 adb_ui 才知道自己停在哪屏。
+ * @param {string[]} lines - compactTree 输出的行，形如 ` 3 TextView "登录" @540,1200 *`。
+ * @param {number} [limit] - 最多取几行。
+ * @returns {string} 形如「登录 | 我的设备 | 设置」的摘要；没有文字控件时返回空串。
+ */
+function digestLine(lines, limit = 4) {
+  const picked = []
+  for (const raw of Array.isArray(lines) ? lines : []) {
+    const line = String(raw)
+    const quoted = /"([^"]+)"/.exec(line)
+    /* 没有文字的容器行（只有类和坐标）说明不了现场，跳过。 */
+    const body = quoted === null ? '' : quoted[1]
+    const value = oneLine(body, 24)
+    if (value === '' || picked.includes(value)) continue
+    picked.push(value)
+    if (picked.length >= limit) break
+  }
+  return picked.join(' | ')
+}
+
+/**
  * 常驻 shell 通道：每次 `adb shell xxx` 都要新起 adb 进程并握手（实测 70–90ms），
  * 常驻一条交互 shell 后提交命令只花 2–4ms，`input tap` 从 80ms 降到 35–48ms。
  * @type {Map<string, {child: any, buf: string, onChunk: ((text: string) => void) | null, dead: boolean}>}
@@ -3326,11 +3348,21 @@ export function apply(ctx, config) {
       }
       } catch (error) {
         const message = String((error && error.message) || error)
-        const now = await foregroundActivity(device).catch(() => '')
+        /* 失败现场自己说话：当前页面 + 屏上的一段文字，省掉「失败后再调一次 adb_ui」。 */
+        let now = ''
+        let digest = ''
+        try {
+          const state = await dumpState(device, { maxNodes: 200, changed: false })
+          now = state.activity ?? ''
+          digest = digestLine(state.tree?.lines ?? [], 4)
+        } catch {
+          now = await foregroundActivity(device).catch(() => '')
+        }
         const hint = /没有|越界|ambiguous_target|核对失败/.test(message)
           ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
           : ''
-        throw new Error(`${message}${now ? ` · 当前页面 ${now}` : ''}${hint ? ` · ${hint}` : ''}`)
+        const where = [now ? `当前页面 ${now}` : '', digest ? `屏上 ${digest}` : ''].filter(Boolean).join(' · ')
+        throw new Error(`${message}${where ? ` · ${where}` : ''}${hint ? ` · ${hint}` : ''}`)
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
       const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
@@ -4820,6 +4852,7 @@ export const __internals = {
   compactTree,
   shortId,
   displaySizeFrom,
+  digestLine,
   scrollFrames,
   swipeLine,
   guardOutput,

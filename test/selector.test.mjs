@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason } = __internals
+const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -179,6 +179,22 @@ it('点空归因：键盘挡、弹窗挡、目标不可点、页面换了，各�
   assert.match(tapMissReason(plain, tap, { text: '已消失', clickable: true, desc: '' }, null), /不在这屏/)
   assert.match(tapMissReason(plain, tap, null, { activity: '.Other' }), /页面已经切换/)
   assert.match(tapMissReason({ nodes: [], activity: '' }, tap, null, null), /读不到/)
+})
+
+it('失败现场摘要：只取带文字的控件行、去重、截行数，空树给空串', () => {
+  const lines = [
+    ' 1 FrameLayout @540,1000',
+    ' 2 TextView "登录" @540,400 *',
+    ' 3 TextView "登录" @540,401 *',
+    ' 4 TextView "我的设备" @540,800 *',
+    '   5 EditText "账号或密码" @540,1200 ~',
+    ' 6 TextView "这段文字很长很长很长很长很长很长很长很长很长很长很长" @540,1600',
+  ]
+  assert.equal(digestLine(lines, 3), '登录 | \u6211\u7684\u8bbe\u5907 | 账号或密码')
+  assert.equal(digestLine([' 1 FrameLayout @1,2'], 4), '')
+  assert.equal(digestLine([], 4), '')
+  assert.equal(digestLine(null, 4), '')
+  assert.match(digestLine(lines, 5), /…$/)
 })
 
 console.log(`\n${pass} 项通过\n`)
