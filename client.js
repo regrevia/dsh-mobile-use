@@ -38,15 +38,14 @@ if (window.__ADBM_LOADED__ !== true) {
         'type.hint': '手机画面同步显示，点一下就是点手机',
         'act.mark': '标注',
         'act.tap': '点按',
-        'act.send': '发送',
+        'act.send': '发到对话',
         'act.clear': '清除',
-        'act.recent': '近几秒',
+        'act.recent': '最近画面',
         'empty.none': '没有连接设备，插上线就会自己出现',
         'empty.gone': '设备已断开，插回来自动恢复',
         'state.starting': '画面准备中',
-        'state.sent': '已发送',
+        'state.sent': '已发到对话',
         'state.failed': '发送失败',
-        'ph.note': '说一下这是什么',
         'ph.text': '输入文字',
         'act.text': '输入',
         'act.fit': '适应',
@@ -62,15 +61,14 @@ if (window.__ADBM_LOADED__ !== true) {
         'type.hint': 'The phone screen, live; tap it to tap the phone',
         'act.mark': 'Mark',
         'act.tap': 'Tap',
-        'act.send': 'Send',
+        'act.send': 'Send to chat',
         'act.clear': 'Clear',
-        'act.recent': 'Last seconds',
+        'act.recent': 'Recent frames',
         'empty.none': 'No device connected; plug one in',
         'empty.gone': 'Device disconnected; plug it back in',
         'state.starting': 'Starting',
-        'state.sent': 'Sent',
+        'state.sent': 'Sent to chat',
         'state.failed': 'Send failed',
-        'ph.note': 'Say what this is',
         'ph.text': 'Type text',
         'act.text': 'Type',
         'act.fit': 'Fit',
@@ -418,7 +416,6 @@ if (window.__ADBM_LOADED__ !== true) {
       const [serial, setSerial] = React.useState('')
       const [devices, setDevices] = React.useState([])
       const [mode, setMode] = React.useState('tap')
-      const [note, setNote] = React.useState('')
       const [status, setStatus] = React.useState('')
       const [ready, setReady] = React.useState(false)
       const [screen, setScreen] = React.useState({ w: 0, h: 0 })
@@ -1143,7 +1140,7 @@ if (window.__ADBM_LOADED__ !== true) {
             body: JSON.stringify({
               serial,
               session: sessionId,
-              note,
+              note: '',
               png,
               rect,
               frozen_at: frozenAt,
@@ -1154,7 +1151,6 @@ if (window.__ADBM_LOADED__ !== true) {
             setStatus(L('state.sent'))
             strokes.current = []
             frozen.current = null
-            setNote('')
             paint()
           } else {
             setStatus(String(answer?.reason ?? L('state.failed')))
@@ -1176,11 +1172,10 @@ if (window.__ADBM_LOADED__ !== true) {
           const answer = await fetch(`${ROUTE}/annotate`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ serial, session: sessionId, note, recent: true, png: '', rect: null }),
+            body: JSON.stringify({ serial, session: sessionId, note: '', recent: true, png: '', rect: null }),
           }).then((res) => res.json())
           if (answer?.ok === true) {
             setStatus(L('state.sent'))
-            setNote('')
           } else {
             setStatus(String(answer?.reason ?? L('state.failed')))
           }
@@ -1280,13 +1275,6 @@ if (window.__ADBM_LOADED__ !== true) {
             }),
           ),
         ),
-        h('input', {
-          className: 'adbm-input',
-          value: note,
-          placeholder: L('ph.note'),
-          onChange: (event) => setNote(event.target.value),
-          onKeyDown: (event) => { if (event.key === 'Enter') void send() },
-        }),
         h('div', { className: 'adbm-keys' },
           h('input', {
             className: 'adbm-input adbm-text',
