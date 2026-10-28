@@ -871,6 +871,51 @@ async function deviceRoot(serial) {
  * @param {string} xml - 完整 XML。
  * @returns {Array<{depth: number, text: string, id: string, cls: string, desc: string, clickable: boolean, longClickable: boolean, scrollable: boolean, enabled: boolean, checked: boolean, selected: boolean, focused: boolean, x1: number, y1: number, x2: number, y2: number}>} 节点。
  */
+/** 属性正则和实体正则只编译一次：300 个节点时会省掉 3600 次 new RegExp。 */
+const ATTR_PATTERNS = new Map()
+const XML_ENTITIES = /&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g
+const XML_NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }
+
+/**
+ * 解 XML 属性里的实体：uiautomator 会把换行写成 `&#10;`、`&` 写成 `&amp;`，
+ * 不解的话「按住&#10;说话」永远匹配不上用户说的「按住 说话」。认不出的原样保留。
+ * @param {string} value - XML 属性原文。
+ * @returns {string} 解码后的文本。
+ */
+function decodeEntities(value) {
+  const text = String(value)
+  /* 没有 & 的占绝大多数，直接返回，省一次正则扫描。 */
+  if (!text.includes('&')) return text
+  return text.replace(XML_ENTITIES, (whole, body) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X' ? Number.parseInt(body.slice(2), 16) : Number.parseInt(body.slice(1), 10)
+      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole
+      try {
+        return String.fromCodePoint(code)
+      } catch {
+        return whole
+      }
+    }
+    return XML_NAMED[body] ?? whole
+  })
+}
+
+/**
+ * 取某个属性的值（顺带解实体）。
+ * @param {string} attrs - 一个 node 标签的属性串。
+ * @param {string} key - 属性名。
+ * @returns {string} 值；没有这个属性时是空串。
+ */
+function attrOf(attrs, key) {
+  let pattern = ATTR_PATTERNS.get(key)
+  if (pattern === undefined) {
+    pattern = new RegExp(`\\b${key}="([^"]*)"`)
+    ATTR_PATTERNS.set(key, pattern)
+  }
+  const found = pattern.exec(attrs)
+  return found ? decodeEntities(found[1]) : ''
+}
+
 function parseNodes(xml) {
   const nodes = []
   const stack = []
@@ -883,10 +928,7 @@ function parseNodes(xml) {
     }
     const attrs = match[1]
     const selfClosing = match[2] === '/'
-    const read = (key) => {
-      const found = new RegExp(`\\b${key}="([^"]*)"`).exec(attrs)
-      return found ? found[1] : ''
-    }
+    const read = (key) => attrOf(attrs, key)
     const bounds = /bounds="\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]"/.exec(attrs)
     nodes.push({
       index: nodes.length,
@@ -4903,6 +4945,7 @@ export const __internals = {
   compactTree,
   shortId,
   displaySizeFrom,
+  decodeEntities,
   digestLine,
   validateSteps,
   scrollFrames,

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps } = __internals
+const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -211,6 +211,17 @@ it('步骤预检：空 steps、一步两个动作、long 配错、swipe/ref/dire
   assert.match(validateSteps([{ scroll_to: '设置', direction: 'up2' }]).problems[0], /direction 只能是/)
   assert.match(validateSteps([{ sleep_ms: -1 }]).problems[0], /sleep_ms 要写非负/)
   assert.match(validateSteps([{ note: 'x' }]).problems[0], /什么都没做/)
+})
+
+it('界面树解实体：换行、&、引号、十六进制都能还原，认不出的原样留着', () => {
+  const xml = '<hierarchy><node text="按住&#10;说话" content-desc="A&amp;B &#x4e2d;" class="android.widget.TextView" resource-id="a&#47;b" bounds="[0,0][10,10]"/>'
+    + '<node text="坏实体&#xZZ; 与裸&" class="android.view.View" bounds="[0,0][10,10]" /></hierarchy>'
+  const nodes = parseNodes(xml)
+  assert.equal(nodes.length, 2)
+  assert.equal(nodes[0].text, '按住\n说话')
+  assert.equal(nodes[0].desc, 'A&B 中')
+  assert.equal(nodes[0].id, 'a/b')
+  assert.equal(nodes[1].text, '坏实体&#xZZ; 与裸&')
 })
 
 console.log(`\n${pass} 项通过\n`)
