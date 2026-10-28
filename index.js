@@ -1644,7 +1644,8 @@ async function dumpState(serial, options) {
   const at = Date.now()
   const snapshotId = nextSnapshotId(serial)
   lastTrees.set(serial, { snapshotId, serial, activity, at, refs: tree.refs, nodes, signature })
-  return { serial, activity, nodes, tree, changed, ms: at - started, source, ocrNote, snapshotId, generated_at: new Date(at).toISOString() }
+  /* 快照缓存里带 refs，dumpState 结果只有 tree.refs：形状不一致会让「刚 dump 的树」按 ref 查不到。 */
+  return { serial, activity, nodes, refs: tree.refs, tree, changed, ms: at - started, source, ocrNote, snapshotId, generated_at: new Date(at).toISOString() }
 }
 
 /**
@@ -1897,7 +1898,7 @@ function spotList(nodes) {
 function selectNodes(state, sel) {
   const want = sel || {}
   const nodes = state && Array.isArray(state.nodes) ? state.nodes : []
-  const refs = state && Array.isArray(state.refs) ? state.refs : []
+  const refs = state && Array.isArray(state.refs) ? state.refs : (state?.tree?.refs ?? [])
   const text = String(want.text ?? want.textContains ?? want.text_matches ?? want.textMatches ?? '')
   const id = want.id == null ? '' : String(want.id)
   const desc = want.desc == null ? '' : String(want.desc)
@@ -3361,7 +3362,7 @@ export function apply(ctx, config) {
       }
       const size = await screenSize(device)
       const describeHit = (node, state) => {
-        const entry = (state.refs || []).find((item) => item.node === node)
+        const entry = (state.refs ?? state.tree?.refs ?? []).find((item) => item.node === node)
         const hit = clickTarget(state.nodes || [], node)
         const point = `${Math.round((hit.x1 + hit.x2) / 2)},${Math.round((hit.y1 + hit.y2) / 2)}`
         return { ref: entry ? entry.ref : null, point }
@@ -3384,7 +3385,7 @@ export function apply(ctx, config) {
         /* 滑动区域：给了容器就只在容器内滑，否则用屏幕中间一大块；方向按手指方向。 */
         const box = args.within_ref !== undefined && args.within_ref !== null
           ? (() => {
-            const entry = (state.refs || []).find((item) => item.ref === Number(args.within_ref))
+            const entry = (state.refs ?? state.tree?.refs ?? []).find((item) => item.ref === Number(args.within_ref))
             if (!entry || !entry.node) throw new Error(`within_ref ${args.within_ref} 不在当前快照里：先 adb_ui 或 adb_find 拿最新 ref。`)
             return { x: entry.node.x1, y: entry.node.y1, w: entry.node.x2 - entry.node.x1, h: entry.node.y2 - entry.node.y1 }
           })()
@@ -4006,7 +4007,7 @@ ctx.effect(() => ctx.tools.register({
       ? await dumpState(device, {})
       : await snapshotForSelector(device, args.snapshot_id)
     const refOf = new Map()
-    for (const entry of state.refs || []) if (entry && entry.node) refOf.set(entry.node, entry.ref)
+    for (const entry of (state.refs ?? state.tree?.refs) || []) if (entry && entry.node) refOf.set(entry.node, entry.ref)
     const hits = selectNodes(state, {
       text: args.text,
       text_matches: args.text_matches,
