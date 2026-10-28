@@ -22,7 +22,7 @@
 
 ## 3. 回归
 
-- `npm test` → 19 项通过；`node ~/.dsh/tools/style-lint.mjs .` → 通过。
+- `npm test` → 21 项通过；`node ~/.dsh/tools/style-lint.mjs .` → 通过。
 - `adb_shot` 一张，确认镜像/截图链路没被这一轮改动碰到。
 
 ## 回滚点
