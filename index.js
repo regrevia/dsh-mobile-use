@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=220'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=224'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -1094,8 +1094,9 @@ async function u2Dump(serial) {
 }
 
 /**
- * 非 ASCII 输入的兜底：写剪贴板 → 长按输入框 → 点「粘贴」。
- * u2 的 setText 只接受 UiObject 选择器、实测改不动真实输入框，剪贴板是这台机器上唯一走通的路径。
+ * 非 ASCII 输入：写剪贴板 → PASTE 键（个别输入框退回长按「粘贴」菜单）。
+ * 不走 u2 的 setText：对象形式的选择器 `{className}/{resourceId}/{text}` 反序列化不报错但匹配不到节点，
+ * 调用返回 false 且输入框不变；字符串形式是 UiObject id，只回 UiObjectNotFoundException（2026-10-28 实测）。
  * @param {string} serial - 设备。
  * @param {string} text - 要输入的文字。
  * @returns {Promise<{ ok: boolean, steps: string[], field: string }>} 粘贴结果。
@@ -1103,26 +1104,63 @@ async function u2Dump(serial) {
 async function typeViaClipboard(serial, text) {
   const steps = []
   const port = await u2Port(serial)
-  const sent = await u2Fetch(port, '/jsonrpc/0', {
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'setClipboard',
-    params: [text, 'dsh-mobile-use'],
-  }, 6000)
-  let data
-  try {
-    data = JSON.parse(sent.text)
-  } catch {
-    throw new Error(`写剪贴板返回异常：${oneLine(sent.text, 120)}`)
+  /* 一次 RPC 往返 ~50ms；写剪贴板后马上回读，能挡住「参数顺序写反 → 粘出 label」这类静默失败。 */
+  const rpc = async (method, params) => {
+    const res = await u2Fetch(port, '/jsonrpc/0', { jsonrpc: '2.0', id: 1, method, params }, 6000)
+    let data
+    try {
+      data = JSON.parse(res.text)
+    } catch {
+      throw new Error(`u2 ${method} 返回异常：${oneLine(res.text, 120)}`)
+    }
+    if (data.error) throw new Error(`u2 ${method} 失败：${oneLine(data.error.message, 120)}`)
+    return data.result
   }
-  if (data.error) throw new Error(`写剪贴板失败：${oneLine(data.error.message, 120)}`)
-  steps.push('写剪贴板')
-  const dump = async () => parseNodes(await u2Dump(serial))
+  /**
+   * 找当前聚焦的可输入控件：优先编辑类，退而求其次取任何有面积的聚焦节点。
+   * @param {any[]} nodes - parseNodes 的结果。
+   * @returns {any} 焦点控件或 undefined。
+   */
   const focusedField = (nodes) => nodes.find((node) => node.focused && /EditText|AutoComplete|SearchView/.test(node.cls))
     ?? nodes.find((node) => node.focused && node.x2 > node.x1 && node.y2 > node.y1)
-  const first = await dump()
-  const field = focusedField(first)
+  const dump = async () => parseNodes(await u2Dump(serial))
+  /* u2 的 setClipboard 参数顺序是 (label, text)：写反了粘贴出来是 label（实测粘成 "dsh-mobile-use"）。 */
+  const putClipboard = async () => {
+    const began = Date.now()
+    await rpc('setClipboard', ['dsh-mobile-use', text])
+    const back = String(await rpc('getClipboard', []) ?? '')
+    steps.push(`写剪贴板 ${Date.now() - began}ms`)
+    return back === text
+  }
+  if (!(await putClipboard())) {
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (!(await putClipboard())) throw new Error(`剪贴板回读不是要输入的文字：${steps.join('；')}`)
+  }
+  /* 上一次 adb_ui/adb_tap 刚 dump 过（10s 内）就直接复用它的焦点框，省掉一次整树 dump（~200ms）。 */
+  const cached = lastTrees.get(serial)
+  let nodes = cached && Array.isArray(cached.nodes) && Date.now() - cached.at <= 10_000 ? cached.nodes : null
+  let field = nodes === null ? undefined : focusedField(nodes)
+  if (field === undefined) {
+    nodes = await dump()
+    field = focusedField(nodes)
+  }
   if (field === undefined) throw new Error('没有聚焦的输入框：先用 adb_tap 点一下输入框再输入')
+  const beforeText = String(field.text ?? '')
+  /* 快路：KEYCODE_PASTE 直接粘进焦点框，省掉「长按 800ms → 反复 dump 等菜单 → 点粘贴」的一整串，
+     实测 1.5s 降到 400ms 上下。个别输入框不吃这个键，没变化就退回长按菜单那条老路。 */
+  const pasteBegan = Date.now()
+  const pasteKey = await sh(serial, 'input keyevent 279', 8000)
+  if (pasteKey.ok) {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    nodes = await dump()
+    const afterField = focusedField(nodes)
+    if (afterField && afterField.text !== beforeText) {
+      return { ok: true, steps: [...steps, `PASTE 键 ${Date.now() - pasteBegan}ms`], field: afterField.text ?? '' }
+    }
+    if (afterField === undefined) throw new Error('没有聚焦的输入框：先用 adb_tap 点一下输入框再输入')
+    field = afterField
+  }
+  /* 慢路：长按输入框等「粘贴」菜单，菜单文字每次都要重新读树才拿得到坐标。 */
   const x = Math.round((field.x1 + field.x2) / 2)
   const y = Math.round((field.y1 + field.y2) / 2)
   const held = await sh(serial, `input swipe ${x} ${y} ${x} ${y} 800`, 12_000)
@@ -1130,7 +1168,7 @@ async function typeViaClipboard(serial, text) {
   steps.push(`长按 ${x},${y}`)
   let item
   for (let i = 0; i < 10 && item === undefined; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await new Promise((resolve) => setTimeout(resolve, 100))
     const list = await dump()
     item = list.find((node) => node.clickable && /^(粘贴|Paste)$/i.test((node.text || node.desc).trim()))
       ?? list.find((node) => /^(粘贴|Paste)$/i.test((node.text || node.desc).trim()))
@@ -1141,7 +1179,7 @@ async function typeViaClipboard(serial, text) {
   const hit = await sh(serial, `input tap ${tx} ${ty}`, 8000)
   if (!hit.ok) throw new Error(`点「粘贴」失败：${oneLine(hit.out || hit.err, 160)}`)
   steps.push(`点粘贴 ${tx},${ty}`)
-  await new Promise((resolve) => setTimeout(resolve, 260))
+  await new Promise((resolve) => setTimeout(resolve, 240))
   const after = focusedField(await dump())
   return { ok: true, steps, field: after?.text ?? '' }
 }
@@ -1215,9 +1253,18 @@ function compactTree(nodes, options) {
 async function foregroundActivity(serial) {
   /* MIUI 上 `dumpsys activity activities` 的 mResumedActivity 经常是空的，
      `dumpsys window` 的 mFocusedApp 稳定（0.09–0.15s）。 */
-  const r = await adb(['-s', serial, 'shell', 'dumpsys window | grep -m2 -E "mCurrentFocus|mFocusedApp"'], { timeout: 8000 })
-  const raw = /([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)/.exec(r.out)
-  return raw ? raw[1] : ''
+  /* 有的 ROM 在 mCurrentFocus 之前还有一行 mCurrentFocusedWindow，
+     只取前两条会把 null 和聚焦窗口名都吃掉，所以多取几行再找第一个「包/Activity」对。 */
+  const r = await adb(['-s', serial, 'shell', 'dumpsys window | grep -E "mCurrentFocus|mFocusedApp" | head -8'], { timeout: 8000 })
+  const first = /([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)/.exec(r.out)
+  if (first) return first[1]
+  /* 有的 ROM（带悬浮窗/输入法时）window 里拿不到包名，退回 activity 栈顶。 */
+  const a = await adb(['-s', serial, 'shell', 'dumpsys activity activities | grep -E "mResumedActivity|topResumedActivity|ResumedActivity" | head -4'], { timeout: 8000 })
+  const second = /([A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+)/.exec(a.out)
+  if (second) return second[1]
+  /* 最后用最近一次界面树里的 activity，比「未知」有用。 */
+  const cached = lastTrees.get(serial)
+  return cached && Date.now() - cached.at < 5000 ? cached.activity : ''
 }
 
 /**
@@ -1554,35 +1601,219 @@ function spotList(nodes) {
   return `（${shown.join('、')}${more}）`
 }
 
+/**
+ * 统一选择器引擎：字段之间 AND，字段内多值 OR；默认包含匹配，exact 精确，regex 正则。
+ * 对齐 uiautomator2 的 text/textContains/textMatches/id/description/instance 语义。
+ * @param {any} state - 一次 dump 的状态（需要 nodes 与 refs）。
+ * @param {any} sel - 选择器。
+ * @returns {any[]} 命中节点（默认按同一处归并；index 指定时只返回那一个）。
+ */
+function selectNodes(state, sel) {
+  const want = sel || {}
+  const nodes = state && Array.isArray(state.nodes) ? state.nodes : []
+  const refs = state && Array.isArray(state.refs) ? state.refs : []
+  const text = String(want.text ?? want.textContains ?? want.text_matches ?? want.textMatches ?? '')
+  const id = want.id == null ? '' : String(want.id)
+  const desc = want.desc == null ? '' : String(want.desc)
+  const cls = want.cls == null ? '' : String(want.cls)
+  const pkg = want.pkg == null ? '' : String(want.pkg)
+  const exact = want.exact === true
+  const reText = want.regex ? new RegExp(text, 'i') : null
+  const reId = want.regex && id ? new RegExp(id, 'i') : null
+  const reDesc = want.regex && desc ? new RegExp(desc, 'i') : null
+  const lowText = text.toLowerCase()
+  const lowId = id.toLowerCase()
+  const lowDesc = desc.toLowerCase()
+  const lowCls = cls.toLowerCase()
+  const lowPkg = pkg.toLowerCase()
+  let box = null
+  if (Array.isArray(want.within_rect) && want.within_rect.length === 4) box = want.within_rect.map((value) => Number(value))
+  else if (want.within_ref !== undefined && want.within_ref !== null) {
+    const entry = refs.find((item) => item.ref === Number(want.within_ref))
+    if (!entry || !entry.node) throw new Error(`within_ref ${want.within_ref} 不在当前快照里：先 adb_ui 或 adb_find 拿最新 ref。`)
+    box = [entry.node.x1, entry.node.y1, entry.node.x2 - entry.node.x1, entry.node.y2 - entry.node.y1]
+  }
+  const inBox = (node) => {
+    if (!box) return true
+    const [bx, by, bw, bh] = box
+    const cx = (node.x1 + node.x2) / 2
+    const cy = (node.y1 + node.y2) / 2
+    return cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh
+  }
+  const pass = (node) => {
+    if (text) {
+      if (reText) {
+        if (!reText.test(node.text || '') && !reText.test(node.desc || '')) return false
+      } else {
+        const nt = String(node.text || '').toLowerCase()
+        const nd = String(node.desc || '').toLowerCase()
+        if (exact ? nt !== lowText && nd !== lowText : !nt.includes(lowText) && !nd.includes(lowText)) return false
+      }
+    }
+    if (id) {
+      const full = String(node.id || '').toLowerCase()
+      if (reId ? !reId.test(node.id || '') : exact ? full !== lowId && shortId(full) !== shortId(lowId) : !full.includes(lowId)) return false
+    }
+    if (desc) {
+      const nd = String(node.desc || '').toLowerCase()
+      if (reDesc ? !reDesc.test(node.desc || '') : exact ? nd !== lowDesc : !nd.includes(lowDesc)) return false
+    }
+    if (cls && !String(node.cls || '').toLowerCase().includes(lowCls)) return false
+    if (pkg && !String(node.pkg || '').toLowerCase().includes(lowPkg)) return false
+    if (want.clickable === true && !(node.clickable || node.longClickable)) return false
+    if (want.enabled === true && node.enabled === false) return false
+    if (want.visible === true && (node.x2 - node.x1) * (node.y2 - node.y1) <= 0) return false
+    if (!inBox(node)) return false
+    return true
+  }
+  let hits = nodes.filter(pass)
+  if (want.all !== true) hits = collapseSameSpot(hits)
+  if (want.index !== undefined && want.index !== null && want.index !== '') {
+    const idx = Number(want.index)
+    if (!Number.isInteger(idx) || idx < 0) throw new Error('index 从 0 开始，例如 0 是第一个匹配。')
+    if (idx >= hits.length) throw new Error(`只有 ${hits.length} 个匹配，index ${idx} 越界。`)
+    return [hits[idx]]
+  }
+  return hits
+}
+
+/**
+ * 找不到目标时给几个相近的文字，省掉一次 adb_ui 往返。
+ * @param {any} state - 一次 dump 的状态。
+ * @param {any} sel - 选择器。
+ * @returns {string} 提示，没有就空串。
+ */
+function nearMiss(state, sel) {
+  const want = sel || {}
+  const needle = String(want.text ?? want.id ?? want.desc ?? '').toLowerCase()
+  if (!needle) return ''
+  const grams = []
+  for (let i = 0; i + 1 < needle.length; i += 1) grams.push(needle.slice(i, i + 2))
+  const seen = new Set()
+  const scored = []
+  for (const node of (state && state.nodes) || []) {
+    const label = String(node.text || node.desc || (node.id ? shortId(node.id) : '') || '')
+    if (label === '' || seen.has(label)) continue
+    seen.add(label)
+    const lower = label.toLowerCase()
+    let score = lower.includes(needle) ? 100 : 0
+    for (const gram of grams) if (lower.includes(gram)) score += 1
+    if (score > 0) scored.push({ label, score })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  const top = scored.slice(0, 3).map((item) => item.label)
+  return top.length === 0 ? '' : ` 相近的有：${top.map((label) => '「' + oneLine(label, 18) + '」').join('、')}。`
+}
+
 function nodeForSelector(serial, want) {
   const cached = checkSnapshot(serial, want.snapshotId, '文字/id')
-  const refs = cached.refs.map((entry) => entry.node)
-  if (want.text) {
-    const exact = refs.filter((node) => node.text === want.text || node.desc === want.text)
-    const loose = exact.length > 0 ? exact : refs.filter((node) => `${node.text} ${node.desc}`.includes(want.text))
-    if (loose.length === 0) throw new Error(`界面上没有文字「${want.text}」：先 adb_ui 看当前界面，或用 filter 搜一下。`)
-    const places = collapseSameSpot(loose)
-    if (places.length > 1) throw new Error(`ambiguous_target：文字「${want.text}」匹配到 ${places.length} 个控件${spotList(places)}，改用 ref 挑一个，或直接 point 点其中一处。`)
-    return places[0]
+  const hits = selectNodes(cached, {
+    text: want.text,
+    id: want.id,
+    desc: want.desc,
+    cls: want.cls,
+    pkg: want.pkg,
+    exact: want.exact,
+    regex: want.regex,
+    clickable: want.clickable,
+    enabled: want.enabled,
+    index: want.index,
+    all: true,
+  })
+  if (hits.length === 0) {
+    const what = want.text ? `文字「${want.text}」`
+      : want.id ? `id 包含「${shortId(String(want.id))}」的控件`
+        : want.desc ? `描述包含「${want.desc}」的控件`
+          : want.cls ? `类名包含「${want.cls}」的控件` : '匹配的控件'
+    throw new Error(`界面上没有${what}：用 adb_find 搜一下，或 adb_ui 看当前界面。` + nearMiss(cached, want))
   }
-  if (want.id) {
-    const needle = shortId(want.id)
-    const exact = refs.filter((node) => shortId(node.id) === needle)
-    const loose = exact.length > 0 ? exact : refs.filter((node) => shortId(node.id).includes(needle))
-    if (loose.length === 0) throw new Error(`界面上没有 id 包含「${needle}」的控件：先 adb_ui 看当前界面。`)
-    const places = collapseSameSpot(loose)
-    if (places.length > 1) throw new Error(`ambiguous_target：id「${needle}」匹配到 ${places.length} 个控件${spotList(places)}，改用 ref 挑一个，或直接 point 点其中一处。`)
-    return places[0]
+  if (want.index !== undefined && want.index !== null && want.index !== '') return hits[0]
+  const places = collapseSameSpot(hits)
+  if (places.length > 1) throw new Error(`ambiguous_target：匹配到 ${places.length} 个控件${spotList(places)}，加 index 挑一个、用 ref，或直接 point 点其中一处。`)
+  return places[0]
+}
+
+const screenSizes = new Map()
+
+/**
+ * 读一次屏幕分辨率（有 Override size 就用它），按设备缓存，改分辨率后清缓存。
+ * @param {string} device - 设备序列号。
+ * @returns {Promise<{width: number, height: number}>} 尺寸。
+ */
+async function screenSize(device) {
+  const cached = screenSizes.get(device)
+  if (cached) return cached
+  const r = await adb(['-s', device, 'shell', 'wm size'], { timeout: 8000 })
+  const body = `${r.out}${r.err ?? ''}`
+  const override = /Override size:\s*(\d+)x(\d+)/.exec(body)
+  const physical = /Physical size:\s*(\d+)x(\d+)/.exec(body)
+  const match = override ?? physical
+  if (!match) throw new Error('读不到屏幕分辨率：先 adb_sh 跑一次 wm size 看看。')
+  const size = { width: Number(match[1]), height: Number(match[2]) }
+  screenSizes.set(device, size)
+  return size
+}
+
+/**
+ * 等前台 Activity 变成期望的页面；不等就返回当前页面（启动类操作不因为没命中就失败）。
+ * @param {string} device - 设备。
+ * @param {string | undefined} pattern - Activity 正则（省略则只等 600ms 让画面出来）。
+ * @param {number} timeoutMs - 上限。
+ * @returns {Promise<string>} 最终前台 Activity。
+ */
+async function settleActivity(device, pattern, timeoutMs) {
+  const limit = Math.max(400, Number(timeoutMs) || 6000)
+  const began = Date.now()
+  if (!pattern) {
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    return foregroundActivity(device).catch(() => '')
   }
-  if (want.desc) {
-    const exact = refs.filter((node) => node.desc === want.desc)
-    const loose = exact.length > 0 ? exact : refs.filter((node) => node.desc.includes(want.desc) || node.text.includes(want.desc))
-    if (loose.length === 0) throw new Error(`界面上没有描述包含「${want.desc}」的控件：先 adb_ui 看当前界面。`)
-    const places = collapseSameSpot(loose)
-    if (places.length > 1) throw new Error(`ambiguous_target：描述「${want.desc}」匹配到 ${places.length} 个控件${spotList(places)}，改用 ref 挑一个，或直接 point 点其中一处。`)
-    return places[0]
+  let re
+  try { re = new RegExp(String(pattern), 'i') } catch { throw new Error('wait_activity 不是合法正则：' + pattern) }
+  for (;;) {
+    const activity = await foregroundActivity(device).catch(() => '')
+    if (re.test(activity)) return activity
+    if (Date.now() - began > limit) return activity
+    await new Promise((resolve) => setTimeout(resolve, 120))
   }
-  throw new Error('需要 ref、text、id、desc 或 point 其中之一。')
+}
+
+/**
+ * 把选择器解析成一个落点（优先用可点祖先的中心）。
+ * @param {string} device - 设备。
+ * @param {any} sel - {point} 或 {ref} 或 {text|id|desc|cls, index, exact} 或 {x,y}。
+ * @returns {Promise<{x: number, y: number, label: string}>} 落点与人类可读标签。
+ */
+async function pointForSelector(device, sel) {
+  const want = sel || {}
+  if (want.point !== undefined) {
+    const parts = String(want.point).split(',').map((value) => Number(value.trim()))
+    if (parts.length !== 2 || parts.some((value) => !Number.isFinite(value))) throw new Error('point 要写成 "x,y"，例如 "540,1200"。')
+    return { x: Math.round(parts[0]), y: Math.round(parts[1]), label: `坐标 ${parts[0]},${parts[1]}` }
+  }
+  if (Number.isFinite(Number(want.x)) && Number.isFinite(Number(want.y))) {
+    return { x: Math.round(Number(want.x)), y: Math.round(Number(want.y)), label: `坐标 ${want.x},${want.y}` }
+  }
+  let node
+  if (want.ref !== undefined && want.ref !== null) {
+    node = nodeForRef(device, Number(want.ref), want.snapshot_id)
+  } else {
+    await snapshotForSelector(device, want.snapshot_id)
+    node = nodeForSelector(device, {
+      text: want.text,
+      id: want.id,
+      desc: want.desc,
+      cls: want.cls,
+      exact: want.exact,
+      index: want.index,
+      snapshotId: want.snapshot_id,
+    })
+    node = await freshNodeFor(device, node, want.snapshot_id)
+  }
+  const hit = clickTarget(nodesOf(device), node)
+  const x = Math.round((hit.x1 + hit.x2) / 2)
+  const y = Math.round((hit.y1 + hit.y2) / 2)
+  return { x, y, label: `「${oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)}」@${x},${y}` }
 }
 
 /**
@@ -1896,6 +2127,8 @@ export function apply(ctx, config) {
         wait_for_id: { type: 'string', description: '等到界面上出现这个资源 id（子串匹配）' },
         wait_for_activity: { type: 'string', description: '等到前台 Activity 匹配这个正则，例如 "ScanActivity"' },
         wait_until_gone: { type: 'string', description: '等到这段文字从界面上消失，例如等加载提示消失' },
+        wait_idle: { type: 'boolean', description: '等界面停止变化（动画/加载结束）再返回，配合 idle_ms' },
+        idle_ms: { type: 'integer', description: 'wait_idle 用：连续多久没变化算静止，默认 400' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 15000' },
         changed_only: { type: 'boolean', description: '只给跟上一棵树不一样的控件行（+ 新增，- 消失），页面几乎没变时省一大截' },
         ocr: { type: 'string', enum: ['auto', 'force', 'off'], description: 'OCR 兜底：auto 只在文本树几乎为空时跑（默认），force 强制加一层 OCR 文字，off 关掉' },
@@ -1938,6 +2171,25 @@ export function apply(ctx, config) {
         const waited = await waitFor(device, want, args.timeout_ms ?? 15_000)
         state = waited.state
         matched = waited.matched
+      } else if (args.wait_idle === true) {
+        /* 等界面自己静下来：连续 idle_ms 树签名不变就返回，省掉模型 sleep 后再读一次。 */
+        const idleMs = Math.max(120, Number(args.idle_ms ?? 400))
+        const limit = args.timeout_ms ?? 15_000
+        const began = Date.now()
+        let signature = null
+        let stableSince = Date.now()
+        for (;;) {
+          state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, ocr: args.ocr ?? 'auto' })
+          const now = state.tree.lines.join('\n')
+          if (signature !== null && now === signature) {
+            if (Date.now() - stableSince >= idleMs) break
+          } else {
+            signature = now
+            stableSince = Date.now()
+          }
+          if (Date.now() - began >= limit) break
+          await new Promise((resolve) => setTimeout(resolve, 120))
+        }
       } else {
         state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, ocr: args.ocr ?? 'auto' })
       }
@@ -1997,7 +2249,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_tap',
-    description: '在 Android 设备上点一下：用 ref（来自最近一次 adb_ui）、文字、资源 id、描述，或者绝对坐标 point="x,y"。long=true 长按。比截图定位快，也不会因为分辨率变化点错。',
+    description: '在 Android 设备上点一下：用 ref（来自最近一次 adb_ui/adb_find）、文字、资源 id、描述、类名，或者绝对坐标 point="x,y"。long=true 长按；index 挑第几个匹配；exact/regex 改匹配方式。比截图定位快，也不会因为分辨率变化点错。',
     parameters: {
       type: 'object',
       properties: {
@@ -2006,6 +2258,11 @@ export function apply(ctx, config) {
         text: { type: 'string', description: '按钮/文字内容，精确匹配优先，其次包含匹配' },
         id: { type: 'string', description: '资源 id，可写全名或只写后半段，如 login_btn' },
         desc: { type: 'string', description: 'content-desc 内容' },
+        cls: { type: 'string', description: '类名，可只写后半段，如 Switch 或 ImageButton' },
+        index: { type: 'integer', description: '匹配到多个时点第几个，从 0 开始' },
+        exact: { type: 'boolean', description: '文字/描述/类名要完全相等，默认包含匹配' },
+        regex: { type: 'boolean', description: '把 text/id/desc 当正则用' },
+        clickable: { type: 'boolean', description: '只挑可点控件' },
         point: { type: 'string', description: '绝对坐标 "x,y"（屏幕像素）' },
         long: { type: 'boolean', description: '长按 600ms' },
         repeat: { type: 'integer', description: '连点几次，1–8，默认 1；连招、双击缩放用它' },
@@ -2026,6 +2283,7 @@ export function apply(ctx, config) {
           target: { type: 'string' },
           activity: { type: 'string' },
           matched: { type: 'boolean' },
+          changed: { type: 'boolean', description: '点后界面树是否变了；没变大概率没点中或动画未结束' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
@@ -2054,7 +2312,17 @@ export function apply(ctx, config) {
           node = nodeForRef(device, Number(args.ref), args.snapshot_id)
         } else {
           await snapshotForSelector(device, args.snapshot_id)
-          node = nodeForSelector(device, { text: args.text, id: args.id, desc: args.desc, snapshotId: args.snapshot_id })
+          node = nodeForSelector(device, {
+            text: args.text,
+            id: args.id,
+            desc: args.desc,
+            cls: args.cls,
+            exact: args.exact,
+            regex: args.regex,
+            clickable: args.clickable,
+            index: args.index,
+            snapshotId: args.snapshot_id,
+          })
         }
         node = await freshNodeFor(device, node, args.snapshot_id)
         const hit = clickTarget(nodesOf(device), node)
@@ -2076,12 +2344,16 @@ export function apply(ctx, config) {
           elapsed_ms: Date.now() - started,
         }
       }
+      /* 点之前的树签名：点完对比一次，把「点了没反应」当场说出来，省掉模型再读一遍树的回合。 */
+      const prior = lastTrees.get(device)
       const times = Math.max(1, Math.min(8, Math.round(Number(args.repeat ?? 1))))
       const gap = Math.max(0, Math.round(Number(args.interval_ms ?? 100)))
       /* 快通道优先：scrcpy 控制 socket 一次写 0–1ms，没有 adb 往返；通道没就绪再退回 input。 */
       let engine = 'adb'
       let fastDone = fastInput.tap !== null
+      let took = 0
       if (fastDone) {
+        const fastBegan = Date.now()
         for (let i = 0; i < times; i += 1) {
           const fast = await fastInput.tap(device, x, y, { long: args.long === true })
           if (fast === null) {
@@ -2090,7 +2362,10 @@ export function apply(ctx, config) {
           }
           if (i + 1 < times && gap > 0) await new Promise((resolve) => setTimeout(resolve, gap))
         }
-        if (fastDone) engine = 'scrcpy'
+        if (fastDone) {
+          engine = 'scrcpy'
+          took = Date.now() - fastBegan
+        }
       }
       if (!fastDone) {
         /* 连点（连招、双击缩放）串在同一次 shell 里：每次仍是一条约 35ms 的 input，中间按间隔等待。 */
@@ -2098,6 +2373,7 @@ export function apply(ctx, config) {
         const cmd = times === 1 ? one : Array.from({ length: times }, () => one).join(`; sleep ${(gap / 1000).toFixed(3)}; `)
         const r = await sh(device, cmd, 10_000 + times * (gap + 900))
         if (!r.ok) throw new Error(failureNote(args.long ? '长按' : '点击', r))
+        took = r.ms
       }
 
       lastActions.push({ at: Date.now(), what: `${args.long ? '长按' : '点击'} ${target}` })
@@ -2107,6 +2383,7 @@ export function apply(ctx, config) {
       let activity = ''
       let matched = true
       let detail = ''
+      let changed = null
       if (shouldWait) {
         const waited = await waitFor(device, want, args.timeout_ms ?? 10_000)
         matched = waited.matched
@@ -2114,10 +2391,20 @@ export function apply(ctx, config) {
         detail = matched
           ? `，等待命中 ${waited.elapsedMs}ms · 当前 ${activity || '未知页面'}`
           : `，等待超时 ${args.timeout_ms ?? 10_000}ms，界面没出现预期变化`
+      } else if (prior && prior.signature && Array.isArray(prior.nodes) && prior.nodes.length > 0
+        && Date.now() - prior.at < 15_000) {
+        /* 没给等待条件时给一次回执：界面没变化就是可疑信号，别让模型再去读一遍树才发现。 */
+        await new Promise((resolve) => setTimeout(resolve, 240))
+        const after = await dumpState(device, {})
+        changed = after.tree.lines.join('\n') !== prior.signature
+        activity = after.activity
+        detail = changed
+          ? `，界面已变化 · 当前 ${activity || '未知页面'}`
+          : '，界面没变化：可能没点中、被别的窗口挡住，或还在动画；用 adb_shot 看画面，或 adb_ui 再读一次'
       }
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
-      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}（${r.ms}ms）${detail || '。界面变化用 adb_ui 确认。'}`
-      return { ok: true, target, activity, matched, message, elapsed_ms: Date.now() - started }
+      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
+      return { ok: true, target, activity, matched, changed, message, elapsed_ms: Date.now() - started }
     },
   }), 'adb: adb_tap')
 
@@ -2130,12 +2417,41 @@ export function apply(ctx, config) {
         points: {
           type: 'array',
           items: { type: 'array', items: { type: 'integer' } },
-          description: '轨迹点 [[x,y],[x,y],…]，至少 2 个；曲线要给中间点',
+          description: '轨迹点 [[x,y],[x,y],…]，至少 2 个；曲线要给中间点。给了 from/to 就不用给 points',
+        },
+        from: {
+          type: 'object',
+          description: '起点控件（拖拽时按控件定位，比手算坐标准）：{ref} 或 {text|id|desc|cls, index}',
+          properties: {
+            ref: { type: 'integer', description: 'adb_ui / adb_find 的 ref' },
+            text: { type: 'string' },
+            id: { type: 'string' },
+            desc: { type: 'string' },
+            cls: { type: 'string' },
+            index: { type: 'integer' },
+            exact: { type: 'boolean' },
+          },
+          additionalProperties: false,
+        },
+        to: {
+          type: 'object',
+          description: '终点：{point:"x,y"} 或控件 {ref} / {text|id|desc|cls, index}',
+          properties: {
+            point: { type: 'string', description: '绝对坐标 "x,y"' },
+            ref: { type: 'integer' },
+            text: { type: 'string' },
+            id: { type: 'string' },
+            desc: { type: 'string' },
+            cls: { type: 'string' },
+            index: { type: 'integer' },
+            exact: { type: 'boolean' },
+          },
+          additionalProperties: false,
         },
         duration_ms: { type: 'integer', description: '整段耗时，默认 500' },
         hold_ms: { type: 'integer', description: '起点按住多久再移动，默认 0；长按拖动给 500' },
       },
-      required: ['points'],
+      required: [],
       additionalProperties: false,
     },
     output: {
@@ -2154,8 +2470,15 @@ export function apply(ctx, config) {
     execute: async (args) => {
       const device = await serial()
       const started = Date.now()
-      const points = (args.points ?? []).map((pair) => pair.map((value) => Math.round(Number(value))))
-      if (points.length < 2) throw new Error('points 至少给 2 个点，例如 [[540,1800],[900,1200]]。')
+      let points = (args.points ?? []).map((pair) => pair.map((value) => Math.round(Number(value))))
+      if (points.length < 2 && args.from && args.to) {
+        /* 按控件拖拽：先定位再动手，页面在这两步之间变了会自动重读，不拿旧坐标拖。 */
+        const start = await pointForSelector(device, args.from)
+        const end = await pointForSelector(device, args.to)
+        points = [[start.x, start.y], [end.x, end.y]]
+        if (points[0][0] === points[1][0] && points[0][1] === points[1][1]) throw new Error('起点和终点是同一个点，改 from/to。')
+      }
+      if (points.length < 2) throw new Error('给 points（至少 2 个点），或给 from + to 按控件拖。')
       for (const pair of points) {
         if (pair.length !== 2 || pair.some((value) => !Number.isFinite(value))) throw new Error('每个点都要写成 [x,y]。')
       }
@@ -2299,7 +2622,9 @@ export function apply(ctx, config) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['info', 'install', 'start', 'stop', 'clear', 'foreground'], description: '要做的操作' },
+        action: { type: 'string', enum: ['info', 'install', 'start', 'stop', 'clear', 'foreground', 'open'], description: '要做的操作' },
+        url: { type: 'string', description: 'open 用：深链或网址，例如 "https://example.com" 或 "myapp://detail/3"' },
+        wait_activity: { type: 'string', description: 'start/open 后等前台 Activity 匹配这个正则再返回，例如 "MainActivity"' },
         package: { type: 'string', description: '包名，如 com.example.app；install 时可省略（从 APK 里读）' },
         apk: { type: 'string', description: 'install 用的 APK 绝对路径' },
         activity: { type: 'string', description: 'start 时可指定 Activity，例如 .ScanActivity；不写就用启动器入口' },
@@ -2352,13 +2677,19 @@ export function apply(ctx, config) {
           elapsed_ms: Date.now() - started,
         }
       }
+      if (action === 'open') {
+        if (!args.url) throw new Error('open 需要 url，例如 "myapp://detail/3"。')
+        const r = await adb(['-s', device, 'shell', `am start -a android.intent.action.VIEW -d ${shQuote(String(args.url))}`], { timeout: 20_000 })
+        if (!r.ok || /Error|Exception/i.test(`${r.out}${r.err}`)) throw new Error(`打开失败：${oneLine(r.out || r.err, 240)}`)
+        const activity = await settleActivity(device, args.wait_activity, 6000)
+        return { ok: true, action, message: `已打开 ${oneLine(String(args.url), 60)}，前台：${activity || '未知'}`, elapsed_ms: Date.now() - started }
+      }
       if (action === 'start') {
         const component = args.activity ? `${pkg}/${String(args.activity).startsWith('.') ? String(args.activity) : `.${args.activity}`}` : ''
         const cmd = component ? `am start -n ${component}` : `monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`
         const r = await adb(['-s', device, 'shell', cmd], { timeout: 20_000 })
         if (!r.ok || /No activities found|Error/i.test(`${r.out}${r.err}`)) throw new Error(`启动失败：${oneLine(r.out || r.err, 240)}`)
-        await new Promise((resolve) => setTimeout(resolve, 600))
-        const activity = await foregroundActivity(device)
+        const activity = await settleActivity(device, args.wait_activity, 6000)
         return { ok: true, action, message: `已启动 ${pkg}，前台：${activity || '未知'}`, elapsed_ms: Date.now() - started }
       }
       if (action === 'stop' || action === 'clear') {
@@ -2419,6 +2750,173 @@ export function apply(ctx, config) {
   }), 'adb: adb_sh')
 
   ctx.effect(() => ctx.tools.register({
+    name: 'adb_scroll_to',
+    description: '把列表滑到目标出现：按文字/id/desc/类名找，滑一下读一次，命中就停（默认不点）。省掉「滑一下→adb_ui→再滑」的来回；滑不动会直接说滑到底了。',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: '要找的文字，默认包含匹配' },
+        id: { type: 'string', description: '资源 id，可只写后半段' },
+        desc: { type: 'string', description: 'content-desc' },
+        cls: { type: 'string', description: '类名，可只写后半段' },
+        exact: { type: 'boolean', description: '完全相等，默认包含匹配' },
+        regex: { type: 'boolean', description: 'text/id/desc 当正则用' },
+        index: { type: 'integer', description: '命中多个时取第几个，从 0 开始' },
+        within_ref: { type: 'integer', description: '只在这个控件范围内滑（给可滚容器的 ref，比整屏滑准）' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: '手指往哪个方向滑，默认 up（把下面的内容拉上来）' },
+        max_swipes: { type: 'integer', description: '最多滑几次，默认 8，上限 20' },
+        tap: { type: 'boolean', description: '找到后顺手点它' },
+        timeout_ms: { type: 'integer', description: '总时长上限，默认 25000' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          found: { type: 'boolean' },
+          swipes: { type: 'integer' },
+          activity: { type: 'string' },
+          message: { type: 'string' },
+          ref: { type: 'integer' },
+          point: { type: 'string' },
+          snapshot_id: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'found', 'swipes', 'activity', 'message', 'ref', 'point', 'snapshot_id', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const limit = Math.max(2000, Number(args.timeout_ms ?? 25_000))
+      const maxSwipes = Math.min(Math.max(Number.isFinite(Number(args.max_swipes)) ? Number(args.max_swipes) : 8, 0), 20)
+      const sel = {
+        text: args.text,
+        id: args.id,
+        desc: args.desc,
+        cls: args.cls,
+        exact: args.exact,
+        regex: args.regex,
+        within_ref: args.within_ref,
+        index: args.index,
+        all: true,
+      }
+      const size = await screenSize(device)
+      const describeHit = (node, state) => {
+        const entry = (state.refs || []).find((item) => item.node === node)
+        const hit = clickTarget(state.nodes || [], node)
+        const point = `${Math.round((hit.x1 + hit.x2) / 2)},${Math.round((hit.y1 + hit.y2) / 2)}`
+        return { ref: entry ? entry.ref : null, point }
+      }
+      let state = await dumpState(device, {})
+      let swipes = 0
+      let target = null
+      for (;;) {
+        const hits = selectNodes(state, sel)
+        const visible = hits.filter((node) => {
+          const w = node.x2 - node.x1
+          const h = node.y2 - node.y1
+          if (w <= 0 || h <= 0) return false
+          const cx = (node.x1 + node.x2) / 2
+          const cy = (node.y1 + node.y2) / 2
+          return cx >= 0 && cx <= size.width && cy >= 0 && cy <= size.height
+        })
+        if (visible.length > 0) { target = visible[0]; break }
+        if (swipes >= maxSwipes || Date.now() - began > limit) break
+        /* 滑动区域：给了容器就只在容器内滑，否则用屏幕中间一大块；方向按手指方向。 */
+        const box = args.within_ref !== undefined && args.within_ref !== null
+          ? (() => {
+            const entry = (state.refs || []).find((item) => item.ref === Number(args.within_ref))
+            if (!entry || !entry.node) throw new Error(`within_ref ${args.within_ref} 不在当前快照里：先 adb_ui 或 adb_find 拿最新 ref。`)
+            return { x: entry.node.x1, y: entry.node.y1, w: entry.node.x2 - entry.node.x1, h: entry.node.y2 - entry.node.y1 }
+          })()
+          : { x: Math.round(size.width * 0.15), y: Math.round(size.height * 0.2), w: Math.round(size.width * 0.7), h: Math.round(size.height * 0.6) }
+        const cx = Math.round(box.x + box.w / 2)
+        const cy = Math.round(box.y + box.h / 2)
+        const low = Math.round(box.y + box.h * 0.85)
+        const high = Math.round(box.y + box.h * 0.15)
+        const left = Math.round(box.x + box.w * 0.15)
+        const right = Math.round(box.x + box.w * 0.85)
+        const direction = args.direction ?? 'up'
+        const [x1, y1, x2, y2] = direction === 'up' ? [cx, low, cx, high]
+          : direction === 'down' ? [cx, high, cx, low]
+            : direction === 'left' ? [right, cy, left, cy]
+              : [left, cy, right, cy]
+        const before = state.tree.lines.join('\n')
+        const fastSwipe = fastInput.swipe === null ? null : await fastInput.swipe(device, x1, y1, x2, y2, 320)
+        if (fastSwipe === null) {
+          const r = await sh(device, `input swipe ${x1} ${y1} ${x2} ${y2} 320`, 15_000)
+          if (!r.ok) throw new Error(failureNote('滑动', r))
+        }
+        swipes += 1
+        await new Promise((resolve) => setTimeout(resolve, 260))
+        state = await dumpState(device, {})
+        if (state.tree.lines.join('\n') === before) {
+          const again = selectNodes(state, sel)
+          if (again.length === 0) {
+            return {
+              ok: true,
+              found: false,
+              swipes,
+              activity: state.activity || '',
+              message: `滑了 ${swipes} 次没再动，也没有目标：可能已经到底，或它在别的页面/需要下拉刷新的地方。${nearMiss(state, sel)}`,
+              ref: null,
+              point: '',
+              snapshot_id: state.snapshotId,
+              elapsed_ms: Date.now() - began,
+            }
+          }
+          target = again[0]
+          break
+        }
+      }
+      if (target === null) {
+        return {
+          ok: true,
+          found: false,
+          swipes,
+          activity: state.activity || '',
+          message: `滑了 ${swipes} 次还没找到${args.text ? `「${args.text}」` : '目标'}：加 max_swipes 或换方向，也可能不在这个页面。${nearMiss(state, sel)}`,
+          ref: null,
+          point: '',
+          snapshot_id: state.snapshotId,
+          elapsed_ms: Date.now() - began,
+        }
+      }
+      const hit = describeHit(target, state)
+      let message = `滑 ${swipes} 次找到${args.text ? `「${args.text}」` : '目标'} @${hit.point}`
+      if (args.tap === true) {
+        const node = target
+        const clickable = clickTarget(state.nodes || [], node)
+        const x = Math.round((clickable.x1 + clickable.x2) / 2)
+        const y = Math.round((clickable.y1 + clickable.y2) / 2)
+        const fastStep = fastInput.tap === null ? null : await fastInput.tap(device, x, y, {})
+        if (fastStep === null) {
+          const r = await sh(device, `input tap ${x} ${y}`, 10_000)
+          if (!r.ok) throw new Error(failureNote('点击', r))
+        }
+        lastActions.push({ at: Date.now(), what: `点击 ${oneLine(target.text || target.desc || '', 20)}@${x},${y}` })
+        message += `，已点它`
+      }
+      return {
+        ok: true,
+        found: true,
+        swipes,
+        activity: state.activity || '',
+        message: `${message}（${Date.now() - began}ms）`,
+        ref: hit.ref,
+        point: hit.point,
+        snapshot_id: state.snapshotId,
+        elapsed_ms: Date.now() - began,
+      }
+    },
+  }), 'adb: adb_scroll_to')
+
+  ctx.effect(() => ctx.tools.register({
     name: 'adb_do',
     description: [
       '一串动作一次调用跑完：点、滑、输入、按键、系统动作、等界面。',
@@ -2443,6 +2941,8 @@ export function apply(ctx, config) {
               action: { type: 'string', description: '系统动作：home / back / recents / lock / wake / notifications / quick_settings' },
               wait_text: { type: 'string', description: '等这段文字出现再做下一步' },
               wait_gone: { type: 'string', description: '等这段文字消失再做下一步' },
+              assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
+              assert_gone: { type: 'string', description: '这一步做完核对这段文字必须消失' },
               sleep_ms: { type: 'integer', description: '硬等多久（尽量用 wait_text 代替）' },
             },
             additionalProperties: false,
@@ -2474,6 +2974,7 @@ export function apply(ctx, config) {
       const limit = args.timeout_ms ?? 8000
       const done = []
       let activity = ''
+      try {
       for (const [index, step] of (args.steps ?? []).entries()) {
         const at = index + 1
         if (step.tap !== undefined || step.id !== undefined) {
@@ -2542,6 +3043,23 @@ export function apply(ctx, config) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.sleep_ms) || 0, 15_000)))
           done.push(`等 ${step.sleep_ms}ms`)
         }
+
+        if (step.assert_text !== undefined || step.assert_gone !== undefined) {
+          const checked = await waitFor(device, { text: step.assert_text, gone: step.assert_gone }, Math.min(limit, 3000))
+          activity = checked.state.activity
+          if (!checked.matched) {
+            throw new Error(`第 ${at} 步核对失败：${step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`}${nearMiss(checked.state, { text: step.assert_text })}`)
+          }
+          done.push(step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」` : `✓「${oneLine(String(step.assert_gone), 16)}」已消失`)
+        }
+      }
+      } catch (error) {
+        const message = String((error && error.message) || error)
+        const now = await foregroundActivity(device).catch(() => '')
+        const hint = /没有|越界|ambiguous_target|核对失败/.test(message)
+          ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
+          : ''
+        throw new Error(`${message}${now ? ` · 当前页面 ${now}` : ''}${hint ? ` · ${hint}` : ''}`)
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
       const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
@@ -2816,6 +3334,128 @@ function matchNode(nodes, sel) {
   }
   return pick(nodes.filter((node) => !sel.text || node.text === sel.text)) || pick(nodes)
 }
+
+ctx.effect(() => ctx.tools.register({
+  name: 'adb_find',
+  description: '按选择器搜控件，一次拿到全部命中：序号、ref（可直接 adb_tap ref=）、id、文字、描述、矩形、中心点、是否可点/可用；命中后同一快照内可直接操作，不必再 adb_ui。用于「先确认有几个、在哪、能不能点」再动手。',
+  parameters: {
+    type: 'object',
+    properties: {
+      text: { type: 'string', description: '文字或描述，默认包含匹配' },
+      text_matches: { type: 'string', description: '文字正则（等于 regex=true 时的 text）' },
+      id: { type: 'string', description: '资源 id，可只写后半段' },
+      desc: { type: 'string', description: 'content-desc' },
+      cls: { type: 'string', description: '类名，可只写后半段，如 Switch' },
+      pkg: { type: 'string', description: '包名片段' },
+      exact: { type: 'boolean', description: '完全相等，默认包含匹配' },
+      regex: { type: 'boolean', description: 'text/id/desc 当正则用' },
+      clickable: { type: 'boolean', description: '只看可点控件' },
+      enabled: { type: 'boolean', description: '只看可用控件' },
+      visible: { type: 'boolean', description: '只看有面积的控件' },
+      within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找' },
+      all: { type: 'boolean', description: '保留同一处的所有层（默认按落点归并，只留最精确那层）' },
+      index: { type: 'integer', description: '只返回第几个匹配，从 0 开始' },
+      max: { type: 'integer', description: '最多返回几条，默认 20，上限 50' },
+      refresh: { type: 'boolean', description: '强制重新读界面树，默认复用最近 1.5s 内没变过的快照' },
+      snapshot_id: { type: 'string', description: '可选：校验快照还是不是那次，对不上直接报错' },
+    },
+    additionalProperties: false,
+  },
+  output: {
+    schema: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string' },
+        activity: { type: 'string' },
+        summary: { type: 'string' },
+        count: { type: 'integer' },
+        lines: { type: 'array' },
+        matches: { type: 'array' },
+        snapshot_id: { type: 'string' },
+        elapsed_ms: { type: 'integer' },
+      },
+      required: ['serial', 'activity', 'summary', 'count', 'lines', 'matches', 'snapshot_id', 'elapsed_ms'],
+      additionalProperties: false,
+    },
+    render: (_args, value) => textBlock(value.summary + '\n' + value.lines.join('\n')),
+  },
+  execute: async (args) => {
+    const device = await serial()
+    const began = Date.now()
+    const state = args.refresh === true
+      ? await dumpState(device, {})
+      : await snapshotForSelector(device, args.snapshot_id)
+    const refOf = new Map()
+    for (const entry of state.refs || []) if (entry && entry.node) refOf.set(entry.node, entry.ref)
+    const hits = selectNodes(state, {
+      text: args.text,
+      text_matches: args.text_matches,
+      id: args.id,
+      desc: args.desc,
+      cls: args.cls,
+      pkg: args.pkg,
+      exact: args.exact,
+      regex: args.regex,
+      clickable: args.clickable,
+      enabled: args.enabled,
+      visible: args.visible,
+      within_ref: args.within_ref,
+      all: args.all,
+      index: args.index,
+    })
+    const max = Math.min(Math.max(Number(args.max) || 20, 1), 50)
+    const matches = hits.slice(0, max).map((node, offset) => {
+      const w = Math.max(0, node.x2 - node.x1)
+      const h = Math.max(0, node.y2 - node.y1)
+      return {
+        ref: refOf.get(node) ?? null,
+        index: offset,
+        cls: String(node.cls || ''),
+        id: String(node.id || ''),
+        text: String(node.text || ''),
+        desc: String(node.desc || ''),
+        rect: [node.x1, node.y1, w, h],
+        point: `${Math.round((node.x1 + node.x2) / 2)},${Math.round((node.y1 + node.y2) / 2)}`,
+        clickable: Boolean(node.clickable || node.longClickable),
+        enabled: node.enabled !== false,
+        checked: Boolean(node.checked),
+        selected: Boolean(node.selected),
+        focused: Boolean(node.focused),
+        scrollable: Boolean(node.scrollable),
+      }
+    })
+    const lines = matches.map((item) => {
+      const parts = [`${String(item.index).padStart(2, ' ')} ref=${item.ref === null ? '-' : item.ref}`]
+      parts.push(shortClass(item.cls))
+      if (item.text) parts.push(`"${oneLine(item.text, 30)}"`)
+      if (item.desc && item.desc !== item.text) parts.push(`~"${oneLine(item.desc, 22)}"`)
+      if (item.id) parts.push('#' + shortId(item.id))
+      parts.push(`[${item.rect[2]}×${item.rect[3]} @${item.point}]`)
+      if (item.clickable) parts.push('*')
+      if (!item.enabled) parts.push('[off]')
+      if (item.checked) parts.push('[x]')
+      return parts.join(' ')
+    })
+    const filterText = [args.text, args.id, args.desc, args.cls, args.pkg].filter(Boolean).join(' ')
+    const summary = [
+      device + ' · ' + (state.activity || '未知页面'),
+      hits.length === 0 ? '没找到' : `${hits.length} 个命中` + (hits.length > matches.length ? `（显示前 ${matches.length} 个）` : ''),
+      filterText ? '查 ' + JSON.stringify(filterText) : '',
+      Date.now() - began + 'ms',
+      hits.length === 0 ? nearMiss(state, args) : '',
+    ].filter(Boolean).join(' · ')
+    return {
+      serial: device,
+      activity: state.activity || '',
+      summary,
+      count: hits.length,
+      lines: lines.length > 0 ? lines : ['（没有命中）'],
+      matches,
+      snapshot_id: state.snapshotId,
+      elapsed_ms: Date.now() - began,
+    }
+  },
+}))
 
 ctx.effect(() => ctx.tools.register({
   name: 'adb_window',
@@ -3686,7 +4326,9 @@ ctx.effect(() => ctx.tools.register({
       const device = await serial()
       const started = Date.now()
       const script = [
-        'echo @F@', 'dumpsys window | grep -m2 -E "mCurrentFocus=|mFocusedApp="',
+        /* 不能用 -m2：MIUI 先输出两行 null（mCurrentFocus=null / mFocusedApp=null），
+           真值在后面的 Window{...} / ActivityRecord{...} 行里，截前两条就永远读到「未知」。 */
+        'echo @F@', 'dumpsys window | grep -E "mCurrentFocus=|mFocusedApp=" | head -8',
         'echo @W@', 'dumpsys window windows | grep -E "^  Window #" | head -12',
         'echo @I@', 'dumpsys input_method | grep -m3 -E "mInputShown=|mShowRequested="',
         'echo @P@', 'dumpsys power | grep -m1 -E "mWakefulness="',
@@ -3881,14 +4523,29 @@ ctx.effect(() => ctx.tools.register({
         '## Android 调试：先读文本树，截图只在看外观时用',
         '',
         '判定顺序：先 `adb_state`（前台 Activity + 窗口栈 + 键盘 + 方向，约 0.5s），再 `adb_ui`（界面文本树）。不要用截图回答「页面对不对 / 有没有弹窗 / 键盘挡住没 / 跳没跳页 / 有没有报错」——报错用 `adb_sh logcat -d -t 200`。',
-        '要等接口返回、跳转或弹窗，传 `wait_for_text` / `wait_for_activity`，不要 sleep 后再截图。',
-        '连着做的一串动作（点开→等加载→输入→发送、或先回桌面再进目标页）用 `adb_do` 一次调用跑完，比一步一调少好几个回合；点完要确认结果，给 `adb_tap` 带 `wait_for_text` / `wait_for_id` / `wait_until_gone`，不要点完再单独读一次树。',
+        '要等接口返回、跳转或弹窗，传 `wait_for_text` / `wait_for_activity`，不要 sleep 后再截图；`adb_tap` 点完会自己回执界面有没有变，没变就是可疑信号（被挡住/没点中/还在动画）。',
+        '连着做的一串动作（点开→等加载→输入→发送、或先回桌面再进目标页）用 `adb_do` 一次调用跑完，比一步一调少好几个回合；每一步可带 `assert_text` / `assert_gone` 核对，失败会停在那一步并报出当前页面。',
         '只想知道「刚才点了之后变了什么」用 `adb_ui changed_only=true`（只给新增/消失的行）。桌面、返回、最近任务、锁屏、亮屏、转屏、通知栏、夜间模式用 `adb_action` 一条命令，不要再去界面里找按钮。',
-        '点击用 `adb_tap`（ref / 文字 / id，自己或最近可点祖先里挑更准的落点；ref 来自最近一次 `adb_ui`），输入用 `adb_input`，装包启停用 `adb_app`。要拖拽、曲线滑、按住再拖这种手指轨迹，用 `adb_gesture`（逐点 DOWN/MOVE/UP，比 `input swipe` 的直线更像真人）。顶部状态、开关这类一步就能改的，直接 `adb_sh`（如 `settings put system font_scale 1.15`、`svc wifi enable`、`pm grant`），比点 UI 快且不会点歪。设备已 root 时 `adb_sh root=true cmd="cat /data/data/<包名>/shared_prefs/x.xml"` 能直接读应用存储、数据库、dropbox —— 状态类问题先读存储，比走 UI 点进去更准。',
+        '点击用 `adb_tap`（ref / 文字 / id，自己或最近可点祖先里挑更准的落点；ref 来自最近一次 `adb_ui`），不确定有哪些就先 `adb_find`（一次拿全部命中 + ref + 坐标），列表里找不到用 `adb_scroll_to` 边滑边找；输入用 `adb_input`，装包启停用 `adb_app`。要拖拽、曲线滑、按住再拖这种手指轨迹，用 `adb_gesture`（逐点 DOWN/MOVE/UP，比 `input swipe` 的直线更像真人）。顶部状态、开关这类一步就能改的，直接 `adb_sh`（如 `settings put system font_scale 1.15`、`svc wifi enable`、`pm grant`），比点 UI 快且不会点歪。设备已 root 时 `adb_sh root=true cmd="cat /data/data/<包名>/shared_prefs/x.xml"` 能直接读应用存储、数据库、dropbox —— 状态类问题先读存储，比走 UI 点进去更准。',
         '`adb_shot` 只在这些时候用：颜色/布局/相机扫码画面/图表，或文本树几乎全是空节点（Flutter、自绘、部分 WebView）。图缩到长边 900px，配 `read_image` 看。「文本树看着是空的」先别急着截图：`adb_ui` 发现可读文字少于 4 个会自动跑一次 macOS 视觉 OCR，把识别出的文字当成可点击节点补进树里（来源标记 `+ocr`），慢 200ms 但省掉一次截图回合。',
         '动效问题用 `adb_anim`：给 ref/text/id 加时长和 fps，采样期间可以带 `trigger`（tap/swipe/text/action）点一下触发动画，回来的是尺寸/位置时间线 + 抖动次数、超调、帧间步长、稳定时间，比连拍截图准，也不用读图。局限：它读的是控件树坐标，列表滚动、页面转场这类合成器动画坐标可能不动，那种情况改成 `adb_mirror` 里的帧序列看。',
         '卡顿、被杀、内存涨用 `adb_proc`（top / mem / list），别截图猜。内嵌 H5 定位不准用 `adb_web`（CDP 直读 DOM，返回 CSS 矩形和换算后的设备坐标，可直接喂 `adb_tap point=`）；App 没开 WebView 调试时会明确报错。',
       ].join('\n'),
     }), 'adb: system prompt section')
   }
+}
+
+/**
+ * 纯函数的测试出口：test/selector.test.mjs 直接测选择器语义，不碰设备。
+ * 只挂无副作用的函数，不要往里加会连设备的东西。
+ */
+export const __internals = {
+  selectNodes,
+  nearMiss,
+  collapseSameSpot,
+  spotList,
+  matches,
+  parseNodes,
+  compactTree,
+  shortId,
 }

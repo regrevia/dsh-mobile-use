@@ -11,7 +11,7 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '174'
+window.__ADBM_BUILD = '177'
 
 /* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
    factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。
@@ -118,6 +118,7 @@ if (window.__ADBM_LOADED__ !== true) {
       '.adbm-img{display:block;width:100%;height:100%;object-fit:contain;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
       '.adbm-video{display:block;width:100%;height:100%;background:#000;border-radius:6px;object-fit:contain}',
       '.adbm-ink{position:absolute;inset:0;touch-action:none}',
+      '.adbm-live{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}',
       '.adbm-ink[data-mode="mark"]{cursor:crosshair}',
       '.adbm-ink[data-mode="tap"]{cursor:pointer}',
       '.adbm-input{flex:none;font:inherit;font-size:12px;padding:5px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:inherit}',
@@ -871,8 +872,8 @@ if (window.__ADBM_LOADED__ !== true) {
       }
 
       const onDown = (event) => {
-        if (mode === 'view') return
         const point = pointOf(event)
+        try { report({ event: 'input', phase: 'down', mode, x: Math.round(point.x), y: Math.round(point.y), button: event.button, serial }) } catch (error) { /* 诊断不影响操作 */ }
         if (mode === 'mark') {
           /* 第一笔落下就把画面冻住：之后几秒输入说明时页面再动，
              送回会话的仍是"人看到问题的那一帧"。 */
@@ -946,7 +947,11 @@ if (window.__ADBM_LOADED__ !== true) {
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ serial, x1: from.x, y1: from.y, x2: to.x, y2: to.y, ms: 260 }),
           })
-        body.catch(() => setStatus(L('state.failed')))
+        body.then((response) => (response.ok ? response.json() : null)).then((result) => {
+          try { report({ event: 'input', phase: 'up', far, engine: result && result.engine, ok: result === null ? null : result.ok === true, reason: result && result.reason }) } catch (error) { /* 诊断不影响操作 */ }
+          if (result !== null && result.ok === true) return
+          setStatus(String((result && result.reason) || L('state.failed')))
+        }).catch(() => setStatus(L('state.failed')))
       }
 
       /* 画布拿到焦点时，键入直接进设备：可见字符攒 150 ms 发一次，功能键立刻发。 */
@@ -1201,9 +1206,8 @@ if (window.__ADBM_LOADED__ !== true) {
 
       return h('div', { className: 'adbm-body' },
         h('div', { className: 'adbm-bar' },
-          button('mark', L('act.mark'), () => setMode(mode === 'mark' ? 'view' : 'mark')),
-          button('tap', L('act.tap'), () => setMode(mode === 'tap' ? 'view' : 'tap')),
-          h('button', {
+          serial === '' ? button('tap', L('act.tap'), () => setMode('tap')) : null,
+          serial === '' ? null : h('button', {
             className: 'adbm-btn',
             'data-primary': '1',
             disabled: !ready,
@@ -1226,6 +1230,14 @@ if (window.__ADBM_LOADED__ !== true) {
         ),
         h('div', { className: 'adbm-stage', ref: stageRef }, // ui-copy-ignore
           empty === '' ? null : h('p', { className: 'adbm-empty' }, empty),
+          serial === ''
+            ? null
+            : h('iframe', {
+              className: 'adbm-live',
+              title: serial,
+              allow: 'autoplay; fullscreen',
+              src: `${ROUTE}/?session=${encodeURIComponent(sessionId)}&serial=${encodeURIComponent(serial)}`,
+            }),
           h('div', {
             className: 'adbm-frame',
             ref: frameRef,

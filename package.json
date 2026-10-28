@@ -63,6 +63,6 @@
     "debugging"
   ],
   "scripts": {
-    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs"
+    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs && node test/selector.test.mjs"
   }
 }

@@ -371,6 +371,16 @@ export const PLAYER_HTML = `<!doctype html>
   pumpStream()
 
   /* 页面自身的异常也上报：黑屏时先看这里，不要靠猜。 */
+  function report(body) {
+    try {
+      fetch(ROUTE + '/diag', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(Object.assign({ pid: 'player' }, body)),
+      }).catch(function () { /* 诊断上报失败不影响操作 */ })
+    } catch (error) { /* 诊断不影响操作 */ }
+  }
+
   function reportError(where, error) {
     try {
       fetch(ROUTE + '/diag', {
@@ -453,6 +463,7 @@ export const PLAYER_HTML = `<!doctype html>
 
   var press = null
   function onDown(event) {
+    try { report({ event: 'input', phase: 'down', mode: marking ? 'mark' : 'tap', button: event.button, serial: serial }) } catch (error) { /* 诊断不影响操作 */ }
     if (marking || event.button !== 0) return
     var at = devicePoint(event)
     if (at === null) return
@@ -481,6 +492,7 @@ export const PLAYER_HTML = `<!doctype html>
         return
       }
       post('/tap', { serial: serial, x: held.at.x, y: held.at.y }).then(function (result) {
+        try { report({ event: 'input', phase: 'up', kind: 'tap', x: held.at.x, y: held.at.y, ok: result && result.ok === true, reason: result && result.reason, engine: result && result.engine }) } catch (error) { /* 诊断不影响操作 */ }
         say(result && result.ok ? ('点 ' + held.at.x + ',' + held.at.y) : '点击失败')
       })
       return
