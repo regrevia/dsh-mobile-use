@@ -4932,8 +4932,9 @@ ctx.effect(() => ctx.tools.register({
 }
 
 /**
- * 纯函数的测试出口：test/selector.test.mjs 直接测选择器语义，不碰设备。
- * 只挂无副作用的函数，不要往里加会连设备的东西。
+ * 测试与脚本出口：纯函数给单测用，几个设备读原语给 scripts/device-bench.mjs 量开销。
+ * 这些都是内部实现，不是插件 API：改名不影响工具契约；往这里加东西也等于放弃「纯函数」承诺，
+ * 需要设备的地方（如 resolveSerial）必须显式写清它连 adb。
  */
 export const __internals = {
   selectNodes,
@@ -4948,6 +4949,13 @@ export const __internals = {
   decodeEntities,
   digestLine,
   validateSteps,
+  resolveSerial,
+  dumpState,
+  foregroundActivity,
+  waitFor,
+  scrollToText,
+  u2Dump,
+  screenSize,
   scrollFrames,
   swipeLine,
   guardOutput,
