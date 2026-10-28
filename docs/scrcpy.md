@@ -312,6 +312,8 @@ server 参数拼装、`stop()` 幂等与敌对对象（child 无 `kill`、socket
 
 ## 12. 冷启动黑屏三连坑（2026-10-28 实测）
 
+**先记住两条口径**：关掉右栏不会停流，`ADBM_IDLE_GRACE_MS`（默认 120s）内再打开就是暖启动（253ms）；要复现冷启动只能打 `POST /dsh-mobile-use/stream/stop?confirm=1`，它是唯一立刻断流的入口。
+
 症状：面板打开先黑 6–13 秒，出来的是 720p（screenrecord），过一会儿才切回 1600×1068；日志里 `看门狗：8 秒没有初始化段，重建采集链路` 反复出现。三个独立原因叠在一起，缺一个都修不好：
 
 1. **sweep 杀掉刚 spawn 的 recorder。** `spawnRecorder()` 里调过一次 `sweepOwnRecorders()`，它是异步的（`adb shell ps` 再 `kill -9`），`ps` 回来时新 recorder 已经在，于是自己杀自己：`spawn session=N` → `recorder-exit code=0` → 无限重建。修法：spawn 路径不再 sweep，只在 `stop()` 里清。
