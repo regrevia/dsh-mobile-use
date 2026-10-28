@@ -11,7 +11,7 @@
 
 /* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
    必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
-window.__ADBM_BUILD = '161'
+window.__ADBM_BUILD = '166'
 
 /* 同一个 bundle 被执行两次（HMR 重评 / 重复注入）时只注册一次：client-modules 对重复
    factory 会直接抛错，整条 web boot 就失败（2026-10-27 20:32 duplicate factory 事故）。
@@ -166,6 +166,13 @@ if (window.__ADBM_LOADED__ !== true) {
       let codec = ''
       let lastLagAt = 0
       let controller = new AbortController()
+      /* 卡死判定：只看「有数据却不动」，静止画面本来就不出帧，不能按「多久没字节」判。 */
+      let currentController = null
+      let lastAppendAt = Date.now()
+      let lastTimeSeen = -1
+      let lastTimeAt = Date.now()
+      let connectedAt = 0
+      let metaSeen = 0
 
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
       const meta = (payload) => {
@@ -236,8 +243,10 @@ if (window.__ADBM_LOADED__ !== true) {
           return
         }
         sourceBuffer.mode = 'segments'
+        sourceBuffer.addEventListener('error', () => { /* 解复用器报错只在 buffered 上看得出，不抛 */ })
         sourceBuffer.addEventListener('updateend', () => {
           appending = false
+          lastAppendAt = Date.now()
           try {
             if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) {
               const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
@@ -261,6 +270,7 @@ if (window.__ADBM_LOADED__ !== true) {
       }
       const onFrame = (type, payload) => {
         if (type === STREAM_META) {
+          metaSeen += 1
           const info = meta(payload)
           if (info?.codec) codec = String(info.codec)
           ensureSource()
@@ -292,6 +302,8 @@ if (window.__ADBM_LOADED__ !== true) {
         if (!res.ok || res.body === null) throw new Error('stream')
         const reader = res.body.getReader()
         let buf = new Uint8Array(0)
+        currentController = controller
+        connectedAt = Date.now()
         while (!stopped) {
           const { value, done } = await reader.read()
           if (done) break
@@ -341,9 +353,36 @@ if (window.__ADBM_LOADED__ !== true) {
       video.addEventListener('resize', () => options.onSize?.(video.videoWidth, video.videoHeight))
       video.addEventListener('playing', () => options.onReady?.())
       void video.play().catch(() => {})
+      /* 三种「看着像崩了」的卡死各给一条出路：追加链停、播放时间停。
+         命中就 abort 当前连接，外层按退避重连（重连会重发 INIT 和最近一个 GOP）。 */
+      const stallTick = setInterval(() => {
+        try {
+          if (stopped) return
+          const now = Date.now()
+          if (video.currentTime !== lastTimeSeen) { lastTimeSeen = video.currentTime; lastTimeAt = now }
+          /* 连上了却连 META 都没收到：冷启动时 stream 还没就绪，这条连接会一直空转，
+             不主动断开就是永久黑屏（3 s 后的 abort 由外层退避重连）。 */
+          if (connectedAt > 0 && metaSeen === 0 && now - connectedAt > 2500) {
+            try { currentController?.abort() } catch { /* 已断 */ }
+            connectedAt = 0
+            return
+          }
+          if (queue.length > 4 && now - lastAppendAt > 2000) {
+            try { currentController?.abort() } catch { /* 已断 */ }
+            return
+          }
+          let end = 0
+          if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
+          if (end > 0 && video.paused === false && video.readyState >= 3 && now - lastTimeAt > 2500) {
+            if (end - video.currentTime > 0.3) { video.currentTime = Math.max(0, end - 0.06); lastTimeAt = now }
+            else { try { currentController?.abort() } catch { /* 已断 */ } }
+          }
+        } catch { /* 诊断不能抛 */ }
+      }, 1000)
       void run()
       return () => {
         stopped = true
+        clearInterval(stallTick)
         try { controller.abort() } catch { /* 已经关了 */ }
         reset()
       }

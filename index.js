@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=194'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=200'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -624,8 +624,56 @@ async function deviceStory(device, windowMs = 120_000) {
   return lines
 }
 
+/**
+ * 系统组件的生命周期事件属于背景噪声，人工时间线里不该占位置。
+ * @param {string} line - logcat 行。
+ * @returns {boolean} true 表示可以丢掉。
+ */
+function isSystemNoise(line) {
+  const match = /(?:am_proc_start|am_proc_died|am_kill|wm_create_activity|wm_destroy_activity|am_focused_activity).*?[\[,(]\s*[0-9-]*\s*,?\s*([a-zA-Z][\w.]*)/.exec(line)
+  const pkg = match === null ? '' : match[1]
+  if (pkg === '') return false
+  return /^(android|com\.android\.|com\.miui\.|com\.google\.android\.|com\.xiaomi\.|miui\.)/.test(pkg)
+}
+
 /** 最近的操作时间线，标注回传时一起交给模型。 @type {Array<{ at: number, what: string }>} */
 const lastActions = []
+
+/* 热重载 / 宿主重启会换掉整个模块实例，内存里的时间线一清空，用户说「我刚才点了什么」
+   就真的查不到。落一份 JSON 到磁盘，重启后接着用，问「刚才」永远有东西可答。 */
+const ACTIONS_FILE = join(homedir(), '.dsh', 'adb-mirror', 'actions.json')
+const ACTIONS_KEEP_MS = 6 * 60 * 60 * 1000
+
+/**
+ * 读回上一次进程留下的时间线，只保留最近 6 小时。
+ * @returns {void}
+ */
+function loadActions() {
+  try {
+    if (!existsSync(ACTIONS_FILE)) return
+    const parsed = JSON.parse(readFileSync(ACTIONS_FILE, 'utf8'))
+    if (!Array.isArray(parsed)) return
+    const now = Date.now()
+    for (const item of parsed) {
+      if (!item || typeof item.at !== 'number' || typeof item.what !== 'string') continue
+      if (now - item.at > ACTIONS_KEEP_MS) continue
+      lastActions.push({ at: item.at, what: item.what.slice(0, 80) })
+    }
+    lastActions.sort((a, b) => a.at - b.at)
+    if (lastActions.length > 400) lastActions.splice(0, lastActions.length - 400)
+  } catch { /* 文件坏了就当没有：时间线不是关键路径 */ }
+}
+
+/**
+ * 把时间线写回磁盘，失败不吭声。
+ * @returns {Promise<void>} 无。
+ */
+async function saveActions() {
+  try {
+    await mkdir(dirname(ACTIONS_FILE), { recursive: true })
+    await writeFile(ACTIONS_FILE, JSON.stringify(lastActions.slice(-400)), 'utf8')
+  } catch { /* 磁盘写不进去不影响操作 */ }
+}
 
 /**
  * 取最近一段时间内的操作。
@@ -1708,6 +1756,20 @@ async function uiInRect(serial, rect) {
 export function apply(ctx, config) {
   const serial = async () => resolveSerial(config)
 
+  loadActions()
+  /* 每 2 秒对比一次尾部，有变化才落盘：所有记动作的地方都不用改，也不会写爆磁盘。 */
+  let savedAt = lastActions.length > 0 ? lastActions[lastActions.length - 1].at : 0
+  const actionSaver = setInterval(() => {
+    try {
+      const tail = lastActions.length > 0 ? lastActions[lastActions.length - 1].at : 0
+      if (tail !== savedAt) {
+        savedAt = tail
+        void saveActions()
+      }
+    } catch { /* 定时器是独立故障域 */ }
+  }, 2000)
+  actionSaver.unref?.()
+
   /* 实时镜像：侧栏直播 + 标注回传 + 本机 3 分钟环形缓冲。 */
   const mirror = setupMirror(ctx, {
     adb: Object.assign(adb, { path: ADB }),
@@ -1724,6 +1786,8 @@ export function apply(ctx, config) {
     typeText: typeViaClipboard,
   })
   ctx.effect(() => () => {
+    clearInterval(actionSaver)
+    void saveActions()
     mirror.stopAll()
     stopOcr()
     for (const device of [...shellChannels.keys()]) killShell(device)
@@ -3085,11 +3149,19 @@ ctx.effect(() => ctx.tools.register({
       const evRaw = evLog && evLog.ok ? evLog.out : ''
       const evKeep = /am_focused_activity|wm_create_activity|wm_destroy_activity|am_proc_start|am_proc_died|am_crash|am_anr|am_kill|am_activity_launch_time|wm_on_resume_called/
       const evPicked = []
+      const seenEv = new Set()
       if (evRaw !== '') {
         for (const line of evRaw.split('\n')) {
           if (!evKeep.test(line)) continue
           if (wanted !== '' && !line.includes(wanted)) continue
-          evPicked.push(line.trim())
+          /* 系统组件每几秒就冒一条，混在时间线里会把「用户做了什么」淹掉；
+             指定 package 时不过滤，免得把要看的那条也筛掉。 */
+          if (wanted === '' && isSystemNoise(line)) continue
+          const trimmed = line.trim()
+          const key = trimmed.replace(/^\S+\s+\S+\s+/, '').slice(0, 120)
+          if (seenEv.has(key)) continue
+          seenEv.add(key)
+          evPicked.push(trimmed)
         }
       }
       const switches = evPicked.slice(-16).map((line) => `${logAge(line)}${line.slice(0, 200)}`)

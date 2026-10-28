@@ -132,7 +132,13 @@ export const PLAYER_HTML = `<!doctype html>
   }
 
   /* 现场计数：出问题时能直接看出是没收帧、没入队，还是 append 一直失败。 */
-  var stats = { meta: 0, init: 0, media: 0, end: 0, appends: 0, appendErr: '', dropped: 0, queueMax: 0 }
+  var stats = { meta: 0, init: 0, media: 0, end: 0, appends: 0, appendErr: '', dropped: 0, queueMax: 0, stalls: 0, connects: 0 }
+  /* 卡死判定用的进度探针（秒级，不参与热路径）。 */
+  var currentReader = null
+  var lastAppendAt = Date.now()
+  var lastTimeSeen = -1
+  var lastTimeAt = Date.now()
+  var connectedAt = 0
   window.__adbm = stats
 
   function appendNext() {
@@ -151,8 +157,10 @@ export const PLAYER_HTML = `<!doctype html>
       try { sourceBuffer = mediaSource.addSourceBuffer(codec) } catch (second) { startPolling(); return }
     }
     sourceBuffer.mode = 'segments'
+    sourceBuffer.addEventListener('error', function () { stats.appendErr = 'sb-error' })
     sourceBuffer.addEventListener('updateend', function () {
       appending = false
+      lastAppendAt = Date.now()
       try {
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
           var end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
@@ -212,8 +220,13 @@ export const PLAYER_HTML = `<!doctype html>
     return fetch(ROUTE + '/stream?serial=' + encodeURIComponent(serial) + '&t=' + Date.now(), { cache: 'no-store' })
       .then(function (res) {
         if (!res.ok || !res.body) throw new Error('stream ' + res.status)
+        stats.connects += 1
         var reader = res.body.getReader()
         var buf = new Uint8Array(0)
+        /* 只记下当前 reader，卡死判定交给 stallTick：静止画面本来就不出帧，
+           「N 秒没字节」会把正常空闲当成故障，之前那版这样做过，结果每 3 秒重连一次。 */
+        currentReader = reader
+        connectedAt = Date.now()
         function step() {
           return reader.read().then(function (part) {
             if (part.done) return null
@@ -290,6 +303,30 @@ export const PLAYER_HTML = `<!doctype html>
   }
 
   pumpStream()
+
+  function armReconnect() {
+    try { if (currentReader !== null) { const reader = currentReader; currentReader = null; reader.cancel().catch(function () {}) } } catch (error) { /* 已断 */ }
+  }
+
+  /* 三种「看着像崩了」的卡死各给一条出路：追加链停、播放时间停、连接半死。
+     判定必须排除静止画面（本来就不出帧），所以只看「有数据却不动」。 */
+  setInterval(function () {
+    try {
+      if (liveStopped) return
+      var now = Date.now()
+      var t = video.currentTime
+      if (t !== lastTimeSeen) { lastTimeSeen = t; lastTimeAt = now }
+      /* 连上了却连 META 都没收到：冷启动时 stream 还没就绪，连接会一直空转。 */
+      if (stats.meta === 0 && connectedAt > 0 && now - connectedAt > 2500) { stats.stalls += 1; armReconnect(); connectedAt = 0; return }
+      if (queue.length > 4 && now - lastAppendAt > 2000) { stats.stalls += 1; armReconnect(); return }
+      var end = 0
+      if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
+      if (end > 0 && video.paused === false && video.readyState >= 3 && now - lastTimeAt > 2500) {
+        if (end - t > 0.3) { video.currentTime = Math.max(0, end - 0.06); lastTimeAt = now }
+        else { stats.stalls += 1; armReconnect() }
+      }
+    } catch (error) { /* 诊断不能抛 */ }
+  }, 1000)
 
   /* ---- 点击 → 设备坐标 ---- */
   video.addEventListener('click', function (event) {

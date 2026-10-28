@@ -663,6 +663,11 @@ const DEFAULT_OPTIONS = {
   pushServer: true,
   video: true,
   control: true,
+  /* 编码分辨率与帧率：不改时按设备原生分辨率 + 不限帧，3200x2136 一帧 6.8 MP，
+     设备编码器忙不过来就直接变成操作延迟。侧栏画布只有几百像素宽，压到长边 1600 足够清晰。 */
+  maxSize: 1600,
+  maxFps: 0,
+  videoBitRate: 8_000_000,
   logLevel: 'info',
   readyTimeoutMs: 15000,
   commandTimeoutMs: 20000,
@@ -952,6 +957,11 @@ export class ScrcpyChannel extends EventEmitter {
         video: this._options.video,
         audio: false,
         control: this._options.control,
+        /* 这三项必须显式传：漏传时 buildServerArgs 用默认 0，等于按原生分辨率不限帧编码，
+           3200x2136 每帧 6.8 MP 把设备编码器压满，操作延迟直接翻倍。 */
+        maxSize: this._options.maxSize,
+        maxFps: this._options.maxFps,
+        videoBitRate: this._options.videoBitRate,
       })
       const args = [...this._adbBaseArgs(), 'shell', command]
       const child = spawn(this._options.adbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })

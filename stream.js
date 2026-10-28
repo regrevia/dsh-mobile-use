@@ -1075,7 +1075,12 @@ export class LiveStream {
     this.framesSeen += 1
     this.lastAt = Date.now()
     const pts = readTfdt(chunk, this.timescale ?? 90000)
-    if (pts >= 0) this.lastPts = pts
+    if (pts >= 0) {
+      this.lastPts = pts
+      /* 宿主时钟 ↔ 分片 PTS 的换算基准：同一份 ffmpeg 会跨多次订阅复用，PTS 从 ffmpeg
+         启动那刻算起，跟 startedAt 不是同一个原点。拿它才能算出真实的端到端延迟。 */
+      this.ptsOriginMs = Date.now() - pts * 1000
+    }
     const key = containsIdr(chunk)
     if (key) {
       this.lastKeyChunks = [chunk]
@@ -1220,6 +1225,8 @@ export class LiveStream {
       generations: this.generation,
       /* 最近一片的解码时间与它距现在的秒数：两个数一起看就是整条链路的延迟。 */
       lastPts: this.lastPts ?? null,
+      /* 端到端延迟的测量口径：Date.now() - (ptsOriginMs + mediaTime*1000)。 */
+      ptsOriginMs: this.ptsOriginMs ?? null,
       ptsAgeMs: this.lastPts === null || this.lastPts === undefined ? null : Math.round(Date.now() - this.startedAt - this.lastPts * 1000),
       capture: this.scrcpy !== null ? 'scrcpy' : (this.recorder !== null ? 'screenrecord' : 'idle'),
     }

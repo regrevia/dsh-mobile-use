@@ -86,7 +86,13 @@ ffmpeg -flags low_delay -use_wallclock_as_timestamps 1 -f h264 -i pipe:0 \
 
 - `-use_wallclock_as_timestamps 1` **必须写在 `-i` 之前**，写在后面等于没写：裸流没有时间戳，
   不加这个参数 ffmpeg 会按 1200000fps 自己编时间轴，播起来像定格（实测 132 s 的流只走 14 s 时间轴）。
-- `-frag_duration` 决定一片多长：40 ms 左右延迟最低但碎片多；静止画面不出帧时就自然不产生流量。
+- `-frag_duration` 决定一片多长，默认 `fragMs = 10`（即 `-frag_duration 10000`），硬边界
+  `Math.min(200, Math.max(10, fragMs))`。碎片越短，攒片等的时间越少；代价是每个 fragment 的
+  `moof` 开销。静止画面 scrcpy 不出帧，这时自然没有流量，**不要**把它当卡住。
+- 编码参数默认收在 `max_size=1600` / `max_fps=60` / `videoBitRate=8000000`：设备原生
+  3200×2136 全量编码会把宿主和链路跑满，实际协商到 **1600×1068**（`video.videoWidth` 已核对）。
+  这三个值由 `ScrcpyChannel` → `_spawnServer` → `buildServerShellCommand` 一路透传，
+  早期只在 `DEFAULT_OPTIONS` 里写、没透传下去，等于没设，表现为「改了参数设备分辨率不动」。
 - socket 帧格式：5 字节头（`type` + BE32 长度），`0 META` / `1 INIT` / `2 MEDIA` / `3 END`。
   INIT（`ftyp`+`moov`）必须在任何 MEDIA 之前；新观众进来先补发 INIT，再按「从一张 IDR 起头的
   连续 GOP」补最近一段（`subscribe` → `sendPrelude`），否则解码器从 P 帧起头直接报错。
@@ -98,6 +104,12 @@ ffmpeg -flags low_delay -use_wallclock_as_timestamps 1 -f h264 -i pipe:0 \
   `CHUNK_DEMUXER_ERROR_APPEND_FAILED`，画面全黑。
 - MIME 要写全：`video/mp4; codecs="avc1.640034"`（从 SPS 的 profile/level 推），
   只用 `video/mp4` 在部分 Chrome 上 `addSourceBuffer` 直接 `NotSupportedError`。
+- 直播边缘靠 `updateend` 里的滞后量维持：`end - currentTime > 0.6 s` 就跳到 `end - 0.06`，
+  `> 0.15 s` 用 `playbackRate 1.25` 追。**新页面接上已经跑了一阵的流时，时间轴不是从 0 开始**，
+  这时不主动跳进缓冲区间就会停在 `currentTime = 0`、`readyState = 1`，画面永远黑。
+- 卡死判定只能看「有没有进展」，不能看「有没有字节」：静止画面本来就不出片。三条判据
+  （`page.js` / `client.js` 各一份）：连接后 2.5 s 还没收到 META → 重连（冷启动时 stream 未就绪）；
+  队列里还有活但 2 s 没 `updateend` → 重连；缓冲到边缘、`readyState ≥ 3`、2.5 s 时间不走 → 先跳边缘再重连。
 
 ## 4. 控制消息字节布局（v5.0.1，`app/src/control_msg.c`）
 
@@ -141,16 +153,25 @@ adb 往返（≈35 ms 基线）+ 每次 `input` 重新拉起 `app_process`（≈
 
 ### 5.1 镜像链路实测（scrcpy → ffmpeg → fMP4 → 浏览器 MSE）
 
-测量方式：页面里用 `video.requestVideoFrameCallback` 取每个「已经上屏」的帧，
-用它的 `mediaTime` 对 `stream.started` 与 `Date.now()` 算差（`stream.info().lastPts` /
-`ptsAgeMs` 是同一套时间刻度的宿主侧对照）。设备 `15ca9736`，边连续滑动边采 4 秒、111 帧：
+测量方式：页面里用 `video.requestVideoFrameCallback` 取每个「已经上屏」的帧的 `mediaTime`，
+与宿主侧的 PTS 换算基准对齐：`latency = (performance.timeOrigin + frameCallbackTime) -
+(ptsOriginMs + mediaTime * 1000)`。`ptsOriginMs = Date.now() - lastPts * 1000` 由 `stream.info()`
+给出，是「宿主时钟 ↔ 分片时间轴」的真实原点。
+
+> 早先版本拿 `stream.started` 当原点，而同一份 ffmpeg 会跨多次订阅复用、PTS 继续往前涨，
+> 于是算出来的 152–168 ms 里混进了几十秒的时间轴偏移，属于**测错**，不是链路慢。以本节为准。
+
+设备 `15ca9736`，1600×1068 编码上限，开设置页连续上下滑、采 6.7 秒：
 
 | 指标 | 值 |
 | --- | --- |
-| 单帧端到端（含采集、编码、重排、传输、解码、上屏）最小值 | 152 ms |
-| 中位 | 168 ms |
-| 最大（含一次重连后的追赶帧） | 436 ms |
-| `readyState` / 缓冲余量 | 4 / ≈0.1–0.2 s |
+| 上屏帧数 / 帧率 | 363 帧 / 53.9 fps |
+| 单帧端到端（采集→编码→重排→传输→解码→上屏）最小值 | 8 ms |
+| 中位 | 39 ms |
+| p90 | 46 ms |
+| 最大 | 66 ms |
+| `readyState` / 缓冲余量 | 4 / ≈0.02–0.1 s |
+| 6.7 s 内 `stalls` / `connects` | 0 / 1 |
 
 `ptsAgeMs` 在静止画面上会涨到 1 s 以上：scrcpy 只在画面变化时出帧，静止时「最近一片的
 年龄」就是「上一次画面变化距今多久」，不是延迟，别拿它当卡顿证据。
@@ -217,34 +238,35 @@ new ScrcpyChannel({ serial, adbPath, serverPath, deviceServerPath, serverVersion
 - 日志回调自己抛异常也不会传播出去（`_logSafe` 内层 try/catch）。
 - `start()` 全程 `try/catch`，任何失败统一 `_fail()` → 日志 + `stop()` + 返回 `false`。
 
-## 7. 未验证（本轮明确没做的事）
+## 7. 已验证 / 未验证
 
-- **真机端到端握手没跑过**：`adb push`、`adb reverse`、`app_process` 启动、设备连回本机端口、
-  视频 socket 先到 / 控制 socket 后到的顺序，全部只在代码里实现，没有对着 `15ca9736` 联调。
-  也没有在真机上解码过一帧。
-- 没有实测 scrcpy 控制 socket 的注入延迟（第 5 节只有 adb `input` 路线的数字）。
-- `tunnel_forward=true` 拓扑没测。
-- 音频（`audio=true`）、H.265/AV1/VP8/VP9 的实际码流、`max_size`/`max_fps` 等编码参数的效果都没测。
-- 控制消息里只实现了按键/文本/触控/返回四类；滚动、剪贴板、旋转、UHID 等只留了枚举值。
-- 多指并发（多个 pointerId 同时按下）没测。
-- `client.js` 侧的画面 ↔ 设备坐标换算没接；本模块只吃设备坐标。
-- 没有接入 `index.js` / 任何插件入口，`package.json` 脚本也没加。
+已经对着 `15ca9736` 真机跑通并留下数字的：
 
-## 8. TODO（下一轮若要接进插件）
+- `adb push` + `app_process` 起 server、forward 拓扑、video/control socket 顺序（video 先到）。
+- 首帧解码 → fMP4 重排 → MSE 上屏；编码上限协商到 1600×1068。
+- 触控/滑动/手势/文本/按键经 `/tap` `/scroll` `/swipe` `/gesture` `/input` `/key` 落地。
+- 端到端延迟与帧率（第 5.1 节）、断流恢复（`stalls`/`connects` 计数可观测）。
+- 人手在侧栏的操作会进宿主时间线，且时间线落盘、热重载后仍在（`/actions` 可查）。
 
-1. 先用真机跑一次 `ScrcpyChannel.start()`，确认 socket 顺序与 `video-header` 的 codec/宽高。
-2. 把 `video-packet` 喂给 MSE / WebCodecs；`config` 包先构建 `avcC`（`parseAvcConfig` 已有）再做
-   `avccToAnnexB`。
-3. 侧栏点击 → `client.js` 现有坐标换算 → `pushTouch`，DOWN/MOVE/UP 走同一 pointerId。
-4. 断流恢复：`video socket close` → `stop()` → 退避重连；`resetRequired` 时重建 parser。
-5. 设备不在线 / 没 root 的降级路径：不能 push server 时退回 `adb shell input`（延迟见第 5 节）。
-6. 补一条“真机冒烟”脚本（不进 CI，手动跑），把第 7 节的空白逐项打勾。
+仍然没做或没测的：
+
+- 音频（`audio=true`）、H.265/AV1/VP8/VP9 码流。
+- 多指并发（多个 pointerId 同时按下）。
+- 开流之后再转屏：坐标空间会失效，目前不自动重算。
+- 真手指触摸的坐标：`/dev/input` 的 `getevent` 需要 root，本机虽已 root，但没有真人示范数据，
+  所以只记录了「面板动作 + 系统事件」，物理屏触摸仍不可还原。
+
+## 8. 后续可做
+
+1. 手势流式下发（`/touch` 单连接持续喂 DOWN/MOVE/UP），替代每次 `adb shell input` 的进程启动开销。
+2. 转屏后自动重建坐标映射（监听 `wm_size` 再算一次缩放）。
+3. UHID / 剪贴板 / 旋转控制消息。
 
 ## 9. 回归测试
 
 ```sh
 node test/scrcpy.test.mjs      # 纯内存，不连设备、不 spawn 进程
-# === 全部通过 ===（52 项），exit 0
+# === 全部通过 ===（54 项），exit 0
 ```
 
 覆盖：包头位布局（v5 媒体/session、v3 config）、逐字节重组、半包缓冲、oversize 拒绝、

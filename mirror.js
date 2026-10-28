@@ -20,9 +20,9 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=160'
-import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=3'
-import { PLAYER_HTML } from './page.js?v=7'
+import { LiveStream, packFrame } from './stream.js?v=161'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=5'
+import { PLAYER_HTML } from './page.js?v=12'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -1157,6 +1157,9 @@ export function setupMirror(ctx, tools) {
           serial,
           adbPath: tools.adb.path,
           port: 27185 + channelSeq,
+          maxSize: Number(process.env.ADBM_MAX_SIZE ?? 1600),
+          maxFps: Number(process.env.ADBM_MAX_FPS ?? 0),
+          videoBitRate: Number(process.env.ADBM_BITRATE ?? 8_000_000),
           log: (note) => ctx.logger?.debug?.(`[scrcpy] ${String(note)}`),
         })
         entry.channel = channel
