@@ -281,4 +281,14 @@ it('步骤预检认识 wait_all / wait_any：空数组、非文字、超 8 条�
   assert.equal(many.ok, false)
   assert.match(many.problems[0], /最多 8 条/)
 })
+
+it('步骤预检认识 wait_activity：等页面跳转，正则写错在连设备之前就报', () => {
+  assert.equal(validateSteps([{ tap: '扫码绑定', wait_activity: 'ScanActivity' }]).ok, true)
+  const empty = validateSteps([{ wait_activity: '  ' }])
+  assert.equal(empty.ok, false)
+  assert.match(empty.problems[0], /wait_activity 要写页面正则/)
+  const bad = validateSteps([{ wait_activity: 'Scan(' }])
+  assert.equal(bad.ok, false)
+  assert.match(bad.problems[0], /不是合法正则/)
+})
 console.log(`\n${pass} 项通过\n`)

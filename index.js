@@ -202,7 +202,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'assert_text', 'assert_gone', 'sleep_ms']
+  const preconditions = ['wait_idle', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -234,6 +234,13 @@ function validateSteps(steps) {
     }
     if (step.sleep_ms !== undefined && !(Number.isFinite(Number(step.sleep_ms)) && Number(step.sleep_ms) >= 0)) {
       problems.push(`第 ${at} 步 sleep_ms 要写非负毫秒数。`)
+    }
+    if (step.wait_activity !== undefined) {
+      if (typeof step.wait_activity !== 'string' || step.wait_activity.trim() === '') {
+        problems.push(`第 ${at} 步 wait_activity 要写页面正则，例如 "MainActivity"。`)
+      } else {
+        try { new RegExp(step.wait_activity, 'i') } catch { problems.push(`第 ${at} 步 wait_activity 不是合法正则：${step.wait_activity}`) }
+      }
     }
     for (const key of ['wait_all', 'wait_any']) {
       if (step[key] === undefined) continue
@@ -3447,6 +3454,7 @@ export function apply(ctx, config) {
               action: { type: 'string', description: '系统动作：home / back / recents / lock / wake / notifications / quick_settings' },
               wait_text: { type: 'string', description: '等这段文字出现再做下一步' },
               wait_gone: { type: 'string', description: '等这段文字消失再做下一步' },
+              wait_activity: { type: 'string', description: '等前台页面切到这个正则再做下一步，例如 "ScanActivity"' },
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
@@ -3570,22 +3578,24 @@ export function apply(ctx, config) {
           done.push(`等静止 ${Date.now() - idleStart}ms`)
         }
 
-        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined) {
+        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined) {
           const waited = await waitFor(device, {
             text: step.wait_text,
             gone: step.wait_gone,
             texts: step.wait_all,
             any_texts: step.wait_any,
+            activity: step.wait_activity,
           }, limit)
           activity = waited.state.activity
           if (!waited.matched) {
             const wanted = step.wait_text ? `没等到「${step.wait_text}」`
               : step.wait_gone ? `「${step.wait_gone}」还在`
-                : step.wait_all ? `「${normalList(step.wait_all).join('」「')}」没全出现`
-                  : `「${normalList(step.wait_any).join('」「')}」一个都没出现`
+                : step.wait_activity ? `页面还没切到 /${step.wait_activity}/`
+                  : step.wait_all ? `「${normalList(step.wait_all).join('」「')}」没全出现`
+                    : `「${normalList(step.wait_any).join('」「')}」一个都没出现`
             throw new Error(`第 ${at} 步等界面超时 ${limit}ms：${wanted}`)
           }
-          const what = step.wait_text ?? (step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
+          const what = step.wait_text ?? (step.wait_activity ? `页面切到 ${step.wait_activity}` : step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
           done.push(`等 ${what} ${waited.elapsedMs}ms`)
         } else if (step.sleep_ms !== undefined) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.sleep_ms) || 0, 15_000)))
