@@ -1555,6 +1555,100 @@ async function snapshotForSelector(serial, snapshotId) {
 }
 
 /**
+ * 边滑边找一个控件：先看当前界面，找不到就按方向滑，最多 8 次。
+ * @param {string} serial - 设备。
+ * @param {string} text - 要找的文字（包含匹配）。
+ * @param {string} direction - 手指滑动方向：up 把下面的内容拉上来，down/left/right 同理。
+ * @returns {Promise<object>} 命中的节点。
+ */
+/**
+ * 该在哪个框里滑：优先界面上真实可滚的容器。平板/分屏上整屏滑会滑到另一半（设置左栏滑不动、
+ * 右栏在动），所以按 scrollable 节点挑，嵌套时留最内层，最多 3 个；没有可滚容器才退回屏幕中间。
+ * @param {any} state - dumpState 结果。
+ * @param {{width:number,height:number}} size - 当前显示尺寸。
+ * @returns {Array<{x:number,y:number,w:number,h:number}>} 候选滑动框，大的在前。
+ */
+function scrollFrames(state, size) {
+  const fallback = { x: Math.round(size.width * 0.15), y: Math.round(size.height * 0.2), w: Math.round(size.width * 0.7), h: Math.round(size.height * 0.6) }
+  const nodes = (state && Array.isArray(state.nodes) ? state.nodes : [])
+    .filter((node) => node && node.scrollable === true && node.x2 > node.x1 && node.y2 > node.y1)
+  const covers = (outer, inner) => outer !== inner
+    && outer.x1 <= inner.x1 && outer.y1 <= inner.y1 && outer.x2 >= inner.x2 && outer.y2 >= inner.y2
+    && (outer.x1 < inner.x1 || outer.y1 < inner.y1 || outer.x2 > inner.x2 || outer.y2 > inner.y2)
+  const innermost = nodes.filter((node) => !nodes.some((other) => covers(node, other)))
+  const seen = new Set()
+  const boxes = []
+  for (const node of innermost) {
+    const box = { x: node.x1, y: node.y1, w: node.x2 - node.x1, h: node.y2 - node.y1 }
+    const key = `${box.x},${box.y},${box.w},${box.h}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    boxes.push(box)
+  }
+  boxes.sort((a, b) => b.w * b.h - a.w * a.h)
+  return boxes.length > 0 ? boxes.slice(0, 3) : [fallback]
+}
+
+/**
+ * 框里按手指方向给一条滑动线（两端留 15%，比从边上一像素开始稳）。
+ * @param {{x:number,y:number,w:number,h:number}} box - 滑动框。
+ * @param {string} direction - up/down/left/right。
+ * @returns {number[]} [x1,y1,x2,y2]。
+ */
+function swipeLine(box, direction) {
+  const cx = Math.round(box.x + box.w / 2)
+  const cy = Math.round(box.y + box.h / 2)
+  const low = Math.round(box.y + box.h * 0.85)
+  const high = Math.round(box.y + box.h * 0.15)
+  const left = Math.round(box.x + box.w * 0.15)
+  const right = Math.round(box.x + box.w * 0.85)
+  return direction === 'down' ? [cx, high, cx, low]
+    : direction === 'left' ? [right, cy, left, cy]
+      : direction === 'right' ? [left, cy, right, cy]
+        : [cx, low, cx, high]
+}
+
+/** 框的标识，用来记住「这个框已经滑不动了」。 */
+function frameKey(box) {
+  return `${box.x},${box.y},${box.w},${box.h}`
+}
+
+async function scrollToText(serial, text, direction) {
+  const size = await screenSize(serial)
+  const dir = ['up', 'down', 'left', 'right'].includes(direction) ? direction : 'up'
+  const stuck = new Set()
+  let previous = ''
+  let lastBox = null
+  for (let attempt = 0; attempt <= 8; attempt += 1) {
+    const state = attempt === 0 ? await snapshotForSelector(serial) : await dumpState(serial, {})
+    const hits = selectNodes(state, { text, all: true }).filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
+    if (hits.length > 0) return hits[0]
+    if (attempt === 8) break
+    /* 同一个框滑完界面没变 = 那个框到底了；换下一个可滚容器，全都不动才报错，别在错的应用里盲滑。 */
+    const signature = state.tree.lines.join('\n')
+    if (lastBox !== null && signature === previous) {
+      stuck.add(frameKey(lastBox))
+      if (scrollFrames(state, size).every((box) => stuck.has(frameKey(box)))) {
+        throw new Error(`界面没在滚，找不到「${text}」：可能已经到底、当前页面不可滚动，或你不在预期的应用里。` + nearMiss(state, { text }))
+      }
+    }
+    previous = signature
+    const boxes = scrollFrames(state, size)
+    const box = boxes.find((item) => !stuck.has(frameKey(item))) ?? boxes[0]
+    lastBox = box
+    const [x1, y1, x2, y2] = swipeLine(box, dir)
+    const fast = fastInput.swipe === null ? null : await fastInput.swipe(serial, x1, y1, x2, y2, 320)
+    if (fast === null) {
+      const r = await sh(serial, `input swipe ${x1} ${y1} ${x2} ${y2} 320`, 15_000)
+      if (!r.ok) throw new Error(failureNote('滑动', r))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 240))
+  }
+  const last = lastTrees.get(serial)
+  throw new Error(`滑到底也没找到「${text}」：换 direction，或先 adb_ui 看当前页面。${last ? nearMiss(last, { text }) : ''}`)
+}
+
+/**
  * 按文字/资源 id/描述找节点。文字优先精确匹配，再退化为包含匹配；命中多个就报错不猜。
  * @param {string} serial - 设备。
  * @param {{text?: string, id?: string, desc?: string, snapshotId?: string}} want - 选择器。
@@ -1740,17 +1834,120 @@ const screenSizes = new Map()
  * @param {string} device - 设备序列号。
  * @returns {Promise<{width: number, height: number}>} 尺寸。
  */
+/** schema 里某类型缺值时的空值：让「工具忘了填/填了 null」不至于把整次调用变成硬错误。 */
+function emptyForType(type) {
+  if (type === 'integer' || type === 'number') return 0
+  if (type === 'boolean') return false
+  if (type === 'array') return []
+  if (type === 'object') return {}
+  return ''
+}
+
+/**
+ * 按 output schema 修一遍值：必填字段缺了补类型空值，选填字段是 null/undefined 就丢掉，
+ * additionalProperties:false 的多余字段也丢掉。工具成功执行却被宿主的 schema 校验判错，
+ * 是 agent 最冤的一类失败（动作真做了、回执却说失败），这层是兜底。
+ * @param {any} schema - output.schema 片段。
+ * @param {any} value - 工具返回值。
+ * @returns {any} 修完的值（不改原地）。
+ */
+function guardOutput(schema, value) {
+  if (!schema || typeof schema !== 'object') return value
+  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : []
+  if (types.includes('null') && value === null) return null
+  if (value === null || value === undefined) return value
+  if (types.includes('object') || schema.properties) {
+    const props = schema.properties ?? {}
+    const keys = Object.keys(props)
+    const out = {}
+    for (const key of keys) {
+      const item = guardOutput(props[key], value[key])
+      if (item === undefined || item === null) {
+        const required = Array.isArray(schema.required) && schema.required.includes(key)
+        if (!required) continue
+        const itemTypes = Array.isArray(props[key]?.type) ? props[key].type : [props[key]?.type]
+        if (itemTypes.includes('null')) {
+          out[key] = null
+          continue
+        }
+        out[key] = emptyForType(itemTypes[0])
+        continue
+      }
+      out[key] = item
+    }
+    if (schema.additionalProperties === false) return out
+    /* 松散 schema 下保留额外字段，但 null/undefined 一律不带出去。 */
+    const extras = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (key in props || item === null || item === undefined) continue
+      extras[key] = item
+    }
+    return { ...extras, ...out }
+  }
+  if (types.includes('array') && Array.isArray(value)) {
+    const items = schema.items
+    return items ? value.map((item) => guardOutput(items, item)) : value
+  }
+  return value
+}
+
+/** 把输出守卫挂到工具定义上：execute 的返回值先修再交出去。 */
+function guardTool(def) {
+  if (!def || typeof def !== 'object' || typeof def.execute !== 'function') return def
+  const schema = def.output && def.output.schema
+  if (!schema) return def
+  const run = def.execute
+  return {
+    ...def,
+    execute: async (...rest) => guardOutput(schema, await run(...rest)),
+  }
+}
+
+/**
+ * 从 dumpsys window displays 里挑「当前显示」尺寸：每行是 init=物理 cur=当前，横屏/分屏时两者不同。
+ * 触摸注入和控件坐标都按 cur 走，用 wm size 的物理尺寸算滑点会滑到错的轴上。
+ * @param {string} text - dumpsys 输出。
+ * @param {{width:number,height:number}|null} physical - wm size 读到的物理尺寸，用来挑对那台显示。
+ * @returns {{width:number,height:number}|null} 当前显示尺寸。
+ */
+function displaySizeFrom(text, physical) {
+  const pairs = []
+  for (const line of String(text).split('\n')) {
+    const m = /init=(\d+)x(\d+)[^\n]*?cur=(\d+)x(\d+)/.exec(line)
+    if (!m) continue
+    pairs.push({ iw: Number(m[1]), ih: Number(m[2]), w: Number(m[3]), h: Number(m[4]) })
+  }
+  if (pairs.length === 0) return null
+  const hit = physical === null
+    ? null
+    : pairs.find((p) => (p.iw === physical.width && p.ih === physical.height) || (p.ih === physical.width && p.iw === physical.height))
+  const pick = hit ?? pairs.reduce((a, b) => (b.w * b.h > a.w * a.h ? b : a))
+  if (!(pick.w > 0 && pick.h > 0)) return null
+  return { width: pick.w, height: pick.h }
+}
+
 async function screenSize(device) {
   const cached = screenSizes.get(device)
-  if (cached) return cached
-  const r = await adb(['-s', device, 'shell', 'wm size'], { timeout: 8000 })
-  const body = `${r.out}${r.err ?? ''}`
-  const override = /Override size:\s*(\d+)x(\d+)/.exec(body)
-  const physical = /Physical size:\s*(\d+)x(\d+)/.exec(body)
-  const match = override ?? physical
-  if (!match) throw new Error('读不到屏幕分辨率：先 adb_sh 跑一次 wm size 看看。')
-  const size = { width: Number(match[1]), height: Number(match[2]) }
-  screenSizes.set(device, size)
+  if (cached && Date.now() - cached.at < 60_000) return cached
+  let physical = null
+  try {
+    const w = await adb(['-s', device, 'shell', 'wm size'], { timeout: 8000 })
+    const body = `${w.out}${w.err ?? ''}`
+    const m = /Override size:\s*(\d+)x(\d+)/.exec(body) ?? /Physical size:\s*(\d+)x(\d+)/.exec(body)
+    if (m) physical = { width: Number(m[1]), height: Number(m[2]) }
+  } catch {
+    physical = null
+  }
+  let size = null
+  try {
+    const d = await adb(['-s', device, 'shell', 'dumpsys window displays'], { timeout: 10_000 })
+    size = displaySizeFrom(`${d.out}${d.err ?? ''}`, physical)
+  } catch {
+    size = null
+  }
+  if (size === null) size = physical
+  if (size === null) throw new Error('读不到屏幕分辨率：先 adb_sh 跑一次 wm size 看看。')
+  screenSizes.set(device, { ...size, at: Date.now() })
   return size
 }
 
@@ -1850,6 +2047,56 @@ function clickTarget(nodes, node) {
     current = parent
   }
   return node
+}
+
+/**
+ * 一次操作之后短轮等地看界面有没有变：先 ~90ms 一次 dump，没变再补一次。
+ * 成功路径比「固定等 240ms 再 dump」早约 150ms 拿到回执，失败路径才多花一次 dump。
+ * @param {string} serial - 设备。
+ * @param {string} signature - 操作前的树签名。
+ * @param {{firstMs?: number, againMs?: number}} [options] - 两轮等待时长。
+ * @returns {Promise<any>} 最新界面状态。
+ */
+async function awaitChange(serial, signature, options = {}) {
+  const waits = [options.firstMs ?? 90, options.againMs ?? 140].map((ms) => Math.max(0, Math.round(ms)))
+  let state = null
+  for (const wait of waits) {
+    await new Promise((resolve) => setTimeout(resolve, wait))
+    state = await dumpState(serial, {})
+    if (Array.isArray(state.nodes) && state.nodes.length > 0 && state.tree.lines.join('\n') !== signature) return state
+  }
+  return state
+}
+
+/**
+ * 点了没反应时，从新快照里当场找出原因，省掉模型再读一遍树的回合。
+ * @param {any} state - awaitChange / dumpState 的结果。
+ * @param {{x: number, y: number}} point - 点下去的位置。
+ * @param {any} [target] - 原本要点的节点（按坐标点时为空）。
+ * @param {any} [before] - 操作前的快照（用来比对包名/页面）。
+ * @returns {string} 一句话原因。
+ */
+function tapMissReason(state, point, target, before) {
+  const nodes = Array.isArray(state?.nodes) ? state.nodes : []
+  const x = Number(point?.x ?? 0)
+  const y = Number(point?.y ?? 0)
+  if (nodes.length === 0) return '一个控件都读不到，可能还在加载，或者这屏是自己画的'
+  const area = (node) => Math.max(1, (node.x2 - node.x1) * (node.y2 - node.y1))
+  const covers = (node) => node.x2 > node.x1 && node.y2 > node.y1 && node.x1 <= x && x <= node.x2 && node.y1 <= y && y <= node.y2
+  const hits = nodes.filter(covers)
+  const ime = hits.find((node) => /InputMethod|KeyboardView/i.test(node.cls) || /inputmethod|keyboard/i.test(node.pkg))
+  if (ime) return '键盘挡住了这一点；先 adb_input {"key":"back"} 收起键盘再点'
+  const sys = hits.find((node) => /^com\.android\.systemui$/.test(node.pkg) || /Dialog|PopupWindow|Toast/i.test(node.cls))
+  if (sys) return `这一点被 ${oneLine(sys.text || sys.desc || shortClass(sys.cls), 16)} 挡住（${sys.pkg || '系统窗口'}），先关掉它`
+  if (before?.activity && state?.activity && before.activity !== state.activity) return '页面已经切换了，按旧位置点不到目标'
+  const wanted = String(target?.text || target?.desc || '')
+  if (wanted && !nodes.some((node) => (node.text || node.desc) === wanted)) return '目标已经不在这屏了：页面变了或列表滚走了，重新 adb_ui 取 ref'
+  if (target && target.clickable === false && !nodes.some((node) => node.clickable && covers(node))) {
+    return '目标不可点，也没有可点的祖先容器：它只是文字/装饰，点它不会触发任何操作'
+  }
+  const deep = hits.length > 0 ? hits.reduce((a, b) => (area(a) <= area(b) ? a : b)) : null
+  if (deep) return `命中的是 ${oneLine(deep.text || deep.desc || shortClass(deep.cls), 18)}，但它没响应：可能只是容器，或动画还没结束`
+  return '界面没变化：可能没点中，或还在动画；用 adb_shot 看画面'
 }
 
 /**
@@ -2298,6 +2545,7 @@ export function apply(ctx, config) {
       let x
       let y
       let target
+      let missTarget = null
       if (args.point) {
         const parts = String(args.point).split(',').map((value) => Number(value.trim()))
         if (parts.length !== 2 || parts.some((value) => !Number.isFinite(value))) throw new Error('point 要写成 "x,y"，例如 "540,1200"。')
@@ -2331,6 +2579,7 @@ export function apply(ctx, config) {
         const label = node.text || node.desc || shortId(node.id) || shortClass(node.cls)
         const via = hit === node ? '' : `，落在可点祖先 ${shortClass(hit.cls)}${hit.id ? ` #${shortId(hit.id)}` : ''}`
         target = `「${oneLine(label, 24)}」@${x},${y}${via}`
+        missTarget = node
       }
       /* 轻点用 input tap（一条命令 ~35ms）；长按只能靠 swipe 原地按住 600ms。 */
       if (args.dry_run) {
@@ -2394,13 +2643,16 @@ export function apply(ctx, config) {
       } else if (prior && prior.signature && Array.isArray(prior.nodes) && prior.nodes.length > 0
         && Date.now() - prior.at < 15_000) {
         /* 没给等待条件时给一次回执：界面没变化就是可疑信号，别让模型再去读一遍树才发现。 */
-        await new Promise((resolve) => setTimeout(resolve, 240))
-        const after = await dumpState(device, {})
-        changed = after.tree.lines.join('\n') !== prior.signature
-        activity = after.activity
-        detail = changed
-          ? `，界面已变化 · 当前 ${activity || '未知页面'}`
-          : '，界面没变化：可能没点中、被别的窗口挡住，或还在动画；用 adb_shot 看画面，或 adb_ui 再读一次'
+        try {
+          const after = await awaitChange(device, prior.signature)
+          changed = after.tree.lines.join('\n') !== prior.signature
+          activity = after.activity
+          detail = changed
+            ? `，界面已变化 · 当前 ${activity || '未知页面'}`
+            : `，界面没变化：${tapMissReason(after, { x, y }, missTarget, prior)}`
+        } catch (error) {
+          detail = `，点已发出，但读不到界面确认（${oneLine(error?.message ?? error, 60)}）`
+        }
       }
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
       const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
@@ -2784,7 +3036,7 @@ export function apply(ctx, config) {
           snapshot_id: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'found', 'swipes', 'activity', 'message', 'ref', 'point', 'snapshot_id', 'elapsed_ms'],
+        required: ['ok', 'found', 'swipes', 'activity', 'message', 'point', 'snapshot_id', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.message),
@@ -2834,18 +3086,9 @@ export function apply(ctx, config) {
             if (!entry || !entry.node) throw new Error(`within_ref ${args.within_ref} 不在当前快照里：先 adb_ui 或 adb_find 拿最新 ref。`)
             return { x: entry.node.x1, y: entry.node.y1, w: entry.node.x2 - entry.node.x1, h: entry.node.y2 - entry.node.y1 }
           })()
-          : { x: Math.round(size.width * 0.15), y: Math.round(size.height * 0.2), w: Math.round(size.width * 0.7), h: Math.round(size.height * 0.6) }
-        const cx = Math.round(box.x + box.w / 2)
-        const cy = Math.round(box.y + box.h / 2)
-        const low = Math.round(box.y + box.h * 0.85)
-        const high = Math.round(box.y + box.h * 0.15)
-        const left = Math.round(box.x + box.w * 0.15)
-        const right = Math.round(box.x + box.w * 0.85)
+          : scrollFrames(state, size)[0]
         const direction = args.direction ?? 'up'
-        const [x1, y1, x2, y2] = direction === 'up' ? [cx, low, cx, high]
-          : direction === 'down' ? [cx, high, cx, low]
-            : direction === 'left' ? [right, cy, left, cy]
-              : [left, cy, right, cy]
+        const [x1, y1, x2, y2] = swipeLine(box, direction)
         const before = state.tree.lines.join('\n')
         const fastSwipe = fastInput.swipe === null ? null : await fastInput.swipe(device, x1, y1, x2, y2, 320)
         if (fastSwipe === null) {
@@ -2864,7 +3107,6 @@ export function apply(ctx, config) {
               swipes,
               activity: state.activity || '',
               message: `滑了 ${swipes} 次没再动，也没有目标：可能已经到底，或它在别的页面/需要下拉刷新的地方。${nearMiss(state, sel)}`,
-              ref: null,
               point: '',
               snapshot_id: state.snapshotId,
               elapsed_ms: Date.now() - began,
@@ -2881,7 +3123,6 @@ export function apply(ctx, config) {
           swipes,
           activity: state.activity || '',
           message: `滑了 ${swipes} 次还没找到${args.text ? `「${args.text}」` : '目标'}：加 max_swipes 或换方向，也可能不在这个页面。${nearMiss(state, sel)}`,
-          ref: null,
           point: '',
           snapshot_id: state.snapshotId,
           elapsed_ms: Date.now() - began,
@@ -2908,7 +3149,7 @@ export function apply(ctx, config) {
         swipes,
         activity: state.activity || '',
         message: `${message}（${Date.now() - began}ms）`,
-        ref: hit.ref,
+        ...(hit.ref === null || hit.ref === undefined ? {} : { ref: hit.ref }),
         point: hit.point,
         snapshot_id: state.snapshotId,
         elapsed_ms: Date.now() - began,
@@ -2935,6 +3176,11 @@ export function apply(ctx, config) {
             properties: {
               tap: { type: 'string', description: '点哪个：文字内容，或用 "x,y" 坐标' },
               id: { type: 'string', description: '按资源 id 点' },
+              ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
+              long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
+              scroll_to: { type: 'string', description: '先边滑边找这段文字，找到就点它；找不到算失败' },
+              direction: { type: 'string', description: 'scroll_to 的滑动方向：up/down/left/right，默认 up' },
+              wait_idle: { type: 'boolean', description: '本步做完等界面静止（动画/加载结束）再核对' },
               swipe: { type: 'array', items: { type: 'integer' }, description: '滑动 [x1,y1,x2,y2,毫秒]' },
               key: { type: 'string', description: '按键名：BACK / HOME / ENTER，或 keycode 数字' },
               text: { type: 'string', description: '往焦点输入框输入文字（ASCII 直发，中文走剪贴板粘贴；先点中输入框让它获得焦点）' },
@@ -2977,10 +3223,18 @@ export function apply(ctx, config) {
       try {
       for (const [index, step] of (args.steps ?? []).entries()) {
         const at = index + 1
-        if (step.tap !== undefined || step.id !== undefined) {
-          let node
+        let node = null
+        if (step.scroll_to !== undefined) {
+          node = await scrollToText(device, String(step.scroll_to), step.direction)
+          done.push(`滑到「${oneLine(String(step.scroll_to), 16)}」`)
+        }
+        if (step.tap !== undefined || step.id !== undefined || step.ref !== undefined || node !== null) {
           let point = null
-          if (step.tap !== undefined && /^\s*-?\d+\s*,\s*-?\d+\s*$/.test(String(step.tap))) {
+          if (node !== null) {
+            /* scroll_to 已经定位到目标，直接算坐标点它。 */
+          } else if (step.ref !== undefined) {
+            node = await nodeForRef(device, Number(step.ref))
+          } else if (step.tap !== undefined && /^\s*-?\d+\s*,\s*-?\d+\s*$/.test(String(step.tap))) {
             const parts = String(step.tap).split(',').map((value) => Number(value.trim()))
             point = { x: parts[0], y: parts[1] }
           } else {
@@ -2999,13 +3253,15 @@ export function apply(ctx, config) {
             const y = Math.round((hit.y1 + hit.y2) / 2)
             target = { x, y, label: `「${oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)}」@${x},${y}` }
           }
-          const fastStep = fastInput.tap === null ? null : await fastInput.tap(device, target.x, target.y, {})
+          const holdMs = step.long === true ? 700 : 0
+          const fastStep = holdMs > 0 || fastInput.tap === null ? null : await fastInput.tap(device, target.x, target.y, {})
           if (fastStep === null) {
-            const r = await sh(device, `input tap ${target.x} ${target.y}`, 10_000)
-            if (!r.ok) throw new Error(`第 ${at} 步${failureNote('点击', r)}`)
+            const command = holdMs > 0 ? `input swipe ${target.x} ${target.y} ${target.x} ${target.y} ${holdMs}` : `input tap ${target.x} ${target.y}`
+            const r = await sh(device, command, 14_000)
+            if (!r.ok) throw new Error(`第 ${at} 步${failureNote(holdMs > 0 ? '长按' : '点击', r)}`)
           }
-          lastActions.push({ at: Date.now(), what: `点击 ${target.label}` })
-          done.push(`点 ${target.label}`)
+          lastActions.push({ at: Date.now(), what: `${holdMs > 0 ? '长按' : '点击'} ${target.label}` })
+          done.push(`${holdMs > 0 ? '长按' : '点'} ${target.label}`)
         } else if (step.swipe !== undefined) {
           const s4 = step.swipe
           if (!Array.isArray(s4) || s4.length < 4) throw new Error(`第 ${at} 步 swipe 要写 [x1,y1,x2,y2,毫秒]。`)
@@ -3032,6 +3288,21 @@ export function apply(ctx, config) {
           const r = await sh(device, cmd, 12_000)
           if (!r.ok) throw new Error(`第 ${at} 步${failureNote('系统动作', r)}`)
           done.push(step.action)
+        }
+
+        if (step.wait_idle === true) {
+          /* 等界面静止：连续两次 dump 内容一样就算稳定，最多等到本步上限。 */
+          const idleStart = Date.now()
+          let previous = ''
+          while (Date.now() - idleStart < limit) {
+            const seen = await dumpState(device, {})
+            const signature = seen.tree.lines.join('\n')
+            activity = seen.activity
+            if (signature === previous) break
+            previous = signature
+            await new Promise((resolve) => setTimeout(resolve, 200))
+          }
+          done.push(`等静止 ${Date.now() - idleStart}ms`)
         }
 
         if (step.wait_text !== undefined || step.wait_gone !== undefined) {
@@ -4548,4 +4819,10 @@ export const __internals = {
   parseNodes,
   compactTree,
   shortId,
+  displaySizeFrom,
+  scrollFrames,
+  swipeLine,
+  guardOutput,
+  awaitChange,
+  tapMissReason,
 }

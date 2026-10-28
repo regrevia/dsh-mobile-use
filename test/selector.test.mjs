@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, collapseSameSpot, spotList } = __internals
+const { selectNodes, nearMiss, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -129,6 +129,56 @@ it('spotList 给可点坐标，多了说等几处', () => {
   assert.match(twice, /@50,20/)
   assert.match(twice, /@50,120/)
   assert.match(spotList([1, 2, 3, 4, 5].map((i) => node('x', 0, i * 100))), /等 5 处/)
+})
+
+it('横屏/分屏按当前显示尺寸算滑点，不拿物理竖屏尺寸', () => {
+  const dump = ['  init=1600x1068 1dpi cur=1600x1068 app=1600x1068', '  init=2136x3200 440dpi cur=3200x2136 app=3200x2136'].join('\n')
+  assert.deepEqual(displaySizeFrom(dump, { width: 2136, height: 3200 }), { width: 3200, height: 2136 })
+  assert.deepEqual(displaySizeFrom(dump, null), { width: 3200, height: 2136 })
+  assert.equal(displaySizeFrom('no display info', null), null)
+  assert.equal(displaySizeFrom(dump, { width: 1600, height: 1068 }).width, 1600)
+})
+
+it('分屏里只滑真正可滚的容器，嵌套留最内层，没有就退回中间', () => {
+  const size = { width: 3200, height: 2136 }
+  const outer = { scrollable: true, x1: 0, y1: 0, x2: 900, y2: 2136 }
+  const inner = { scrollable: true, x1: 0, y1: 300, x2: 900, y2: 2000 }
+  const right = { scrollable: true, x1: 1000, y1: 100, x2: 3100, y2: 2000 }
+  const plain = { scrollable: false, x1: 0, y1: 0, x2: 3200, y2: 2136 }
+  const boxes = scrollFrames({ nodes: [outer, inner, right, plain] }, size)
+  assert.equal(boxes.length, 2)
+  assert.deepEqual(boxes.find((b) => b.w === 900), { x: 0, y: 300, w: 900, h: 1700 })
+  assert.deepEqual(scrollFrames({ nodes: [plain] }, size), [{ x: 480, y: 427, w: 2240, h: 1282 }])
+  assert.deepEqual(swipeLine({ x: 0, y: 300, w: 900, h: 1700 }, 'up'), [450, 1745, 450, 555])
+  assert.deepEqual(swipeLine({ x: 0, y: 300, w: 900, h: 1700 }, 'down'), [450, 555, 450, 1745])
+})
+
+it('输出守卫：必填补空值、选填丢 null、多余字段丢掉，别让成功动作变硬错误', () => {
+  const schema = {
+    type: 'object',
+    properties: { ok: { type: 'boolean' }, swipes: { type: 'integer' }, ref: { type: 'integer' }, note: { type: 'string' }, list: { type: 'array', items: { type: 'object', properties: { at: { type: 'integer' }, id: { type: 'string' } }, required: ['at'], additionalProperties: false } }, maybe: { type: ['string', 'null'] } },
+    required: ['ok', 'swipes', 'ref', 'note', 'list', 'maybe'],
+    additionalProperties: false,
+  }
+  const got = guardOutput(schema, { ok: true, swipes: null, ref: undefined, note: null, list: [{ at: 2, id: null, junk: 1 }], maybe: null, extra: 'x' })
+  assert.deepEqual(got, { ok: true, swipes: 0, ref: 0, note: '', list: [{ at: 2 }], maybe: null })
+  const opt = { type: 'object', properties: { ok: { type: 'boolean' }, point: { type: 'string' } }, required: ['ok'], additionalProperties: false }
+  assert.deepEqual(guardOutput(opt, { ok: true, point: null }), { ok: true })
+})
+
+it('点空归因：键盘挡、弹窗挡、目标不可点、页面换了，各给一句话说清', () => {
+  const node = (over) => ({ x1: 0, y1: 0, x2: 1080, y2: 200, text: '', desc: '', cls: 'android.view.View', pkg: 'com.demo', clickable: false, enabled: true, ...over })
+  const tap = { x: 540, y: 1200 }
+  const keyboard = { nodes: [node({ pkg: 'com.sohu.inputmethod.sogou', cls: 'android.inputmethodservice.KeyboardView', y1: 800, y2: 3000 })], activity: '.Main' }
+  assert.match(tapMissReason(keyboard, tap, null, null), /键盘/)
+  const dialog = { nodes: [node({ pkg: 'com.android.systemui', cls: 'android.widget.FrameLayout', y2: 3000 })], activity: '.Main' }
+  assert.match(tapMissReason(dialog, tap, null, null), /挡住/)
+  const plain = { nodes: [node({ pkg: 'com.demo', cls: 'android.widget.FrameLayout', y2: 3000 })], activity: '.Main' }
+  const label = { nodes: [node({ pkg: 'com.demo', cls: 'android.widget.FrameLayout', y2: 3000 }), node({ text: '确定', pkg: 'com.demo', clickable: false })], activity: '.Main' }
+  assert.match(tapMissReason(label, tap, { text: '确定', clickable: false, desc: '' }, null), /不能点|不可点/)
+  assert.match(tapMissReason(plain, tap, { text: '已消失', clickable: true, desc: '' }, null), /不在这屏/)
+  assert.match(tapMissReason(plain, tap, null, { activity: '.Other' }), /页面已经切换/)
+  assert.match(tapMissReason({ nodes: [], activity: '' }, tap, null, null), /读不到/)
 })
 
 console.log(`\n${pass} 项通过\n`)
