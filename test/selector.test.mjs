@@ -225,3 +225,25 @@ it('界面树解实体：换行、&、引号、十六进制都能还原，认不
 })
 
 console.log(`\n${pass} 项通过\n`)
+
+it('报错建议按查找维度给：按 id 提示 id、按类名提示类名、按文字提示文字', () => {
+  const screen = {
+    nodes: [
+      { text: '设置', desc: '', id: 'settingsHeader', cls: 'android.widget.LinearLayout', clickable: true },
+      { text: '', desc: '', id: 'settingsRow', cls: 'android.widget.TextView', clickable: true },
+      { text: '更多', desc: '', id: 'moreHeader', cls: 'android.widget.LinearLayout', clickable: false },
+      { text: '', desc: '', id: 'plainBox', cls: 'android.widget.FrameLayout', clickable: false },
+    ],
+  }
+  const byId = nearMiss(screen, { id: 'setting' })
+  assert.match(byId, /settingsHeader/)
+  assert.match(byId, /settingsRow/)
+  assert.doesNotMatch(byId, /设置/)
+  const byCls = nearMiss(screen, { cls: 'TextView' })
+  assert.match(byCls, /TextView/)
+  assert.doesNotMatch(byCls, /LinearLayout/)
+  assert.match(nearMiss(screen, { text: '设置项' }), /设置/)
+  assert.equal(nearMiss(screen, { text: '' }), '')
+  assert.equal(nearMiss(screen, { cls: '' }), '')
+  assert.equal(nearMiss({ nodes: [] }, { text: '设置' }), '')
+})

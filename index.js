@@ -1726,22 +1726,37 @@ function frameKey(box) {
 }
 
 async function scrollToText(serial, text, direction) {
+  return scrollToSelector(serial, { text }, direction, 8)
+}
+
+/**
+ * 边滑边找：同一套「滑一下、读一次、命中就停」的循环，选择器跟 adb_find 一致。
+ * 目标不是文字时（id / desc / 类名）也走这里，避免为一个参数再写一遍滑动逻辑。
+ * @param {string} serial - 设备。
+ * @param {any} want - 选择器：text/id/desc/cls/exact/regex/clickable/index。
+ * @param {string} direction - 手指往哪滑，默认 up。
+ * @param {number} maxAttempts - 最多滑几次（1–15）。
+ * @returns {Promise<any>} 命中的节点。
+ */
+async function scrollToSelector(serial, want, direction, maxAttempts) {
   const size = await screenSize(serial)
   const dir = ['up', 'down', 'left', 'right'].includes(direction) ? direction : 'up'
+  const label = want.text || want.id || want.desc || want.cls || '目标'
+  const limit = Math.max(1, Math.min(15, Math.round(Number(maxAttempts) || 3)))
   const stuck = new Set()
   let previous = ''
   let lastBox = null
-  for (let attempt = 0; attempt <= 8; attempt += 1) {
+  for (let attempt = 0; attempt <= limit; attempt += 1) {
     const state = attempt === 0 ? await snapshotForSelector(serial) : await dumpState(serial, {})
-    const hits = selectNodes(state, { text, all: true }).filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
-    if (hits.length > 0) return hits[0]
-    if (attempt === 8) break
+    const hits = selectNodes(state, { ...want, all: true }).filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
+    if (hits.length > 0) return hits[want.index ?? 0] ?? hits[0]
+    if (attempt === limit) break
     /* 同一个框滑完界面没变 = 那个框到底了；换下一个可滚容器，全都不动才报错，别在错的应用里盲滑。 */
     const signature = state.tree.lines.join('\n')
     if (lastBox !== null && signature === previous) {
       stuck.add(frameKey(lastBox))
       if (scrollFrames(state, size).every((box) => stuck.has(frameKey(box)))) {
-        throw new Error(`界面没在滚，找不到「${text}」：可能已经到底、当前页面不可滚动，或你不在预期的应用里。` + nearMiss(state, { text }))
+        throw new Error(`界面没在滚，找不到「${label}」：可能已经到底、当前页面不可滚动，或你不在预期的应用里。` + nearMiss(state, want))
       }
     }
     previous = signature
@@ -1757,7 +1772,7 @@ async function scrollToText(serial, text, direction) {
     await new Promise((resolve) => setTimeout(resolve, 240))
   }
   const last = lastTrees.get(serial)
-  throw new Error(`滑到底也没找到「${text}」：换 direction，或先 adb_ui 看当前页面。${last ? nearMiss(last, { text }) : ''}`)
+  throw new Error(`滑了 ${limit} 次也没找到「${label}」：换方向（scroll_direction），加大 scroll，或先 adb_ui 看当前页面。${last ? nearMiss(last, want) : ''}`)
 }
 
 /**
@@ -1891,20 +1906,29 @@ function selectNodes(state, sel) {
  */
 function nearMiss(state, sel) {
   const want = sel || {}
-  const needle = String(want.text ?? want.id ?? want.desc ?? '').toLowerCase()
+  /* 建议要跟「按什么找错的」对得上：按 id 找错就提示 id，按类名找错就提示类名，否则 agent 拿着文字去搜图标会白跑一趟。 */
+  const byId = Boolean(want.id) && !want.text && !want.desc
+  const byCls = !byId && Boolean(want.cls) && !want.text && !want.desc
+  const needle = String(want.text ?? want.desc ?? want.id ?? want.cls ?? '').toLowerCase()
   if (!needle) return ''
   const grams = []
   for (let i = 0; i + 1 < needle.length; i += 1) grams.push(needle.slice(i, i + 2))
   const seen = new Set()
   const scored = []
   for (const node of (state && state.nodes) || []) {
-    const label = String(node.text || node.desc || (node.id ? shortId(node.id) : '') || '')
+    const label = byId
+      ? (node.id ? shortId(node.id) : '')
+      : byCls
+        ? shortClass(node.cls || '')
+        : String(node.text || node.desc || (node.id ? shortId(node.id) : '') || '')
     if (label === '' || seen.has(label)) continue
     seen.add(label)
     const lower = label.toLowerCase()
     let score = lower.includes(needle) ? 100 : 0
     for (const gram of grams) if (lower.includes(gram)) score += 1
-    if (score > 0) scored.push({ label, score })
+    if (score === 0) continue
+    /* 分数一样时能点的排前面：agent 下一步多半就是点它。 */
+    scored.push({ label, score: score + (node.clickable === true ? 0.5 : 0) })
   }
   scored.sort((a, b) => b.score - a.score)
   const top = scored.slice(0, 3).map((item) => item.label)
@@ -2608,7 +2632,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_tap',
-    description: '在 Android 设备上点一下：用 ref（来自最近一次 adb_ui/adb_find）、文字、资源 id、描述、类名，或者绝对坐标 point="x,y"。long=true 长按；index 挑第几个匹配；exact/regex 改匹配方式。比截图定位快，也不会因为分辨率变化点错。',
+    description: '在 Android 设备上点一下：用 ref（来自最近一次 adb_ui/adb_find）、文字、资源 id、描述、类名，或者绝对坐标 point="x,y"。long=true 长按；index 挑第几个匹配；exact/regex 改匹配方式。目标不在当前屏就带 scroll=3 边滑边找，找到直接点——省掉「滑一次、读一次树、再点」的回合。',
     parameters: {
       type: 'object',
       properties: {
@@ -2630,6 +2654,8 @@ export function apply(ctx, config) {
         wait_for_text: { type: 'string', description: '点完等这段文字出现再返回，省掉一次 adb_ui 往返' },
         wait_for_id: { type: 'string', description: '点完等这个资源 id 出现' },
         wait_until_gone: { type: 'string', description: '点完等这段文字消失（关弹窗、等加载完）' },
+        scroll: { type: 'integer', description: '目标不在当前屏时最多滑几次（1–15）：滑到就点，滑不到报错。只在按文字/id/描述/类名找时有效' },
+        scroll_direction: { type: 'string', description: '边滑边找的手指方向：up/down/left/right，默认 up（把下面的内容拉上来）' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 10000' },
       },
       additionalProperties: false,
@@ -2643,6 +2669,7 @@ export function apply(ctx, config) {
           activity: { type: 'string' },
           matched: { type: 'boolean' },
           changed: { type: 'boolean', description: '点后界面树是否变了；没变大概率没点中或动画未结束' },
+          scrolled: { type: 'integer', description: '为了找到目标滑了几次；没滑就不出现' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
@@ -2658,6 +2685,7 @@ export function apply(ctx, config) {
       let y
       let target
       let missTarget = null
+      let scrolled = 0
       if (args.point) {
         const parts = String(args.point).split(',').map((value) => Number(value.trim()))
         if (parts.length !== 2 || parts.some((value) => !Number.isFinite(value))) throw new Error('point 要写成 "x,y"，例如 "540,1200"。')
@@ -2672,7 +2700,7 @@ export function apply(ctx, config) {
           node = nodeForRef(device, Number(args.ref), args.snapshot_id)
         } else {
           await snapshotForSelector(device, args.snapshot_id)
-          node = nodeForSelector(device, {
+          const want = {
             text: args.text,
             id: args.id,
             desc: args.desc,
@@ -2682,7 +2710,17 @@ export function apply(ctx, config) {
             clickable: args.clickable,
             index: args.index,
             snapshotId: args.snapshot_id,
-          })
+          }
+          try {
+            node = nodeForSelector(device, want)
+          } catch (error) {
+            /* 只有「当前屏没有」才值得滑：匹配到多个、快照过期这些滑了也没用，原样报出去。 */
+            const reason = String(error?.message ?? error)
+            const notHere = reason.startsWith('界面上没有') && !args.snapshot_id
+            if (!(args.scroll && notHere)) throw error
+            node = await scrollToSelector(device, want, args.scroll_direction, args.scroll)
+            scrolled = Math.max(1, Math.round(Number(args.scroll) || 3))
+          }
         }
         node = await freshNodeFor(device, node, args.snapshot_id)
         const hit = clickTarget(nodesOf(device), node)
@@ -2701,7 +2739,8 @@ export function apply(ctx, config) {
           target,
           activity,
           matched: true,
-          message: `预演：会${args.long ? '长按' : '点击'} ${target}（没有真点）。确认无误去掉 dry_run 再点。`,
+          ...(scrolled > 0 ? { scrolled } : {}),
+          message: `预演：会${args.long ? '长按' : '点击'} ${target}${scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''}（没有真点）。确认无误去掉 dry_run 再点。`,
           elapsed_ms: Date.now() - started,
         }
       }
@@ -2767,8 +2806,9 @@ export function apply(ctx, config) {
         }
       }
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
-      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
-      return { ok: true, target, activity, matched, changed, message, elapsed_ms: Date.now() - started }
+      const slid = scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''
+      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
+      return { ok: true, target, activity, matched, changed, ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started }
     },
   }), 'adb: adb_tap')
 
@@ -4954,6 +4994,7 @@ export const __internals = {
   foregroundActivity,
   waitFor,
   scrollToText,
+  scrollToSelector,
   u2Dump,
   screenSize,
   scrollFrames,

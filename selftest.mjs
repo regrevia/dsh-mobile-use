@@ -203,6 +203,29 @@ const scrollBad = await fetch(`${base}/scroll`, {
 if (scrollBad?.ok === false) ok('/scroll 空位移被拒', scrollBad.reason)
 else bad('/scroll 参数校验不对', JSON.stringify(scrollBad))
 
+console.log('\n[27] adb_tap 边滑边找（dry_run，不真点）')
+try {
+  await call('adb_app', { action: 'start', package: 'com.android.settings' })
+  await call('adb_ui', { wait_for_text: '电池', timeout_ms: 8000 })
+  const slid = await call('adb_tap', { text: '电池', scroll: 4, dry_run: true })
+  const count = Number(slid.value.scrolled ?? 0)
+  if (slid.value.ok && String(slid.value.target ?? '').includes('电池') && count >= 0) {
+    ok('scroll 找到并算出落点', `${slid.value.target} · 滑 ${count} 次 · ${slid.ms}ms`)
+  } else {
+    bad('scroll 没找到目标', JSON.stringify(slid.value).slice(0, 120))
+  }
+  let missed = ''
+  try {
+    await call('adb_tap', { text: '这段文字一定不存在dsh', scroll: 2, dry_run: true })
+  } catch (error) {
+    missed = String(error?.message ?? error)
+  }
+  if (missed.includes('也没找到') || missed.includes('界面上没有')) ok('滑不到就报错，不瞎点', missed.slice(0, 60))
+  else bad('滑不到却没报错', missed.slice(0, 80) || '没有抛错')
+} catch (error) {
+  bad('adb_tap scroll 抛错', String(error?.message ?? error).slice(0, 100))
+}
+
 if (wantTap) {
   console.log('\n[26] adb_tap 真点（--tap）')
   const target = treeText.split('\n').find((line) => line.includes(' *'))

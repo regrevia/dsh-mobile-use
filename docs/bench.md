@@ -5,6 +5,17 @@
 测法：每次调用记录工具自报耗时 + 外层 `curl` 计时；数字为单次典型值，抖动区间用 `–` 表示。
 所有结论只在上述组合成立；换设备、换 USB/无线 adb、换编码器都可能不同。
 
+## 零、怎么自己复测
+
+不开宿主也能量设备侧原语，改完一处改动就能对比前后：
+
+```bash
+node scripts/device-bench.mjs --n 5            # 只读：dump / 读前台 / 等文字
+node scripts/device-bench.mjs --n 5 --write    # 追加：滚动找字（会滑屏）
+```
+
+2026-10-29 复测（同一台机器，前台 `com.whale.pet/.MainActivity`）：`dumpState` 94–142 ms（均值 118）、`foregroundActivity` 63–77 ms、`adb_ui` 整屏 156 ms、`adb_find` 命中 5 个 86 ms、`waitFor` 600 ms 超时实耗 708 ms（一次 dump + 120 ms 轮询 + 一次 dump）。
+
 ## 一、工具往返
 
 | 动作 | 实测 | 说明 |
