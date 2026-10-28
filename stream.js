@@ -215,6 +215,9 @@ const IDLE_GRACE_MS = 20000
 const MAX_REMUX_QUEUE = 4 * 1024 * 1024
 /** JPEG 是可选支路：落后超过这个量就丢掉重建，它没有资格拖慢采集。 */
 const MAX_JPEG_QUEUE = 1024 * 1024
+
+/** GOP 缓存字节上限：超过就整段丢掉等下一张 IDR，保证新观众永远从 IDR 起播。 */
+const MAX_GOP_BYTES = 4 * 1024 * 1024
 /** 排空比这还慢就认为 ffmpeg 卡死了（设备端编码器会一直吐，不能跟着等）。 */
 const REMUX_STALL_MS = 2000
 /** 本进程的随机标识：设备端 pid 文件名带上它，多开/重启不会互相认领对方的录屏。 */
@@ -250,6 +253,7 @@ export class LiveStream {
     this.frag = Buffer.alloc(0)
     this.prelude = Buffer.alloc(0)
     this.lastKeyChunks = []
+    this.lastKeyBytes = 0
     /** 等关键帧的新观众。 @type {Set<(bytes: Buffer) => void>} */
     this.waiting = new Set()
     this.total = 0
@@ -478,6 +482,7 @@ export class LiveStream {
     this.init = null
     this.error = ''
     this.lastKeyChunks = []
+    this.lastKeyBytes = 0
     this.closeRemuxer()
     if (child !== null) {
       try {
@@ -799,6 +804,7 @@ export class LiveStream {
     this.initPending = Buffer.alloc(0)
     this.frag = Buffer.alloc(0)
     this.lastKeyChunks = []
+    this.lastKeyBytes = 0
     if (child === null) return
     try {
       child.stdin.end()
@@ -829,16 +835,29 @@ export class LiveStream {
       if (this.buffer.length < size) return
       const box = this.buffer.subarray(0, size)
       this.buffer = this.buffer.subarray(size)
-      if (type === 'moof') {
-        if (this.init === null) {
-          this.init = this.initPending.length > 0 ? this.initPending : Buffer.alloc(0)
-          this.initPending = Buffer.alloc(0)
-          /* 观众可能比 moov 先到，初始化段一到就补发，不然画面永远起不来。 */
-          if (this.init.length > 0) this.broadcast(packFrame(FRAME_INIT, this.init))
-        } else if (this.frag.length > 0) {
-          this.emitMedia(this.frag)
+      if (type === 'moov') {
+        /* moov 才是初始化段：先发 INIT，再把之前攒着、还不能解码的分片一起发出去。 */
+        this.init = this.initPending.length > 0 ? Buffer.concat([this.initPending, box]) : box
+        this.initPending = Buffer.alloc(0)
+        this.broadcast(packFrame(FRAME_INIT, this.init))
+        if (this.frag.length > 0) {
+          const pending = this.frag
+          this.frag = Buffer.alloc(0)
+          this.emitMedia(pending)
         }
-        this.frag = box
+      } else if (type === 'moof') {
+        if (this.frag.length > 0) {
+          const finished = this.frag
+          if (this.init === null) {
+            /* 初始化段还没到：分片先攒着，绝不先发 MEDIA，否则前端拿到解不了的一帧。 */
+            this.frag = Buffer.concat([finished, box])
+            continue
+          }
+          this.frag = box
+          this.emitMedia(finished)
+        } else {
+          this.frag = box
+        }
       } else if (this.frag.length > 0) {
         this.frag = Buffer.concat([this.frag, box])
       } else {
@@ -856,21 +875,26 @@ export class LiveStream {
     this.framesSeen += 1
     this.lastAt = Date.now()
     const key = containsIdr(chunk)
-    if (key) this.lastKeyChunks = [chunk]
-    else {
+    if (key) {
+      this.lastKeyChunks = [chunk]
+      this.lastKeyBytes = chunk.length
+    } else if (this.lastKeyChunks.length > 0) {
       this.lastKeyChunks.push(chunk)
-      if (this.lastKeyChunks.length > 240) this.lastKeyChunks.shift()
-    }
-    /* 还在等关键帧的观众，这一张到了就能开播。 */
-    if (key && this.waiting.size > 0) {
-      for (const sink of this.waiting) {
-        this.sendPrelude(sink)
-        sink(packFrame(FRAME_MEDIA, chunk))
-        this.clients.add(sink)
+      this.lastKeyBytes += chunk.length
+      /* 只缓存「一张 IDR 起头」的连续 GOP：超上限就整段丢掉等下一张，绝不从 GOP 中间续播。 */
+      if (this.lastKeyBytes > MAX_GOP_BYTES) {
+        this.lastKeyChunks = []
+        this.lastKeyBytes = 0
       }
-      this.waiting.clear()
     }
+    /* 先广播这一帧，再给等待的观众补前情，避免同一个关键帧投三遍。 */
+    const promoted = key && this.waiting.size > 0 ? Array.from(this.waiting) : []
+    if (promoted.length > 0) this.waiting.clear()
     this.broadcast(packFrame(FRAME_MEDIA, chunk))
+    for (const sink of promoted) {
+      this.sendPrelude(sink)
+      this.clients.add(sink)
+    }
   }
 
   /**
@@ -957,6 +981,7 @@ export class LiveStream {
     this.stopping = false
     this.init = null
     this.lastKeyChunks = []
+    this.lastKeyBytes = 0
     this.waiting.clear()
     this.config = null
     this.firstFrameAt = 0

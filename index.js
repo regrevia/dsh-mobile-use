@@ -22,7 +22,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=172'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=173'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */

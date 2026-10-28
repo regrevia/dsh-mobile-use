@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-use",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "private": false,
   "description": "真机调试插件：界面文本树、动效数据、实时画面侧栏与圈选标注",
   "type": "module",
