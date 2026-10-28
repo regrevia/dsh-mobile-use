@@ -37,8 +37,17 @@ const MAX_NODES = { default: 400, max: 1500 }
 /** 文本树缓存有效期：ref 点击必须在这么近的一次 dump 之后。 */
 const REF_TTL_MS = 120_000
 
+/** 快照「够不够新」：超过这个时长再点，先重读一次树确认目标还在原位，避免点到旧坐标。 */
+const REF_SOFT_TTL_MS = 1500
+
+/** 重读后允许的位移（设备像素）：超过就认为界面变了，不再盲点。 */
+const REF_MOVE_TOLERANCE = 48
+
 /** 大输出上限：logcat / dumpsys 都可能很长。 */
 const OUTPUT_LIMIT = 20_000
+
+/** 常驻 shell 单条命令的缓冲上限（字符）：超了只留尾部，不让内存随命令数涨。 */
+const MAX_SHELL_BUF = 8 << 20
 
 /**
  * 找到 adb。DSH 进程的 PATH 不一定带 Homebrew，所以按常见安装位置探测，
@@ -386,6 +395,8 @@ function openShell(serial) {
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk) => {
     channel.buf += chunk
+    /* 单条命令输出封顶：大 dump / logcat 不该把内存越堆越高，超了只留尾部。 */
+    if (channel.buf.length > MAX_SHELL_BUF) channel.buf = channel.buf.slice(-MAX_SHELL_BUF)
     if (channel.onChunk !== null) channel.onChunk(channel.buf)
   })
   child.on('error', () => {
@@ -416,6 +427,15 @@ const WRITE_HEADS = new Set([
   'install', 'uninstall', 'ln',
 ])
 
+/** 「只读首词 + 写动作」的组合：这些必须按写命令算，否则超时后会重放。 */
+const WRITE_PATTERNS = [
+  /(^|[^0-9&])>>?\s*\S/, /* 重定向写文件：echo changed > /sdcard/x、cat a > b */
+  /\|\s*(tee|dd)\b/,
+  /\bfind\b[^|]*\s-(delete|exec|execdir)\b/,
+  /\bsed\b[^|]*\s-i(\s|$)/,
+  /\bchmod\b[^|]*\s[0-7]{3,4}\b/,
+]
+
 /**
  * 判断一条命令是不是「写状态」的：写命令超时后设备可能已经执行，重放会重复操作。
  * 按 `; & |` 和换行拆成简单命令逐段判断；不认识的命令按写命令算（宁可不重试）。
@@ -423,15 +443,24 @@ const WRITE_HEADS = new Set([
  * @returns {boolean} 是否写了设备状态。
  */
 function isWriteCommand(cmd) {
-  for (const raw of String(cmd).split(/[;&|\n]+/)) {
+  /* `2>&1` 只是把 stderr 并进输出，不是写文件，也不该把命令切成两段。 */
+  const cleaned = String(cmd).replace(/\d?>&\d/g, ' ')
+  for (const raw of cleaned.split(/[;&|\n]+/)) {
     const segment = raw.trim().replace(/^\(+\s*/, '')
     if (segment === '') continue
-    const [head, second] = segment.split(/\s+/)
+    if (WRITE_PATTERNS.some((pattern) => pattern.test(segment))) return true
+    const parts = segment.split(/\s+/)
+    const head = parts[0]
+    const second = parts[1]
     if (WRITE_HEADS.has(head)) {
-      /* `wm size` 只是读分辨率，其余 wm 子命令都会改状态。 */
-      if (head === 'wm' && second === 'size') continue
+      /* `wm size` 只是读分辨率；带参数就是在改分辨率。 */
+      if (head === 'wm' && second === 'size' && parts[2] === undefined) continue
       return true
     }
+    /* logcat 默认只读，但这些开关会清缓冲/改缓冲大小。 */
+    if (head === 'logcat' && parts.slice(1).some((flag) => flag === '-c' || flag === '--clear' || flag.startsWith('-G'))) return true
+    /* date 默认只读，`date -s …` 在改系统时间。 */
+    if (head === 'date' && second !== undefined && second.startsWith('-s')) return true
     if (READ_ONLY_HEADS.has(head)) continue
     return true
   }
@@ -479,6 +508,8 @@ function shellOnce(serial, cmd, timeout) {
       clearTimeout(timer)
       channel.onChunk = null
       channel.child.removeListener('exit', onExit)
+      /* 这条命令读完了，缓冲清掉：否则下一条命令会带着上一条的输出越滚越大。 */
+      channel.buf = ''
       const ms = Math.round(performance.now() - started)
       if (code === null) resolve({ ok: false, code: null, out, ms, uncertain: true })
       else resolve({ ok: code === 0, code, out, ms })
@@ -717,14 +748,39 @@ async function u2Alive(port) {
  */
 async function u2Start(serial) {
   const jar = join(U2_VENDOR, 'u2.jar')
-  const has = await adb(['-s', serial, 'shell', 'ls /data/local/tmp/u2.jar'], { timeout: 8000 })
-  if (!has.out.includes('u2.jar')) {
+  /* 按退出码判断文件在不在：`ls` 失败时把路径打进报错里，用「输出含 u2.jar」判断永远为真。 */
+  const has = await adb(['-s', serial, 'shell', 'test', '-f', '/data/local/tmp/u2.jar'], { timeout: 8000 })
+  if (has.code !== 0) {
     if (!existsSync(jar)) throw new Error('插件缺 vendor/u2.jar，无法启动 uiautomator2 服务')
-    await adb(['-s', serial, 'push', jar, '/data/local/tmp/u2.jar'], { timeout: 120_000 })
+    const pushed = await adb(['-s', serial, 'push', jar, '/data/local/tmp/u2.jar'], { timeout: 120_000 })
+    if (pushed.code !== 0) throw new Error(`推送 u2.jar 失败：${oneLine(pushed.err || pushed.out, 140)}`)
+    const again = await adb(['-s', serial, 'shell', 'test', '-f', '/data/local/tmp/u2.jar'], { timeout: 8000 })
+    if (again.code !== 0) throw new Error('推完 u2.jar 设备上仍然没有这个文件')
   }
   await adb(['-s', serial, 'shell',
     `nohup sh -c 'CLASSPATH=/data/local/tmp/u2.jar app_process / com.wetest.uia2.Main -p ${U2_PORT}' >/dev/null 2>&1 &`],
     { timeout: 8000 })
+}
+
+/**
+ * 让某个 forward 端口后面的 u2 服务可用：没起来就拉起再等它就绪。
+ * @param {string} serial - 设备。
+ * @param {number} port - 本机端口。
+ * @returns {Promise<string>} 空串表示可用，否则是失败原因。
+ */
+async function ensureU2On(serial, port) {
+  if (await u2Alive(port)) return ''
+  let error = ''
+  try {
+    await u2Start(serial)
+  } catch (failure) {
+    error = failure instanceof Error ? failure.message : String(failure)
+  }
+  for (let i = 0; i < 40; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (await u2Alive(port)) return ''
+  }
+  return error || 'uiautomator2 服务没有起来'
 }
 
 /**
@@ -747,31 +803,33 @@ async function u2Port(serial) {
     u2Cache.set(serial, { port: reusedPort, at: Date.now() })
     return reusedPort
   }
-  /* `adb forward tcp:0` 在部分 adb 版本上直接失败（实测 37.0.1 返回非 0），
-     所以自己挑几个端口试，能 ping 通即用。 */
   let lastError = ''
+  /* 主路：让 adb 自己分配端口（`tcp:0`），加 `--no-rebind` 保证不顶掉别人的转发。
+     旧注释说 37.0.1 上 tcp:0 会失败，本机 37.0.1 实测可用；失败才走下面的固定端口兜底。 */
+  const fresh = await adb(['-s', serial, 'forward', '--no-rebind', 'tcp:0', `tcp:${U2_PORT}`], { timeout: 8000 })
+  const freshPort = Number((fresh.out ?? '').trim())
+  if (fresh.code === 0 && Number.isFinite(freshPort) && freshPort > 0) {
+    ownForward(serial, `tcp:${freshPort}`, `tcp:${U2_PORT}`)
+    lastError = await ensureU2On(serial, freshPort)
+    if (lastError === '') {
+      u2Cache.set(serial, { port: freshPort, at: Date.now() })
+      return freshPort
+    }
+  } else {
+    lastError = oneLine(fresh.err || fresh.out || `adb forward 退出码 ${fresh.code}`, 160)
+  }
+  /* 兜底：系统分配不可用时自己挑几个端口试；同样 `--no-rebind`，不抢别人已经在用的。 */
   for (const port of [19108, 19208, 19308]) {
-    const created = await adb(['-s', serial, 'forward', `tcp:${port}`, `tcp:${U2_PORT}`], { timeout: 8000 })
+    const created = await adb(['-s', serial, 'forward', '--no-rebind', `tcp:${port}`, `tcp:${U2_PORT}`], { timeout: 8000 })
     if (created.code !== 0) {
       lastError = oneLine(created.err || created.out || `adb forward 退出码 ${created.code}`, 160)
       continue
     }
     ownForward(serial, `tcp:${port}`, `tcp:${U2_PORT}`)
-    if (!await u2Alive(port)) {
-      try {
-        await u2Start(serial)
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-      }
-      let ok = false
-      for (let i = 0; i < 40 && !ok; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 150))
-        ok = await u2Alive(port)
-      }
-      if (!ok) {
-        lastError = lastError || 'uiautomator2 服务没有起来'
-        continue
-      }
+    const failed = await ensureU2On(serial, port)
+    if (failed !== '') {
+      lastError = failed
+      continue
     }
     u2Cache.set(serial, { port, at: Date.now() })
     return port
@@ -1164,6 +1222,40 @@ function nodeForRef(serial, ref, snapshotId) {
 }
 
 /**
+ * 点之前确认目标还在原位：快照太旧就重读一次树，按 id/文字/描述找回同一个控件。
+ * 找不到、匹配多个、或位置挪得太多，都报错让人重读界面，不拿旧坐标乱点。
+ * @param {string} serial - 设备。
+ * @param {any} node - 目标节点。
+ * @param {string} [snapshotId] - 调用方带的快照编号；带了说明它认这次快照，不重读。
+ * @returns {Promise<any>} 可以点的节点（可能是新快照里的同一个）。
+ */
+async function freshNodeFor(serial, node, snapshotId) {
+  if (snapshotId !== undefined && snapshotId !== null && String(snapshotId) !== '') return node
+  const cached = lastTrees.get(serial)
+  if (!cached || Date.now() - cached.at <= REF_SOFT_TTL_MS) return node
+  const label = oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)
+  const next = await dumpState(serial, {})
+  const ox = (node.x1 + node.x2) / 2
+  const oy = (node.y1 + node.y2) / 2
+  /* 同一段文字常有多份（父容器 + 子节点、左右分栏），按「离旧位置最近」认领，不算歧义。 */
+  const scored = next.tree.refs
+    .map((entry) => entry.node)
+    .filter((candidate) => (node.id !== '' && candidate.id === node.id)
+      || (node.text !== '' && candidate.text === node.text)
+      || (node.desc !== '' && candidate.desc === node.desc))
+    .map((candidate) => ({ node: candidate, dist: Math.hypot((candidate.x1 + candidate.x2) / 2 - ox, (candidate.y1 + candidate.y2) / 2 - oy) }))
+    .sort((a, b) => a.dist - b.dist)
+  if (scored.length === 0) {
+    throw new Error(`stale_snapshot：界面已经变了，之前的「${label}」不在了。先 adb_ui 看当前界面再操作。`)
+  }
+  const moved = scored[0].dist > REF_MOVE_TOLERANCE
+  if (moved) {
+    throw new Error(`stale_snapshot：「${label}」的位置已经挪动，旧坐标可能点到别处。先 adb_ui 看当前界面再操作。`)
+  }
+  return scored[0].node
+}
+
+/**
  * 按文字/id 找控件前先拿到可用快照：缺失、过期、或当前页面已经换了一页就重新 dump 一次。
  * 这比拿两分钟前的坐标去点安全，也比直接报错少一个模型回合。
  * @param {string} serial - 设备。
@@ -1183,7 +1275,7 @@ async function snapshotForSelector(serial, snapshotId) {
 }
 
 /**
- * 按文字/资源 id/描述找节点。文字优先精确匹配，再退化为包含匹配。
+ * 按文字/资源 id/描述找节点。文字优先精确匹配，再退化为包含匹配；命中多个就报错不猜。
  * @param {string} serial - 设备。
  * @param {{text?: string, id?: string, desc?: string, snapshotId?: string}} want - 选择器。
  * @returns {any} 节点。
@@ -1192,21 +1284,26 @@ function nodeForSelector(serial, want) {
   const cached = checkSnapshot(serial, want.snapshotId, '文字/id')
   const refs = cached.refs.map((entry) => entry.node)
   if (want.text) {
-    const exact = refs.find((node) => node.text === want.text || node.desc === want.text)
-    const loose = exact ?? refs.find((node) => `${node.text} ${node.desc}`.includes(want.text))
-    if (!loose) throw new Error(`界面上没有文字「${want.text}」：先 adb_ui 看当前界面，或用 filter 搜一下。`)
-    return loose
+    const exact = refs.filter((node) => node.text === want.text || node.desc === want.text)
+    const loose = exact.length > 0 ? exact : refs.filter((node) => `${node.text} ${node.desc}`.includes(want.text))
+    if (loose.length === 0) throw new Error(`界面上没有文字「${want.text}」：先 adb_ui 看当前界面，或用 filter 搜一下。`)
+    if (loose.length > 1) throw new Error(`ambiguous_target：文字「${want.text}」匹配到 ${loose.length} 个控件，改用 ref 挑一个。`)
+    return loose[0]
   }
   if (want.id) {
     const needle = shortId(want.id)
-    const found = refs.find((node) => shortId(node.id) === needle) ?? refs.find((node) => shortId(node.id).includes(needle))
-    if (!found) throw new Error(`界面上没有 id 包含「${needle}」的控件：先 adb_ui 看当前界面。`)
-    return found
+    const exact = refs.filter((node) => shortId(node.id) === needle)
+    const loose = exact.length > 0 ? exact : refs.filter((node) => shortId(node.id).includes(needle))
+    if (loose.length === 0) throw new Error(`界面上没有 id 包含「${needle}」的控件：先 adb_ui 看当前界面。`)
+    if (loose.length > 1) throw new Error(`ambiguous_target：id「${needle}」匹配到 ${loose.length} 个控件，改用 ref 挑一个。`)
+    return loose[0]
   }
   if (want.desc) {
-    const found = refs.find((node) => node.desc.includes(want.desc)) ?? refs.find((node) => node.text.includes(want.desc))
-    if (!found) throw new Error(`界面上没有描述包含「${want.desc}」的控件：先 adb_ui 看当前界面。`)
-    return found
+    const exact = refs.filter((node) => node.desc === want.desc)
+    const loose = exact.length > 0 ? exact : refs.filter((node) => node.desc.includes(want.desc) || node.text.includes(want.desc))
+    if (loose.length === 0) throw new Error(`界面上没有描述包含「${want.desc}」的控件：先 adb_ui 看当前界面。`)
+    if (loose.length > 1) throw new Error(`ambiguous_target：描述「${want.desc}」匹配到 ${loose.length} 个控件，改用 ref 挑一个。`)
+    return loose[0]
   }
   throw new Error('需要 ref、text、id、desc 或 point 其中之一。')
 }
@@ -1639,7 +1736,8 @@ export function apply(ctx, config) {
         target = `坐标 ${x},${y}`
       } else {
         /* ref 严格按快照校验：快照过期或之后又 dump 过就报错，不拿旧 ref 乱点。
-           按文字/id 点则允许自动重读：页面换了就 dump 一次再找，比拿旧坐标点安全。 */
+           按文字/id 点则允许自动重读：页面换了就 dump 一次再找，比拿旧坐标点安全。
+           没带 snapshot_id 且快照超过 1.5s 时，点之前再验一次目标还在原位。 */
         let node
         if (args.ref !== undefined) {
           node = nodeForRef(device, Number(args.ref), args.snapshot_id)
@@ -1647,6 +1745,7 @@ export function apply(ctx, config) {
           await snapshotForSelector(device, args.snapshot_id)
           node = nodeForSelector(device, { text: args.text, id: args.id, desc: args.desc, snapshotId: args.snapshot_id })
         }
+        node = await freshNodeFor(device, node, args.snapshot_id)
         const hit = clickTarget(nodesOf(device), node)
         x = Math.round((hit.x1 + hit.x2) / 2)
         y = Math.round((hit.y1 + hit.y2) / 2)
