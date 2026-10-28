@@ -9,3 +9,7 @@ annotations/
 *.mp4
 recent-*.png
 peek-*.jpg
+
+# npm 缓存（本机产物，不进仓库）
+.cache/
+node_modules/
