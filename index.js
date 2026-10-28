@@ -33,6 +33,8 @@ export const name = 'adb'
 export const inject = ['tools']
 
 /** 界面上限：超过这个节点数不渲染，避免一个列表页吃掉几万 token。 */
+/** 可输入控件的类名特征：u2 树里没有 editable 属性，只能按类判别（与选择器 editable 同一判据）。 */
+const EDITABLE_CLS = /EditText|AutoComplete|SearchView/i
 const MAX_NODES = { default: 400, max: 1500 }
 
 /** 文本树缓存有效期：ref 点击必须在这么近的一次 dump 之后。 */
@@ -1293,14 +1295,21 @@ async function typeViaClipboard(serial, text) {
   const pasteBegan = Date.now()
   const pasteKey = await sh(serial, 'input keyevent 279', 8000)
   if (pasteKey.ok) {
-    await new Promise((resolve) => setTimeout(resolve, 200))
-    nodes = await dump()
-    const afterField = focusedField(nodes)
-    if (afterField && afterField.text !== beforeText) {
-      return { ok: true, steps: [...steps, `PASTE 键 ${Date.now() - pasteBegan}ms`], field: afterField.text ?? '' }
+    /* 粘贴是异步落在输入框上的，别硬等固定 200ms：立刻 dump 一次，没变再按 120/240ms 退避重看，
+       总共最多约 0.5s。多数机器第一次就命中，省掉上百毫秒；不吃 PASTE 键的框照样落回长按菜单那条路。 */
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, attempt === 1 ? 120 : 240))
+      nodes = await dump()
+      const afterField = focusedField(nodes)
+      if (afterField === undefined) throw new Error('没有聚焦的输入框：先用 adb_tap 点一下输入框再输入')
+      /* 密码框内容是掩码：长度变了也算粘贴成功。 */
+      const changed = afterField.text !== beforeText
+        || (afterField.password === true && String(afterField.text ?? '').length !== beforeText.length)
+      if (changed) {
+        return { ok: true, steps: [...steps, `PASTE 键 ${Date.now() - pasteBegan}ms`], field: afterField.text ?? '' }
+      }
+      field = afterField
     }
-    if (afterField === undefined) throw new Error('没有聚焦的输入框：先用 adb_tap 点一下输入框再输入')
-    field = afterField
   }
   /* 慢路：长按输入框等「粘贴」菜单，菜单文字每次都要重新读树才拿得到坐标。 */
   const x = Math.round((field.x1 + field.x2) / 2)
@@ -1333,6 +1342,8 @@ async function typeViaClipboard(serial, text) {
  * @returns {boolean} 是否保留。
  */
 function interesting(node, full) {
+  /* 空输入框（没文字没 id 没点击行为）以前会被整行丢掉，模型根本看不到该往哪打字：按类保下来。 */
+  if (EDITABLE_CLS.test(String(node.cls || ''))) return true
   if (node.text || node.desc || node.clickable || node.longClickable) return true
   if (full && node.id) return true
   return false
@@ -1342,7 +1353,7 @@ function interesting(node, full) {
  * 压缩文本树：去掉纯容器，合并父子重复文字，给可操作节点发 ref。
  * 输出格式（尽量短）：
  *   `#12 Button "登录" #login_btn @300,412 *`  — * 可点击
- *   `   ~ 可滚动   [x] 已勾选   [s] 选中   [f] 焦点   [pwd] 密码框`
+ *   `   ~ 可滚动   [x] 已勾选   [s] 选中   [f] 焦点   [edit] 可输入   [pwd] 密码框`
  * @param {any[]} nodes - parseNodes 的结果。
  * @param {{full?: boolean, maxNodes?: number}} options - 参数。
  * @returns {{lines: string[], refs: Array<{ref: number, node: any}>, kept: number, total: number}} 结果。
@@ -1375,8 +1386,10 @@ function compactTree(nodes, options) {
       if (node.checked) tail += ' [x]'
       else if (node.selected) tail += ' [s]'
       if (node.focused) tail += ' [f]'
-      /* 密码框内容读出来是掩码，模型不该把它当普通文本填：行上直接标出来。 */
+      /* 密码框内容读出来是掩码，模型不该把它当普通文本填：行上直接标出来。
+         可输入框也标一下：模型不用猜哪些行是能点的输入位。 */
       if (node.password) tail += ' [pwd]'
+      else if (EDITABLE_CLS.test(String(node.cls || ''))) tail += ' [edit]'
       if (node.enabled === false) tail += ' [off]'
       const ref = refs.length + 1
       refs.push({ ref, node })
@@ -1940,9 +1953,7 @@ function selectNodes(state, sel) {
     for (const state of ['checked', 'selected', 'scrollable', 'focused', 'editable', 'password']) {
       const wantState = want[state]
       if (wantState === undefined || wantState === null) continue
-      const has = state === 'editable'
-        ? /EditText|AutoComplete|SearchView/i.test(String(node.cls || ''))
-        : node[state] === true
+      const has = state === 'editable' ? EDITABLE_CLS.test(String(node.cls || '')) : node[state] === true
       if (wantState === true && !has) return false
       if (wantState === false && has) return false
     }

@@ -337,4 +337,15 @@ it('adb_do 每一步能带 scroll 边滑边找，写错了当场报', () => {
   assert.match(validateSteps([{ ref: 2, scroll: 3 }]).problems[0], /scroll 只能配 tap \/ id/)
   assert.match(validateSteps([{ tap: '设置', scroll: 2, scroll_direction: '斜着' }]).problems[0], /scroll_direction 只能是/)
 })
+
+it('可输入框在树上标 [edit]，密码框标 [pwd]，两者不重复标', () => {
+  const xml = '<hierarchy><node class="android.widget.EditText" text="" bounds="[0,0][400,120]" /><node class="android.widget.EditText" text="••••" password="true" bounds="[0,120][400,240]" /><node class="android.widget.TextView" text="手机号" bounds="[0,240][400,360]" /></hierarchy>'
+  const nodes = parseNodes(xml)
+  const tree = compactTree(nodes, {})
+  assert.match(tree.lines[0], /\[edit\]/)
+  assert.match(tree.lines[1], /\[pwd\]/)
+  assert.ok(!/\[edit\]/.test(tree.lines[1]))
+  assert.ok(!/\[edit\]|\[pwd\]/.test(tree.lines[2]))
+  assert.equal(selectNodes({ nodes, refs: tree.refs, tree }, { editable: true }).length, 2)
+})
 console.log(`\n${pass} 项通过\n`)
