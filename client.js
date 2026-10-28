@@ -550,6 +550,20 @@ window.__ModuleLoader__.load({
         let timer
         let since = 0
         let misses = 0
+        /* 正在显示与正在解码的 Blob URL 各留一个：替换时先释放旧的待解码，
+           卸载时两个都释放。旧写法只靠 onload 回收，换帧快时会漏掉整条 URL。 */
+        let shownUrl = ''
+        let pendingUrl = ''
+        const releaseUrls = () => {
+          if (pendingUrl !== '') {
+            URL.revokeObjectURL(pendingUrl)
+            pendingUrl = ''
+          }
+          if (shownUrl !== '') {
+            URL.revokeObjectURL(shownUrl)
+            shownUrl = ''
+          }
+        }
         const visible = () => {
           const node = frameRef.current
           const host = node === null ? null : (node.parentElement ?? node)
@@ -574,12 +588,20 @@ window.__ModuleLoader__.load({
             const img = imgRef.current
             if (img !== null) {
               const url = URL.createObjectURL(blob)
-              const prev = img.dataset.url
+              if (pendingUrl !== '') URL.revokeObjectURL(pendingUrl)
+              pendingUrl = url
               img.onload = () => {
-                if (prev !== undefined) URL.revokeObjectURL(prev)
-                img.dataset.url = url
+                if (pendingUrl !== url) return
+                pendingUrl = ''
+                if (shownUrl !== '') URL.revokeObjectURL(shownUrl)
+                shownUrl = url
                 setReady(true)
                 paint()
+              }
+              img.onerror = () => {
+                if (pendingUrl !== url) return
+                pendingUrl = ''
+                URL.revokeObjectURL(url)
               }
               img.src = url
             }
@@ -590,7 +612,7 @@ window.__ModuleLoader__.load({
           if (live) timer = setTimeout(pull, misses === 0 ? 0 : Math.min(3000, 300 * misses))
         }
         void pull()
-        return () => { live = false; clearTimeout(timer) }
+        return () => { live = false; clearTimeout(timer); releaseUrls() }
       }, [serial, paint, engine])
 
       /* 画面尺寸与是否在直播：标注坐标要换算到设备像素，必须知道这两个数。 */

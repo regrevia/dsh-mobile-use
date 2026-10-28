@@ -211,6 +211,12 @@ function containsIdr(chunk) {
 
 /** 最后一个观众走后，录屏再活这么久：侧栏重载/切页回来时能立刻出画面，不用等 2 秒起流。 */
 const IDLE_GRACE_MS = 20000
+/** 主链路待写队列上限：ffmpeg 不读数据时，队列涨到这里就整条重建，绝不把宿主内存吃光。 */
+const MAX_REMUX_QUEUE = 4 * 1024 * 1024
+/** JPEG 是可选支路：落后超过这个量就丢掉重建，它没有资格拖慢采集。 */
+const MAX_JPEG_QUEUE = 1024 * 1024
+/** 排空比这还慢就认为 ffmpeg 卡死了（设备端编码器会一直吐，不能跟着等）。 */
+const REMUX_STALL_MS = 2000
 /** 本进程的随机标识：设备端 pid 文件名带上它，多开/重启不会互相认领对方的录屏。 */
 const RUN_TAG = Math.random().toString(36).slice(2, 8)
 
@@ -267,6 +273,15 @@ export class LiveStream {
     this.jpegOpenAt = 0
     /** 最近一次有人要 JPEG 的时间：JPEG 观看者也该把推流钉住，否则每轮轮询都要重开录屏。 */
     this.jpegWantedAt = 0
+    /** 每次启动/停止都换一代：旧进程的 exit 回调据此作废，停止之后不会自己复活。 */
+    this.generation = 0
+    this.spawning = false
+    /** 背压状态：正在因为 ffmpeg 写不动而暂停读录屏流。 */
+    this.recorderPaused = false
+    /** 诊断计数：队列保护触发了几次、暂停过几次。 */
+    this.queueDrops = 0
+    this.queueStalls = 0
+    this.jpegDrops = 0
   }
 
   /**
@@ -342,6 +357,11 @@ export class LiveStream {
     if (!(globalThis.__dshAdbJpeg.get(this.serial) instanceof Set)) globalThis.__dshAdbJpeg.set(this.serial, new Set())
     globalThis.__dshAdbJpeg.get(this.serial).add(child)
     child.on('exit', () => globalThis.__dshAdbJpeg.get(this.serial)?.delete(child))
+    /* 同上：管道 EPIPE 只许结束这条可选支路，不能冒泡到宿主。 */
+    child.stdin.on('error', (error) => this.guard('jpeg-stdin-error', () => {
+      this.error = 'JPEG 管道断开：' + String(error?.message ?? error)
+      if (this.jpegChild === child) this.closeJpeg()
+    }))
     child.stdout.on('data', (chunk) => this.guard('feed-jpeg', () => this.feedJpeg(chunk)))
     child.stderr.on('data', (buf) => {
       const text = String(buf).trim()
@@ -536,7 +556,6 @@ export class LiveStream {
     try {
       const line = JSON.stringify({ at: Date.now(), serial: this.serial, note, sessions: this.sessions, clients: this.clients.size, waiting: this.waiting.size, err: this.error }) + '\n'
       mkdirSync(join(homedir(), '.dsh', 'adb-mirror'), { recursive: true })
-      mkdirSync(join(homedir(), '.dsh', 'adb-mirror'), { recursive: true })
       appendFileSync(join(homedir(), '.dsh', 'adb-mirror', 'stream-debug.log'), line)
     } catch {
       /* 调试失败不影响推流 */
@@ -555,7 +574,10 @@ export class LiveStream {
     const args = ['-s', this.serial, 'exec-out', command]
     const child = spawn(this.adbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     this.recorder = child
-    this.debug('spawn')
+    /* 新进程意味着读端是新的：上一轮为背压按下的暂停状态必须清掉。 */
+    this.recorderPaused = false
+    const gen = this.generation
+    this.debug('spawn gen=' + String(gen) + ' session=' + String(this.sessions))
     let stderr = ''
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => {
@@ -563,12 +585,15 @@ export class LiveStream {
     })
     child.stdout.on('data', (chunk) => this.guard('feed-raw', () => this.feedRaw(chunk)))
     child.on('error', (error) => this.guard('recorder-error', () => {
+      if (gen !== this.generation) return
       this.error = String(error?.message ?? error)
       this.recorder = null
       this.scheduleRestart()
     }))
     child.on('exit', (code) => this.guard('recorder-exit', () => {
       if (this.recorder === child) this.recorder = null
+      /* stop() 之后的旧进程回调一律作废：否则「关掉页面 180 ms 后又自己开始录」。 */
+      if (gen !== this.generation) return
       this.closeRemuxer()
       if (this.stopping) return
       const wasIntentional = this.intentional
@@ -619,19 +644,84 @@ export class LiveStream {
     }
     const jpegChild = this.jpegChild
     if (jpegChild !== null) {
-      try {
-        jpegChild.stdin.write(chunk)
-      } catch {
-        /* 桥接断了就丢了，主链路重开时会重建 */
+      const jpegIn = jpegChild.stdin
+      if (jpegIn === null || jpegIn.writableLength > MAX_JPEG_QUEUE) {
+        /* 可选支路落后就整条丢掉重建，它没有资格拖住采集链。 */
+        this.jpegDrops += 1
+        this.closeJpeg()
+      } else {
+        try {
+          jpegIn.write(chunk)
+        } catch {
+          this.closeJpeg()
+        }
       }
     }
     this.ensureRemuxer()
     const remuxer = this.remuxer
     if (remuxer === null) return
+    const mp4In = remuxer.stdin
+    if (mp4In === null || mp4In.writableLength > MAX_REMUX_QUEUE) {
+      /* 排到上限说明 ffmpeg 已经不读了：整条重建，宁可黑半秒也不憋住内存。 */
+      this.queueDrops += 1
+      this.error = 'ffmpeg 写入落后，已重建转封装'
+      this.closeRemuxer()
+      return
+    }
     try {
-      remuxer.stdin.write(chunk)
+      if (mp4In.write(chunk) === false) this.pauseForRemuxer(remuxer)
     } catch {
       this.closeRemuxer()
+    }
+  }
+
+  /**
+   * ffmpeg 报背压：暂停读录屏流，等它排空；等太久就整条重建（含重新要 IDR）。
+   * @param {import('node:child_process').ChildProcess} remuxer - 当前转封装进程。
+   * @returns {void}
+   */
+  pauseForRemuxer(remuxer) {
+    if (this.recorderPaused) return
+    const recorder = this.recorder
+    if (recorder === null) return
+    this.recorderPaused = true
+    this.queueStalls += 1
+    this.debug('remux-backpressure pause')
+    try {
+      recorder.stdout.pause()
+    } catch {
+      /* 已经关了 */
+    }
+    let timer = setTimeout(() => this.guard('remux-stall', () => {
+      timer = null
+      if (this.remuxer === remuxer) {
+        this.error = 'ffmpeg 2 秒未消费数据，已重建'
+        this.closeRemuxer()
+        /* 重新要一张 IDR：新 ffmpeg 从 SPS 开始才解得对。 */
+        this.rekey()
+      }
+      this.resumeRecorder()
+    }), REMUX_STALL_MS)
+    timer.unref?.()
+    remuxer.stdin.once('drain', () => this.guard('remux-drain', () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      this.resumeRecorder()
+    }))
+  }
+
+  /** 排空后恢复读录屏流。 @returns {void} */
+  resumeRecorder() {
+    if (!this.recorderPaused) return
+    this.recorderPaused = false
+    const recorder = this.recorder
+    if (recorder === null) return
+    try {
+      recorder.stdout.resume()
+    } catch {
+      /* 已经关了 */
     }
   }
 
@@ -658,6 +748,11 @@ export class LiveStream {
       '-f', 'mp4', 'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     this.remuxer = child
+    /* child.on('error') 接不到管道自身的 EPIPE：必须单独接管 stdin，否则异步 error 事件会打死宿主。 */
+    child.stdin.on('error', (error) => this.guard('remux-stdin-error', () => {
+      this.error = 'ffmpeg 管道断开：' + String(error?.message ?? error)
+      if (this.remuxer === child) this.closeRemuxer()
+    }))
     child.stdout.on('data', (chunk) => this.guard('feed-mp4', () => this.feedMp4(chunk)))
     child.stderr.on('data', (buf) => {
       const text = String(buf).trim()
@@ -834,6 +929,8 @@ export class LiveStream {
 
   /** 没人看了就停，别占着设备编码器。 @returns {void} */
   stop() {
+    /* 换代：之前所有 in-flight 的退出/重启回调从此作废，停止之后不会自己复活。 */
+    this.generation += 1
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer)
       this.idleTimer = null
@@ -885,6 +982,13 @@ export class LiveStream {
       jpegAt: this.jpegAt,
       jpegLive: this.jpegChild !== null,
       jpegBytes: this.jpeg === null ? 0 : this.jpeg.length,
+      /* 诊断：队列保护触发次数与当前待写字节，涨得快就说明 ffmpeg 跟不上。 */
+      queueDrops: this.queueDrops,
+      queueStalls: this.queueStalls,
+      jpegDrops: this.jpegDrops,
+      remuxQueued: this.remuxer === null ? 0 : this.remuxer.stdin?.writableLength ?? 0,
+      jpegQueued: this.jpegChild === null ? 0 : this.jpegChild.stdin?.writableLength ?? 0,
+      generations: this.generation,
     }
   }
 }

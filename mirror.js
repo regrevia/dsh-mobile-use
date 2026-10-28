@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=146'
+import { LiveStream, packFrame } from './stream.js?v=149'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -248,6 +248,9 @@ function pngToJpeg(png) {
   })
 }
 
+/** 单个 MJPEG 连接的待写上限：慢客户端不能把宿主进程的堆吃光。 */
+const MAX_LIVE_QUEUE = 2 * 1024 * 1024
+
 /**
  * 往一个 MJPEG 连接写一帧。
  * @param {import('node:http').ServerResponse} res - 连接。
@@ -257,6 +260,12 @@ function pngToJpeg(png) {
  */
 function writeFrame(res, frame, drop) {
   try {
+    /* 慢客户端只许拖垮自己：待写超过上限就直接断连，让它重连，别在宿主里攒队列。 */
+    if (res.writableLength > MAX_LIVE_QUEUE) {
+      drop()
+      res.destroy()
+      return
+    }
     res.write(`--frame\r\ncontent-type: image/jpeg\r\ncontent-length: ${frame.length}\r\n\r\n`)
     res.write(frame)
     res.write('\r\n')
@@ -282,6 +291,8 @@ export class Mirror {
     this.height = 0
     this.watchers = new Set()
     this.lastWatchAt = 0
+    /* 并发 start 的单飞句柄：见 start()。 */
+    this.startPromise = null
     this.dropped = 0
     this.seq = 0
     this.waiters = []
@@ -321,20 +332,31 @@ export class Mirror {
 
   async start() {
     if (this.timer !== null || this.stopping) return
-    await mkdir(this.dir, { recursive: true })
-    this.startedAt = Date.now()
-    this.error = ''
-    const size = await this.adb(['-s', this.serial, 'shell', 'wm', 'size'], { timeout: 6000 })
-    const found = /(\d+)x(\d+)/.exec(String(size.out ?? ''))
-    if (found !== null) this.physical = { w: Number(found[1]), h: Number(found[2]) }
-    await this.snapshot()
-    this.alignScreen()
-    this.timer = setInterval(() => guard('pump', () => this.pump()), 200)
-    this.timer.unref?.()
-    this.pushTimer = setInterval(() => guard('push', () => this.push()), PUSH_TICK_MS)
-    this.pushTimer.unref?.()
-    /* 录制跟观看者对齐：起服务时没人看就先不录，等 /frame 或 /live 把人带来再开。 */
-    this.ensureRecorder()
+    /* 并发 start（页面重载 + /frame 同时到）只许跑一次：起两套定时器后，停的时候必漏一套。 */
+    if (this.startPromise !== null) return this.startPromise
+    this.startPromise = (async () => {
+      await mkdir(this.dir, { recursive: true })
+      this.startedAt = Date.now()
+      this.error = ''
+      const size = await this.adb(['-s', this.serial, 'shell', 'wm', 'size'], { timeout: 6000 })
+      const found = /(\d+)x(\d+)/.exec(String(size.out ?? ''))
+      if (found !== null) this.physical = { w: Number(found[1]), h: Number(found[2]) }
+      await this.snapshot()
+      this.alignScreen()
+      /* 等到这里再判一次：await 期间可能已经有人 stop 了。 */
+      if (this.stopping) return
+      this.timer = setInterval(() => guard('pump', () => this.pump()), 200)
+      this.timer.unref?.()
+      this.pushTimer = setInterval(() => guard('push', () => this.push()), PUSH_TICK_MS)
+      this.pushTimer.unref?.()
+      /* 录制跟观看者对齐：起服务时没人看就先不录，等 /frame 或 /live 把人带来再开。 */
+      this.ensureRecorder()
+    })().catch((error) => {
+      this.error = String(error?.message ?? error)
+    }).finally(() => {
+      this.startPromise = null
+    })
+    return this.startPromise
   }
 
   /**
@@ -1621,7 +1643,9 @@ export function setupMirror(ctx, tools) {
         })
         res.flushHeaders()
         let closed = false
-        const unsubscribe = stream.subscribe((bytes) => {
+        /* 先占位再订阅：subscribe 可能同步补发初始化段，那时 unsubscribe 还没赋值。 */
+        let unsubscribe = () => {}
+        unsubscribe = stream.subscribe((bytes) => {
           if (closed) return
           /* 积压超过 2 MB 就断开重连：宁可重连一次，也不要让延迟越滚越大。 */
           if (res.writableLength > 2 << 20) {
