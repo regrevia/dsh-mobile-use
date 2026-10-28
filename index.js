@@ -2752,10 +2752,11 @@ export function apply(ctx, config) {
          游戏/自绘界面文本树是空的，这里直接说清该换哪条路（截图看画面、adb_motion 量动效）。 */
       const clickable = lines.filter((line) => line.trimEnd().endsWith('*')).length
       const scrollable = lines.filter((line) => line.includes('~')).length
-      const focusLine = lines.find((line) => /\[f\]/.test(line) || /EditText/.test(line))
+      const focusLine = lines.find((line) => /\[f\]/.test(line))
+        ?? lines.find((line) => /\[edit\]/.test(line) || /EditText/.test(line))
       const digest = state.tree.kept === 0
         ? '文本树为空（游戏或自绘界面）：用 adb_shot 看画面，动效差异用 adb_motion 量'
-        : [`可点 ${clickable}`, scrollable > 0 ? `可滚 ${scrollable}` : '', focusLine ? `焦点 ${oneLine(focusLine.replace(/\s+/g, ' ').trim(), 30)}` : ''].filter(Boolean).join(' / ')
+        : [`可点 ${clickable}`, scrollable > 0 ? `可滚 ${scrollable}` : '', focusLine ? `焦点 ref${focusLine.trim().split(/\s+/)[0]} ${oneLine(focusLine.trim().split(/\s+/).slice(1).join(' '), 30)}` : ''].filter(Boolean).join(' / ')
       const summary = [
         `${state.serial} · ${state.activity || '未知页面'}`,
         `${state.tree.kept}/${state.tree.total} 节点${args.filter ? `，匹配 ${filtered.length}` : ''} · ${state.ms}ms`,
