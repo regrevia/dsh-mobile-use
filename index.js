@@ -1994,6 +1994,40 @@ function nodeForSelector(serial, want) {
   return places[0]
 }
 
+/**
+ * 找控件；当前屏没有就先短轮等地等它出现，再报错。
+ * 竞品（Appium implicitWait / u2 wait）都把「等元素出现」做成一次调用的一部分，
+ * 我们也一样：点早了不再是一轮失败往返，而是自动等最多 900ms（可用 wait_ms 调，上限 5s）。
+ * 只对「界面上没有」这种还能变的情况等；匹配到多个、快照过期这些等也不会好，立刻报。
+ * @param {string} device - 设备。
+ * @param {any} want - nodeForSelector 的选择器。
+ * @param {number} [waitMs] - 最多等多久（毫秒），默认 900。
+ * @returns {any} 节点。
+ */
+async function awaitNode(device, want, waitMs) {
+  try {
+    return nodeForSelector(device, want)
+  } catch (error) {
+    const reason = String(error?.message ?? error)
+    const limit = Math.max(0, Math.min(5000, Number(waitMs ?? 900) || 0))
+    if (limit === 0 || !reason.startsWith('界面上没有')) throw error
+    const began = Date.now()
+    let last = error
+    while (Date.now() - began < limit) {
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      try {
+        /* dumpState 会刷新 lastTrees，nodeForSelector 读到的就是这一轮的新界面。 */
+        await dumpState(device, {})
+        return nodeForSelector(device, want)
+      } catch (inner) {
+        last = inner
+      }
+    }
+    const waited = Date.now() - began
+    throw new Error(`${String(last?.message ?? last).replace(/^界面上没有/, `等了 ${waited}ms 界面上还是没有`)}`)
+  }
+}
+
 const screenSizes = new Map()
 
 /**
@@ -2301,6 +2335,48 @@ function shellInputText(text) {
  * @param {string} text - 要输入的文字。
  * @returns {Promise<{how: 'input' | 'paste', steps: string[], field: string, note: string}>} 结果。
  */
+/**
+ * 当前焦点输入框里还剩下的文字（普通 EditText 才算），用来核对「清空」是不是真清空了。
+ * @param {string} serial - 设备。
+ * @returns {Promise<string>} 还有内容就返回那段文字，空/找不到输入框返回空串。
+ */
+async function focusedFieldText(serial) {
+  try {
+    const state = await dumpState(serial, { ocr: 'off', maxNodes: 200, activity: false })
+    const filled = state.nodes.filter((node) => /EditText|AutoComplete/i.test(String(node.cls || '')) && String(node.text || '') !== '')
+    return filled.length === 0 ? '' : String(filled[0].text)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 清空焦点输入框。老做法是一条一条发 40 次 DEL，等于在设备上起 40 个 input 进程（实测 2.6s）；
+ * 这里改成「全选 + DEL」两条 keyevent 一次 shell（约 100ms），再读一次树确认真的空了，
+ * 全选不生效的输入框（少数自绘控件）才补一轮批量 DEL —— 一条命令带 60 个 KEYCODE_DEL，仍然只起一个进程。
+ * @param {string} serial - 设备。
+ * @returns {Promise<{note: string, ms: number}>} 给用户看的说明与耗时。
+ */
+async function clearFocusedField(serial) {
+  const began = Date.now()
+  const burst = async () => {
+    const codes = ['KEYCODE_MOVE_END', ...Array.from({ length: 60 }, () => 'KEYCODE_DEL')].join(' ')
+    const result = await sh(serial, `input keyevent ${codes}`, 20_000)
+    if (!result.ok) throw new Error(failureNote('清空输入框', result))
+  }
+  const selected = await sh(serial, 'input keycombination KEYCODE_CTRL_LEFT KEYCODE_A; input keyevent KEYCODE_DEL', 15_000)
+  if (!selected.ok) {
+    await burst()
+    return { note: `已清空输入框（${Date.now() - began}ms，批量 DEL）`, ms: Date.now() - began }
+  }
+  const leftover = await focusedFieldText(serial)
+  if (leftover === '') return { note: `已清空输入框（${Date.now() - began}ms）`, ms: Date.now() - began }
+  await burst()
+  const after = await focusedFieldText(serial)
+  if (after === '') return { note: `已清空输入框（${Date.now() - began}ms，全选没生效时补了批量 DEL）`, ms: Date.now() - began }
+  return { note: `清空后输入框还有「${oneLine(after, 20)}」：它可能不是普通输入框，先点中输入框再 clear，或手动 selectAll。`, ms: Date.now() - began }
+}
+
 async function inputTextVia(serial, text) {
   const wanted = String(text)
   const count = [...wanted].length
@@ -2687,6 +2763,7 @@ export function apply(ctx, config) {
         wait_until_gone: { type: 'string', description: '点完等这段文字消失（关弹窗、等加载完）' },
         scroll: { type: 'integer', description: '目标不在当前屏时最多滑几次（1–15）：滑到就点，滑不到报错。只在按文字/id/描述/类名找时有效' },
         scroll_direction: { type: 'string', description: '边滑边找的手指方向：up/down/left/right，默认 up（把下面的内容拉上来）' },
+        wait_ms: { type: 'integer', description: '目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）：点早了不用再来一轮' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 10000' },
       },
       additionalProperties: false,
@@ -2743,7 +2820,7 @@ export function apply(ctx, config) {
             snapshotId: args.snapshot_id,
           }
           try {
-            node = nodeForSelector(device, want)
+            node = await awaitNode(device, want, args.wait_ms)
           } catch (error) {
             /* 只有「当前屏没有」才值得滑：匹配到多个、快照过期这些滑了也没用，原样报出去。 */
             const reason = String(error?.message ?? error)
@@ -3013,9 +3090,8 @@ export function apply(ctx, config) {
       const started = Date.now()
       const messages = []
       if (args.clear) {
-        const cleared = await sh(device, 'input keyevent KEYCODE_MOVE_END; for i in $(seq 40); do input keyevent KEYCODE_DEL; done', 20_000)
-        if (!cleared.ok) throw new Error(failureNote('清空输入框', cleared))
-        messages.push('已清空输入框')
+        const cleared = await clearFocusedField(device)
+        messages.push(cleared.note)
       }
       if (args.text !== undefined) {
         const wanted = String(args.text)
@@ -3362,6 +3438,7 @@ export function apply(ctx, config) {
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
               scroll_to: { type: 'string', description: '先边滑边找这段文字，找到就点它；找不到算失败' },
+              wait_ms: { type: 'integer', description: '这一步的目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）' },
               direction: { type: 'string', description: 'scroll_to 的滑动方向：up/down/left/right，默认 up' },
               wait_idle: { type: 'boolean', description: '本步做完等界面静止（动画/加载结束）再核对' },
               swipe: { type: 'array', items: { type: 'integer' }, description: '滑动 [x1,y1,x2,y2,毫秒]' },
@@ -3428,7 +3505,7 @@ export function apply(ctx, config) {
           } else {
             /* 按文字/id 点之前先确认快照还对应现在的界面，页面换了就重新 dump，不拿旧坐标点。 */
             await snapshotForSelector(device)
-            node = nodeForSelector(device, { text: step.tap, id: step.id })
+            node = await awaitNode(device, { text: step.tap, id: step.id }, step.wait_ms)
             /* 快照比软时效还旧时再核一次：控件挪了或没了就报 stale_snapshot，不把一串步骤点到旧位置。 */
             node = await freshNodeFor(device, node)
           }
@@ -5007,7 +5084,7 @@ ctx.effect(() => ctx.tools.register({
         '要等接口返回、跳转或弹窗，传 `wait_for_text` / `wait_for_activity`，不要 sleep 后再截图；`adb_tap` 点完会自己回执界面有没有变，没变就是可疑信号（被挡住/没点中/还在动画）。',
         '连着做的一串动作（点开→等加载→输入→发送、或先回桌面再进目标页）用 `adb_do` 一次调用跑完，比一步一调少好几个回合；每一步可带 `assert_text` / `assert_gone` 核对，也可带 `wait_all`（几段文字全出现）/ `wait_any`（任一出现就算过，加载完或报错弹窗两种结局都往下走），失败会停在那一步并报出当前页面和屏上的文字。',
         '只想知道「刚才点了之后变了什么」用 `adb_ui changed_only=true`（只给新增/消失的行）。桌面、返回、最近任务、锁屏、亮屏、转屏、通知栏、夜间模式用 `adb_action` 一条命令，不要再去界面里找按钮。',
-        '点击用 `adb_tap`（ref / 文字 / id，自己或最近可点祖先里挑更准的落点；ref 来自最近一次 `adb_ui`），不确定有哪些就先 `adb_find`（一次拿全部命中 + ref + 坐标），列表里找不到用 `adb_scroll_to` 边滑边找；输入用 `adb_input`，装包启停用 `adb_app`。要拖拽、曲线滑、按住再拖这种手指轨迹，用 `adb_gesture`（逐点 DOWN/MOVE/UP，比 `input swipe` 的直线更像真人）。顶部状态、开关这类一步就能改的，直接 `adb_sh`（如 `settings put system font_scale 1.15`、`svc wifi enable`、`pm grant`），比点 UI 快且不会点歪。设备已 root 时 `adb_sh root=true cmd="cat /data/data/<包名>/shared_prefs/x.xml"` 能直接读应用存储、数据库、dropbox —— 状态类问题先读存储，比走 UI 点进去更准。',
+        '点击用 `adb_tap`（ref / 文字 / id，自己或最近可点祖先里挑更准的落点；ref 来自最近一次 `adb_ui`；目标还没出现会自己等最多 900ms，可用 `wait_ms` 调），不确定有哪些就先 `adb_find`（一次拿全部命中 + ref + 坐标），列表里找不到用 `adb_scroll_to` 边滑边找；输入用 `adb_input`，装包启停用 `adb_app`。要拖拽、曲线滑、按住再拖这种手指轨迹，用 `adb_gesture`（逐点 DOWN/MOVE/UP，比 `input swipe` 的直线更像真人）。顶部状态、开关这类一步就能改的，直接 `adb_sh`（如 `settings put system font_scale 1.15`、`svc wifi enable`、`pm grant`），比点 UI 快且不会点歪。设备已 root 时 `adb_sh root=true cmd="cat /data/data/<包名>/shared_prefs/x.xml"` 能直接读应用存储、数据库、dropbox —— 状态类问题先读存储，比走 UI 点进去更准。',
         '`adb_shot` 只在这些时候用：颜色/布局/相机扫码画面/图表，或文本树几乎全是空节点（Flutter、自绘、部分 WebView）。图缩到长边 900px，配 `read_image` 看。「文本树看着是空的」先别急着截图：`adb_ui` 发现可读文字少于 4 个会自动跑一次 macOS 视觉 OCR，把识别出的文字当成可点击节点补进树里（来源标记 `+ocr`），慢 200ms 但省掉一次截图回合。',
         '动效问题用 `adb_anim`：给 ref/text/id 加时长和 fps，采样期间可以带 `trigger`（tap/swipe/text/action）点一下触发动画，回来的是尺寸/位置时间线 + 抖动次数、超调、帧间步长、稳定时间，比连拍截图准，也不用读图。局限：它读的是控件树坐标，列表滚动、页面转场这类合成器动画坐标可能不动，那种情况改成 `adb_mirror` 里的帧序列看。',
         '卡顿、被杀、内存涨用 `adb_proc`（top / mem / list），别截图猜。内嵌 H5 定位不准用 `adb_web`（CDP 直读 DOM，返回 CSS 矩形和换算后的设备坐标，可直接喂 `adb_tap point=`）；App 没开 WebView 调试时会明确报错。',
