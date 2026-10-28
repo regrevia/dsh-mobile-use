@@ -9,8 +9,9 @@
  * 画面、录制、标注落盘都在宿主那半边，这里只负责画出来和收集人的动作。
  */
 
-/* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。 */
-window.__ADBM_BUILD = '152'
+/* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。
+   必须和 client.rev 一致，selftest 会核对；不一致时页面只换一次就停，不来回重载。 */
+window.__ADBM_BUILD = '154'
 
 window.__ModuleLoader__.load({
   id: 'dsh-mobile-use',
@@ -629,6 +630,15 @@ window.__ModuleLoader__.load({
               setReady(state?.live === true)
               const build = String(state?.build ?? '')
               if (build !== '' && build !== window.__ADBM_BUILD) {
+                /* 换一次代码就够：换完还是对不上，是两边的版本号本身不一致，再换就是整页死循环。 */
+                const seen = `adbm-stale:${window.__ADBM_BUILD}->${build}`
+                let tried = 0
+                try { tried = Number(sessionStorage.getItem(seen) ?? 0) } catch { tried = 0 }
+                if (tried >= 1) {
+                  setStatus('页面代码没有更新，重新打开这一栏')
+                  return
+                }
+                try { sessionStorage.setItem(seen, '1') } catch { /* 存不了就只靠这一轮的上限 */ }
                 setStatus('正在载入新版本…')
                 window.location.reload()
               }

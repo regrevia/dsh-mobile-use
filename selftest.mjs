@@ -357,6 +357,17 @@ try {
 } catch (error) {
   bad('/state 请求失败', String(error?.message ?? error).slice(0, 80))
 }
+try {
+  /* 两边各写一份版本号，谁改了另一份没跟上，页面就会一直拿旧代码和自己的版本对不上：
+     这种不一致只有对着看才会发现，所以单独比一份，不一致就当场失败。 */
+  const want = String(fs.readFileSync(new URL('./client.rev', import.meta.url), 'utf8')).trim()
+  const page = fs.readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+  const declared = /__ADBM_BUILD\s*=\s*'([^']*)'/.exec(page)?.[1] ?? ''
+  if (declared === want) ok('client.js 与 client.rev 同号', declared)
+  else bad('client.js 版本没跟上 client.rev', `client.js=${declared} client.rev=${want}`)
+} catch (error) {
+  bad('客户端版本号读不出来', String(error?.message ?? error).slice(0, 80))
+}
 
 if (failures.length > 0) {
   console.log(`\n=== ${failures.length} 项失败 ===`)
