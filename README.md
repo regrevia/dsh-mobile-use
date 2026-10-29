@@ -133,6 +133,7 @@ cd dsh-mobile-use
 | 工具 | 作用 |
 | --- | --- |
 | `adb_ui` | 读界面文本树：`ref`、控件类型、文字、`#资源id`、`@中心坐标`，尾部 `*` 可点击 / `~` 可滚动 / `[x]` 勾选 / `[off]` 不可用。支持 `filter`、`full`、`wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`（替代 sleep + 反复截图） |
+| `adb_wait` | 只等条件、不返回整棵树，省 token：`text` / `id` / `desc` / `gone` / `texts`（全出现）/ `any_texts`（任一出现）/ `activity` / `stable`（界面静止）。超时会说清停在哪个页面、能点什么 |
 | `adb_tap` | 按 `ref` / `text` / `id` / `desc` / `point="x,y"` 点击，`long: true` 长按；可带 `wait_for_text` / `wait_for_id` / `wait_until_gone` 点完直接等结果 |
 | `adb_input` | `text`（ASCII，空格自动转义）、`key`（ENTER/BACK/DEL…）、`swipe`、`clear` |
 | `adb_gesture` | 真人轨迹：`points` 折线逐点 DOWN/MOVE/UP，`duration_ms`、`hold_ms`；曲线拖拽、按住再拖 |

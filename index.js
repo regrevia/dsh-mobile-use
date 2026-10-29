@@ -2920,6 +2920,107 @@ export function apply(ctx, config) {
       }
     },
   }), 'adb: adb_ui')
+  /* 只等条件、不把整棵树端回来：轮询回合里最费 token 的是「sleep 再读一次树」。
+     条件满足立刻返回，超时也返回当下这一屏摘要（能点几个、停在哪个页面），模型不用再读一遍。 */
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_wait',
+    description: '等一个条件成立就返回，不返回整棵控件树：等文字/资源 id/页面出现（text/id/desc/activity）、等某段文字消失（gone）、等几段文字全部出现（texts）、等任意一个出现（any_texts），或者等界面静止（stable）。比 sleep 后 adb_ui 省一大截 token；超时会告诉当下停在哪个页面、能点什么，方便决定下一步。',
+    parameters: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string', description: '设备序列号，只有一台可省略' },
+        text: { type: 'string', description: '等这段文字出现在界面上（子串匹配）' },
+        id: { type: 'string', description: '等这个资源 id 出现（可只写后半段）' },
+        desc: { type: 'string', description: '等这个 content-desc 出现' },
+        gone: { type: 'string', description: '等这段文字从界面上消失（关弹窗、等加载完）' },
+        texts: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等多个条件）' },
+        any_texts: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗）' },
+        activity: { type: 'string', description: '等前台页面切到这个正则，例如 "ScanActivity"' },
+        stable: { type: 'boolean', description: '等界面静止：树签名连续 quiet_ms 不变才算（动画/加载结束）' },
+        quiet_ms: { type: 'integer', description: 'stable 用：连续多久没变化算静止，默认 400' },
+        timeout_ms: { type: 'integer', description: '等待上限，默认 15000' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          satisfied: { type: 'boolean' },
+          stable: { type: ['boolean', 'null'] },
+          quiet_ms: { type: ['integer', 'null'] },
+          activity: { type: 'string' },
+          summary: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'satisfied', 'stable', 'quiet_ms', 'activity', 'summary', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.summary),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const started = Date.now()
+      const want = {
+        text: args.text,
+        id: args.id,
+        desc: args.desc,
+        gone: args.gone,
+        texts: args.texts,
+        any_texts: args.any_texts,
+        activity: args.activity,
+      }
+      const bounded = (value) => Math.min(60_000, Math.max(200, Number(value ?? 15_000)))
+      const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
+      if (!askedCondition && args.stable !== true) {
+        return {
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '',
+          summary: '什么都没等：给 text / id / desc / gone / texts / any_texts / activity，或者 stable=true。',
+          elapsed_ms: Date.now() - started,
+        }
+      }
+      const dumpOptions = { full: false }
+      let state = null
+      let satisfied = true
+      if (askedCondition) {
+        const waited = await waitFor(device, want, bounded(args.timeout_ms))
+        state = waited.state
+        satisfied = waited.matched
+      }
+      let calm = null
+      if (args.stable === true) {
+        const left = Math.max(200, bounded(args.timeout_ms) - (Date.now() - started))
+        calm = await awaitStable(() => dumpState(device, dumpOptions), { quietMs: args.quiet_ms ?? 400, timeoutMs: left })
+        state = calm.state
+        satisfied = satisfied && calm.stable
+      }
+      if (state === null) state = await dumpState(device, dumpOptions)
+      const nodes = Array.isArray(state.nodes) ? state.nodes : []
+      const clickable = nodes.filter((node) => node.clickable).length
+      const focusLine = state.tree.lines.find((line) => /\[f\]/.test(line)) ?? state.tree.lines.find((line) => /\[edit\]/.test(line))
+      const here = `${state.activity || '未知页面'} · ${state.tree.kept}/${state.tree.total} 节点${clickable > 0 ? ` · 可点 ${clickable}` : ''}${focusLine ? ` · 焦点 ${oneLine(focusLine.trim().split(/\s+/).slice(1).join(' '), 24)}` : ''}`
+      const target = normalList([want.text, want.id, want.desc, want.gone, ...(normalList(want.texts)), ...(normalList(want.any_texts))]).join(' / ')
+      const pieces = []
+      if (askedCondition) pieces.push(satisfied ? `等到「${oneLine(target, 30)}」` : `${bounded(args.timeout_ms)}ms 内没等到「${oneLine(target, 30)}」`)
+      if (calm !== null) {
+        pieces.push(calm.stable
+          ? `界面已静止 ${calm.quietMs}ms`
+          : calm.empty ? '一直读不到控件（还在加载或自己画的界面）' : `${calm.ms}ms 内画面还在变`)
+      }
+      pieces.push(here)
+      return {
+        ok: satisfied,
+        satisfied,
+        stable: calm === null ? null : calm.stable,
+        quiet_ms: calm === null ? null : calm.quietMs,
+        activity: state.activity || '',
+        summary: pieces.join(' · '),
+        elapsed_ms: Date.now() - started,
+      }
+    },
+  }), 'adb: adb_wait')
+
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_tap',
