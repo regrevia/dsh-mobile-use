@@ -3860,6 +3860,9 @@ export function apply(ctx, config) {
         percent: { type: 'number', description: '配 direction：行程占框长边的比例，0.1–1，默认 0.7；长列表想小步滑就给 0.3' },
         duration_ms: { type: 'integer', description: '整段耗时，默认 500（direction 滑动默认 320）' },
         hold_ms: { type: 'integer', description: '起点按住多久再移动，默认 0；长按拖动给 500' },
+        wait_for_text: { type: 'string', description: '手滑完等这段文字出现再返回（滑到下一页、刷出新内容时用）' },
+        wait_until_gone: { type: 'string', description: '手滑完等这段文字消失再返回' },
+        timeout_ms: { type: 'integer', description: '等文字的超时，默认 8000' },
       },
       required: [],
       additionalProperties: false,
@@ -3969,11 +3972,17 @@ export function apply(ctx, config) {
         if (!r.ok) throw new Error(failureNote('手势', r))
       }
       lastActions.push({ at: Date.now(), what: `手势 ${points[0].join(',')}→${points[points.length - 1].join(',')}（${duration}ms）` })
-      return {
-        ok: true,
-        message: `手势完成：${points.length} 个控制点 / ${path.length} 步 / 约 ${duration}ms，${Date.now() - started}ms 返回。`,
-        elapsed_ms: Date.now() - started,
+      const base = `手势完成：${points.length} 个控制点 / ${path.length} 步 / 约 ${duration}ms，${Date.now() - started}ms 返回。`
+      const wantText = typeof args.wait_for_text === 'string' ? args.wait_for_text.trim() : ''
+      const wantGone = typeof args.wait_until_gone === 'string' ? args.wait_until_gone.trim() : ''
+      if (wantText !== '' || wantGone !== '') {
+        const limit = Math.min(60_000, Math.max(200, Number(args.timeout_ms) || 8000))
+        const waited = await waitFor(device, { text: wantText || undefined, gone: wantGone || undefined }, limit)
+        const what = wantText !== '' ? `「${wantText}」出现` : `「${wantGone}」消失`
+        const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}`
+        return { ok: true, message: `${base}${tail}。`, elapsed_ms: Date.now() - started }
       }
+      return { ok: true, message: base, elapsed_ms: Date.now() - started }
     },
   }, 'adb_gesture')), 'adb: adb_gesture')
 
