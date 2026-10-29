@@ -7,9 +7,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 现状 | `index.js` 的 `adb_gesture`（约 1449 行）与 `adb_input` 走 `input motionevent DOWN/MOVE/UP`，只有单指；README 第 82 行明确「多指不支持」。侧栏画布 `client.js` 只处理单一 pointer。 |
+| 现状 | `index.js` 的 `adb_gesture`（约 1449 行）与 `adb_input` 走 `input motionevent DOWN/MOVE/UP`，只有单指；README 第 82 行明确「多指不支持」。侧栏画布 `client.js` 只处理单一 pointer。【实测】`vendor/u2.jar` 是 dex 形态（`classes.dex`…`classes4.dex`），全包字符串里没有 `multiPointer`，只有 `PointerCoords`×2、`injectInputEvent`×2、`swipePoints`×1 ⇒ 现成 jar 没有现成的多指 RPC，这条不能靠调用已推送的 jar 直接拿到。 |
 | 竞品做法 | uiautomator2 设备端 `gesture` 支持多指（[uiautomator2](https://github.com/openatx/uiautomator2)）；QtScrcpy 把 multi-touch 列为官方特性（[QtScrcpy](https://github.com/barry-ran/QtScrcpy)）；Appium 用 W3C multi-action（[Appium](https://github.com/appium/appium)）。 |
-| 实现要点 | ① `index.js` 新增 `adb_gesture` 的 `pointers: [[{x,y,t}...], ...]` 形态，优先走已驻留的 u2 设备端（`u2.jar` 已在 `/data/local/tmp/`，见 `index.js` 约 581 行的 push 逻辑），失败回落 `sendevent`（root）。② `mirror.js` 的 `/swipe` 路由扩展成 `/gesture`，保留旧字段向后兼容。③ `client.js`：`Ctrl/⌘+拖动` 生成第二指，双指中心对称缩放，缩放系数按两指间距比算，松手发一次完整轨迹。 |
+| 实现要点 | ① `index.js` 新增 `adb_gesture` 的 `pointers: [[{x,y,t}...], ...]` 形态，先确认设备端 jar 的多指入口（上面实测没有现成字符串，要么改 dex 自己加一个方法，要么只用其中的 `injectInputEvent` 拼 MotionEvent 序列——后者还要 dex 侧加胶水），确认不划算就直接走 `sendevent`（root，需按设备 tslib/协议 B 试参），失败报清楚原因。② `mirror.js` 的 `/swipe` 路由扩展成 `/gesture`，保留旧字段向后兼容。③ `client.js`：`Ctrl/⌘+拖动` 生成第二指，双指中心对称缩放，缩放系数按两指间距比算，松手发一次完整轨迹。 |
 | 预估 | 设备端 1 人日 + 侧栏 1.5 人日，含真机调参 0.5 人日。 |
 | 验收 | 在系统相册对同一张图做捏合：图片缩放从 1.0 到 ≥2.0 且中心不漂移 >5%；`adb_gesture` 返回的注入序列含 2 个 pointer id；真机 20 次捏合成功率 ≥19/20。 |
 
