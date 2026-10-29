@@ -5587,6 +5587,9 @@ ctx.effect(() => ctx.tools.register({
         },
         degrees: { type: 'integer', enum: [0, 90, 180, 270], description: 'rotate 用：指定方向；不写就转到下一个方向' },
         enable: { type: 'boolean', description: 'night_mode 用：true 开夜间模式，false 关' },
+        wait_for_text: { type: 'string', description: '动作之后等这段文字出现再返回（比如按返回后确认回到了列表页）' },
+        wait_until_gone: { type: 'string', description: '动作之后等这段文字消失再返回（比如关掉弹窗确认它真没了）' },
+        timeout_ms: { type: 'integer', description: '等文字的超时，默认 10000' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -5632,6 +5635,15 @@ ctx.effect(() => ctx.tools.register({
       if (!r.ok) throw new Error(failureNote(label, r))
       lastActions.push({ at: Date.now(), what: label })
       if (lastActions.length > 400) lastActions.splice(0, lastActions.length - 400)
+      const wantText = typeof args.wait_for_text === 'string' ? args.wait_for_text.trim() : ''
+      const wantGone = typeof args.wait_until_gone === 'string' ? args.wait_until_gone.trim() : ''
+      if (wantText !== '' || wantGone !== '') {
+        const limit = Math.min(60_000, Math.max(200, Number(args.timeout_ms) || 10_000))
+        const waited = await waitFor(device, { text: wantText || undefined, gone: wantGone || undefined }, limit)
+        const what = wantText !== '' ? `「${wantText}」出现` : `「${wantGone}」消失`
+        const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}`
+        return { ok: true, summary: `${label}完成（${r.ms}ms）；${tail}。`, elapsed_ms: Date.now() - began }
+      }
       return { ok: true, summary: `${label}完成（${r.ms}ms）。界面变化用 adb_ui 确认。`, elapsed_ms: Date.now() - began }
     },
   }, 'adb_action')), 'adb: adb_action')

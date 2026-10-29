@@ -143,7 +143,7 @@ cd dsh-mobile-use
 | `adb_device` | 列设备、状态、型号、当前选中设备与分辨率 |
 | `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
 | `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步；每步可 `retry` 重来注入前的偶发失败；失败时自动留一张截图到 `~/.dsh/adb-evidence/<序列号>/`（只留最近 20 张）；步骤也能带 `until`（等同一控件进入某状态）与 `dismiss`（本步等待时自动点掉挡路弹窗） |
-| `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode` |
+| `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode`；可带 `wait_for_text` / `wait_until_gone`，动作和确认一次调用做完 |
 | `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 「刚才那几秒」的 6 帧拼图：动效比例/位移/卡顿这类单帧看不出的问题用它。优先用直播内存帧，没有就现场录一小段（约 +4.5 s），都不行才回落到磁盘段**并注明「不是刚刚」** |
 | `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |

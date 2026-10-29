@@ -133,6 +133,7 @@
 | XPath 兜底 | 仅当选择器表达不了时用；Appium 自评最慢一档，且要额外 dump+解析，作为「逃生舱」而非主路径 |
 | toast / 系统弹窗文本进树 | Appium `enableNotificationListener`（保留 3 500 ms）；本插件可用 `adb_events` 补，但文本进树更省一次调用 |
 | XPath 定位 | Appium 的 XPath 要多一次服务端往返；uiautomator2 没有 XPath | `adb_find xpath=` 支持 `/` `//`、tag/`*`、`@attr`、`@attr="v"`、`contains(@attr,"v")`、`[n]`、`[last()]`、`not(@attr)`，在已 dump 的节点上本地求值 | 本轮（单测 44 项 + 真机 94 节点 19–266 µs） |
+| 动作后确认 | 按返回/回桌面后还要再调一次 `adb_ui` 或 `adb_wait` | `adb_action` 带 `wait_for_text` / `wait_until_gone` / `timeout_ms`，动作+确认一次调用；超时会说清当前页面 | 本轮 |
 | 失败自动取证 | 竞品都要模型自己再调一次截图/树 | 本插件把 `failureSuffix` 收成统一一句：页面 + 屏上前几行 + 截图路径，`adb_do` / `adb_tap` / `adb_wait` / `adb_find` / `adb_gesture` / `adb_input` / `adb_app` / `adb_sh` / `adb_scroll_to` / `adb_action` 全走它 | 本轮（单测覆盖拼装与去重） |
 | 元素级截图 | u2 元素 `.screenshot()`；用于「这张卡片长什么样」这类必须看图的问题，避免整屏 612–665 ms【实测】 |
 | 组合动作链（W3C 风格） | 长按拖动、双击后滑，一次提交多段轨迹；scrcpy 的 `INJECT_TOUCH_EVENT` 连续帧是参考实现 |
