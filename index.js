@@ -275,7 +275,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms']
+  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -2419,6 +2419,40 @@ async function awaitChange(serial, signature, options = {}) {
 }
 
 /**
+ * 等界面「自己静下来」：树签名连续 quietMs 不变就算稳定（u2 的 wait_stable / Appium 的 idle 等待）。
+ * 读不到任何控件时不算稳定——加载中的空树也会「不变」，那是最容易点错位置的一刻。
+ * @param {() => Promise<any>} dump - 一次 dump，返回带 tree/nodes 的状态。
+ * @param {{quietMs?: number, timeoutMs?: number}} [options] - 静止窗口与总上限。
+ * @returns {Promise<{state: any, stable: boolean, quietMs: number, ms: number, dumps: number, empty: boolean}>} 结果。
+ */
+async function awaitStable(dump, options = {}) {
+  const quietMs = Math.max(120, Number(options.quietMs ?? 400))
+  const timeoutMs = Math.max(quietMs, Number(options.timeoutMs ?? 5000))
+  const began = Date.now()
+  let state = await dump()
+  let previous = state.tree.lines.join('\n')
+  let quietSince = Date.now()
+  let dumps = 1
+  let stable = false
+  const hasContent = () => Array.isArray(state.nodes) && state.nodes.length > 0
+  while (Date.now() - began < timeoutMs) {
+    if (hasContent() && Date.now() - quietSince >= quietMs) {
+      stable = true
+      break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    state = await dump()
+    dumps += 1
+    const now = state.tree.lines.join('\n')
+    if (now !== previous) {
+      previous = now
+      quietSince = Date.now()
+    }
+  }
+  return { state, stable, quietMs, ms: Date.now() - began, dumps, empty: !hasContent() }
+}
+
+/**
  * 点了没反应时，从新快照里当场找出原因，省掉模型再读一遍树的回合。
  * @param {any} state - awaitChange / dumpState 的结果。
  * @param {{x: number, y: number}} point - 点下去的位置。
@@ -2767,7 +2801,8 @@ export function apply(ctx, config) {
         wait_for_activity: { type: 'string', description: '等到前台 Activity 匹配这个正则，例如 "ScanActivity"' },
         wait_until_gone: { type: 'string', description: '等到这段文字从界面上消失，例如等加载提示消失' },
         wait_idle: { type: 'boolean', description: '等界面停止变化（动画/加载结束）再返回，配合 idle_ms' },
-        idle_ms: { type: 'integer', description: 'wait_idle 用：连续多久没变化算静止，默认 400' },
+        wait_stable: { type: 'boolean', description: '同 wait_idle：树签名连续 idle_ms 不变就算稳定' },
+        idle_ms: { type: 'integer', description: 'wait_idle / wait_stable 用：连续多久没变化算静止，默认 400' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 15000' },
         changed_only: { type: 'boolean', description: '只给跟上一棵树不一样的控件行（+ 新增，- 消失），页面几乎没变时省一大截' },
         ocr: { type: 'string', enum: ['auto', 'force', 'off'], description: 'OCR 兜底：auto 只在文本树几乎为空时跑（默认），force 强制加一层 OCR 文字，off 关掉' },
@@ -2784,11 +2819,13 @@ export function apply(ctx, config) {
           tree: { type: 'string' },
           changed: { type: 'boolean' },
           matched: { type: 'boolean' },
+          stable: { type: ['boolean', 'null'] },
+          quiet_ms: { type: ['integer', 'null'] },
           snapshot_id: { type: 'string' },
           generated_at: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['serial', 'activity', 'summary', 'tree', 'changed', 'matched', 'snapshot_id', 'generated_at', 'elapsed_ms'],
+        required: ['serial', 'activity', 'summary', 'tree', 'changed', 'matched', 'stable', 'quiet_ms', 'snapshot_id', 'generated_at', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(`${value.summary}\n${value.tree}`),
@@ -2806,29 +2843,19 @@ export function apply(ctx, config) {
       const shouldWait = Boolean(want.text || want.id || want.activity || want.gone)
       let state
       let matched = true
+      let stability = null
       if (shouldWait) {
         const waited = await waitFor(device, want, args.timeout_ms ?? 15_000)
         state = waited.state
         matched = waited.matched
-      } else if (args.wait_idle === true) {
-        /* 等界面自己静下来：连续 idle_ms 树签名不变就返回，省掉模型 sleep 后再读一次。 */
-        const idleMs = Math.max(120, Number(args.idle_ms ?? 400))
-        const limit = args.timeout_ms ?? 15_000
-        const began = Date.now()
-        let signature = null
-        let stableSince = Date.now()
-        for (;;) {
-          state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, ocr: args.ocr ?? 'auto' })
-          const now = state.tree.lines.join('\n')
-          if (signature !== null && now === signature) {
-            if (Date.now() - stableSince >= idleMs) break
-          } else {
-            signature = now
-            stableSince = Date.now()
-          }
-          if (Date.now() - began >= limit) break
-          await new Promise((resolve) => setTimeout(resolve, 120))
-        }
+      } else if (args.wait_idle === true || args.wait_stable === true) {
+        /* 等界面自己静下来：树签名连续 idle_ms 不变才算稳定，省掉模型 sleep 后再读一次。 */
+        const calmed = await awaitStable(
+          () => dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, ocr: args.ocr ?? 'auto' }),
+          { quietMs: args.idle_ms ?? 400, timeoutMs: args.timeout_ms ?? 15_000 },
+        )
+        state = calmed.state
+        stability = calmed
       } else {
         state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, ocr: args.ocr ?? 'auto' })
       }
@@ -2872,6 +2899,11 @@ export function apply(ctx, config) {
         state.ocrNote ?? '',
         state.changed ? '' : '（与上一次读取相同）',
         shouldWait ? (matched ? `等待命中，${Date.now() - started}ms` : `等待超时 ${args.timeout_ms ?? 15_000}ms，界面未变化`) : '',
+        stability === null ? '' : stability.stable
+          ? `已静止 ${stability.quietMs}ms（${stability.dumps} 次读取，${stability.ms}ms）`
+          : stability.empty
+            ? `没等到画面：${stability.ms}ms 内一直读不到控件，这屏可能还在加载或自己画的，先用 adb_shot 看一眼`
+            : `${stability.ms}ms 内画面还在变（${stability.dumps} 次读取），别按旧坐标点，先重读或加长 idle_ms`,
       ].filter(Boolean).join(' · ')
       return {
         serial: state.serial,
@@ -2880,6 +2912,8 @@ export function apply(ctx, config) {
         tree: shown.join('\n') || '（没有匹配的控件）',
         changed: state.changed,
         matched,
+        stable: stability === null ? null : stability.stable,
+        quiet_ms: stability === null ? null : stability.quietMs,
         snapshot_id: state.snapshotId,
         generated_at: state.generated_at,
         elapsed_ms: Date.now() - started,
@@ -3619,6 +3653,8 @@ export function apply(ctx, config) {
               wait_ms: { type: 'integer', description: '这一步的目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）' },
               direction: { type: 'string', description: 'scroll_to 的滑动方向：up/down/left/right，默认 up' },
               wait_idle: { type: 'boolean', description: '本步做完等界面静止（动画/加载结束）再核对' },
+              wait_stable: { type: 'boolean', description: '同 wait_idle，按树签名连续 idle_ms 不变判定静止' },
+              idle_ms: { type: 'integer', description: 'wait_idle / wait_stable 用：连续多久没变化算静止，默认 400' },
               swipe: { type: 'array', items: { type: 'integer' }, description: '滑动 [x1,y1,x2,y2,毫秒]' },
               key: { type: 'string', description: '按键名：BACK / HOME / ENTER，或 keycode 数字' },
               text: { type: 'string', description: '往焦点输入框输入文字（ASCII 直发，中文走剪贴板粘贴；先点中输入框让它获得焦点）' },
@@ -3743,19 +3779,14 @@ export function apply(ctx, config) {
           done.push(step.action)
         }
 
-        if (step.wait_idle === true) {
-          /* 等界面静止：连续两次 dump 内容一样就算稳定，最多等到本步上限。 */
-          const idleStart = Date.now()
-          let previous = ''
-          while (Date.now() - idleStart < limit) {
-            const seen = await dumpState(device, {})
-            const signature = seen.tree.lines.join('\n')
-            activity = seen.activity
-            if (signature === previous) break
-            previous = signature
-            await new Promise((resolve) => setTimeout(resolve, 200))
-          }
-          done.push(`等静止 ${Date.now() - idleStart}ms`)
+        if (step.wait_idle === true || step.wait_stable === true) {
+          /* 等界面静止：树签名连续 idle_ms 不变才算稳定，最多等到本步上限。 */
+          const calmed = await awaitStable(() => dumpState(device, {}), {
+            quietMs: step.idle_ms ?? 400,
+            timeoutMs: limit,
+          })
+          activity = calmed.state.activity
+          done.push(`等静止 ${calmed.ms}ms${calmed.stable ? '' : calmed.empty ? '（读不到控件）' : '（到点还没静）'}`)
         }
 
         if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined) {
@@ -5320,6 +5351,7 @@ export const __internals = {
   dumpState,
   foregroundActivity,
   waitFor,
+  awaitStable,
   scrollToText,
   scrollToSelector,
   u2Dump,

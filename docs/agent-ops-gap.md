@@ -102,7 +102,9 @@
   `verify:true` 时回读焦点框文本比对，不一致直接报错（比让模型下次 dump 才发现便宜得多）。
 - **验证**：同一输入框连填 20 次 20 字中文，取每次 `elapsed_ms` p50：现状 ~1 500 ms【实测 描述】，目标 < 400 ms；并 `adb_sh cmd="dumpsys input_method | grep mCurMethodId"` 确认通道切换可回滚。
 
-#### P0-4 等「界面稳定」，而不是等固定时长或等某个字符串
+#### P0-4 等「界面稳定」，而不是等固定时长或等某个字符串 —— 已落地（`awaitStable`）
+
+- **落地**：`adb_ui {wait_stable:true|wait_idle:true, idle_ms, timeout_ms}`、`adb_do` 每步 `wait_stable`；判据统一为「树签名连续 `idle_ms` 不变」，空树不算稳定；单测覆盖「一上来就静 / 先变后静 / 一直变 / 读不到控件」四种。
 
 - **为什么**：惯性滚动、页面转场、骨架屏→内容的中间态，是「读到半截 → 点错位置」的主因；模型于是养成 `sleep` 习惯，而 sleep 是固定成本，页慢就失败、页快就浪费。
 - **抄谁**：u2 `Watcher.wait_stable(seconds=5.0, timeout=60.0)`；Appium 的 idle 等待（`waitForIdleTimeout`）；底层判据本插件已有——`adb_motion`/`adb_recent` 就是按帧差量化变化的，把「帧差 < 阈值持续 N 帧」提成 API 即可，不必新造轮子。
@@ -144,8 +146,9 @@
 | 隐式等待 | Appium `implicitlyWait` 是会话级全局开关 | 每个 `adb_tap` / `adb_do` 步默认自带 ≤900ms 有界等待（`wait_ms` 可调），不掩盖歧义与快照过期 | `52545f9` |
 | 清空输入框 | `element.clear()` 走 W3C 一次往返 | 一次 Ctrl+A+DEL（约 120ms，与长度无关）+ 一次核对 dump；自绘控件忽略时退回单次 DEL 连发 | `52545f9` |
 | 步骤预校验 | 走到一半才发现参数写错 | `validateSteps` 在注入前逐条查：动作冲突、regex、`scroll` 范围、`scroll_direction` 取值，一次报清「第几步要改什么」 | `6aad1d1` / `39388c2` |
+| 按方向滑/按框滑 | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | `cb678f2` |
+| 等界面静止 | u2 `wait_stable(seconds=5.0)`；Appium `waitForIdleTimeout` 是会话级 | `awaitStable`：树签名连续 `idle_ms`（默认 400）不变才算静止，`adb_ui {wait_stable}` 与 `adb_do` 每步 `wait_stable` 共用同一判据；读不到控件不算静止（加载中的空树最会骗人），回执直接说「已静止 / 到点还在变 / 一直读不到控件」 | 本轮 |
 
-| 按方向滑/按框滑（`adb_gesture {direction, percent, from}`） | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | 本轮 |
 
 
 ## 崩溃防线（本机真实 OOM 沉淀）

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes, compactTree } = __internals
+const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -385,6 +385,42 @@ it('直连 adb 的内存闸门：并发与预留字节都封顶，排队满了�
   await new Promise((resolve) => setTimeout(resolve, 60))
   const back = await acquireDirect(one)
   back()
+})
+
+const fakeState = (lines) => ({ tree: { lines }, nodes: lines.length === 0 ? [] : [{ text: lines[0] }], activity: 'A' })
+
+it('awaitStable：一上来就不变，立刻算稳定', async () => {
+  let calls = 0
+  const r = await awaitStable(async () => { calls += 1; return fakeState(['1 Button "确定"']) }, { quietMs: 120, timeoutMs: 5000 })
+  assert.equal(r.stable, true)
+  assert.equal(r.empty, false)
+  assert.ok(calls >= 1 && calls <= 3, `calls=${calls}`)
+  assert.ok(r.ms < 1000, `ms=${r.ms}`)
+})
+
+it('awaitStable：先变后静，稳定时返回静下来的那棵树', async () => {
+  /* 前两帧还在变（骨架屏 → 中间态），之后固定在「完成」：必须等它真静下来再把树交出去。 */
+  const frames = [['1 TextView "加载中"'], ['1 TextView "加载中 30%"'], ['1 Button "完成"']]
+  let index = 0
+  const next = () => fakeState(frames[Math.min(index++, frames.length - 1)])
+  const r = await awaitStable(next, { quietMs: 120, timeoutMs: 5000 })
+  assert.equal(r.stable, true)
+  assert.equal(r.state.tree.lines.join(), '1 Button "完成"')
+  assert.ok(r.dumps >= 4, `dumps=${r.dumps}`)
+})
+
+it('awaitStable：一直变就到点报不稳定，不假装稳定', async () => {
+  let n = 0
+  const r = await awaitStable(async () => fakeState([`1 TextView "第 ${n++} 帧"`]), { quietMs: 120, timeoutMs: 320 })
+  assert.equal(r.stable, false)
+  assert.equal(r.empty, false)
+  assert.ok(r.ms >= 300, `ms=${r.ms}`)
+})
+
+it('awaitStable：读不到控件时不算稳定（加载中的空树最会骗人）', async () => {
+  const r = await awaitStable(async () => fakeState([]), { quietMs: 120, timeoutMs: 300 })
+  assert.equal(r.stable, false)
+  assert.equal(r.empty, true)
 })
 
 console.log(`\n${pass} 项通过\n`)
