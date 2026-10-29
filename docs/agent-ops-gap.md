@@ -136,6 +136,7 @@
 | XPath 定位 | Appium 的 XPath 要多一次服务端往返；uiautomator2 没有 XPath | `adb_find xpath=` 支持 `/` `//`、tag/`*`、`@attr`、`@attr="v"`、`contains(@attr,"v")`、`[n]`、`[last()]`、`not(@attr)`，在已 dump 的节点上本地求值 | 本轮（单测 44 项 + 真机 94 节点 19–266 µs） |
 | XPath 全链路 | 只有 find 支持 XPath，点/滑/串流程还得换写法 | `adb_find` / `adb_scroll_to` / `adb_do` 步骤都吃同一个 `xpath`，写一次到处能用 | 本轮 |
 | 范围限定选择 | Appium 靠 XPath 祖先轴绕，u2 没有「只在某块里找」 | `within_ref`/`within_rect` 一个实现两处共用：`selectNodes` 与 `xpath` 都按同一个框裁（按中心点判，框外同名行不会混进来） | 本轮（单测覆盖 ref 缺失报错与裁切） |
+| 行内控件定位 | Appium 要 `xpath` 拼 `//*[@text="行"]/..//*[@text="按钮"]` | `adb_tap` 加 `within_ref`：给行的 ref 就只在这一行里找，文案重复的行不会点错 | 本轮（机制由 `withinBox` 单测覆盖） |
 | 滚动找目标的状态门槛 | 滑到看见就算到，灰着点不动还得再来一轮 | `adb_scroll_to` 加 `until`（要求真的 enabled/clickable 才算到位）与 `dismiss`（挡路弹窗自动点掉，回执说点了什么） | 本轮 |
 | 串流程里的滑动 | 先滑到目标再点要拆两步，目标还不一定真的能点 | `adb_do` 的 `scroll_to` 可写对象：选择器 + 方向 + `until` 状态 + `dismiss` + 滑动次数，一步滑到并点掉 | 本轮（单测覆盖写法校验） |
 | 可失败的步骤 | 竞品靠脚本里 try/catch 自己写 | `adb_do` 每步可写 `on_fail: "continue"`：失败记一笔跳过并继续，返回值带 `skipped` 计数——「有弹窗就点掉，没有就算了」不用拆成两次调用 | 本轮（单测覆盖取值校验） |

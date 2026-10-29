@@ -2505,6 +2505,7 @@ function nodeForSelector(serial, want) {
     clickable: want.clickable,
     enabled: want.enabled,
     index: want.index,
+    within_ref: want.within_ref,
     all: true,
   })
   if (hits.length === 0) {
@@ -3927,6 +3928,7 @@ export function apply(ctx, config) {
       properties: {
         ref: { type: 'integer', description: 'adb_ui 返回的 ref 编号（只对生成它的那次快照有效，界面重新 dump 过就作废）' },
         snapshot_id: { type: 'string', description: '可选：adb_ui 返回的 snapshot_id。带上就校验快照还是不是那次，对不上直接报错，不拿旧 ref 点。' },
+        within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找目标：点列表某一行里的按钮/开关时用（先 adb_find 拿到那一行的 ref）' },
         text: { type: 'string', description: '按钮/文字内容，精确匹配优先，其次包含匹配' },
         id: { type: 'string', description: '资源 id，可写全名或只写后半段，如 login_btn' },
         desc: { type: 'string', description: 'content-desc 内容' },
@@ -4014,6 +4016,7 @@ export function apply(ctx, config) {
             regex: args.regex,
             clickable: args.clickable,
             index: args.index,
+            within_ref: args.within_ref,
             snapshotId: args.snapshot_id,
           }
           try {
