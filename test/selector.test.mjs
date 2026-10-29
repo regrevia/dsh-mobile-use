@@ -560,6 +560,15 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：index 挑第几个匹配（列表里四个「关注」点第二个）', () => {
+  assert.equal(validateSteps([{ tap: '关注', index: 1 }]).ok, true)
+  assert.equal(validateSteps([{ tap: '关注', index: 0 }]).ok, true)
+  assert.equal(validateSteps([{ tap: '关注', index: -1 }]).ok, false)
+  assert.equal(validateSteps([{ tap: '关注', index: 1.5 }]).ok, false)
+  assert.equal(validateSteps([{ tap: '关注', index: 201 }]).ok, false)
+  assert.equal(validateSteps([{ swipe: [1, 2, 3, 4], index: 1 }]).ok, false)
+})
+
 it('adb_do 步骤：找目标的写法对齐 adb_tap（desc / cls / exact / regex）', () => {
   assert.equal(validateSteps([{ tap: '设置', desc: '更多', exact: true }]).ok, true)
   assert.equal(validateSteps([{ cls: 'ImageButton', tap: 'x' }]).ok, true, 'cls 配 tap 可以')

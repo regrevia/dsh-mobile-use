@@ -498,6 +498,11 @@ function validateSteps(steps) {
     if ((step.exact !== undefined || step.regex !== undefined) && used[0] !== 'tap' && used[0] !== 'id') {
       problems.push(`第 ${at} 步 exact / regex 只能配 tap / id 用。`)
     }
+    if (step.index !== undefined) {
+      const nth = Number(step.index)
+      if (!(Number.isInteger(nth) && nth >= 0 && nth <= 200)) problems.push(`第 ${at} 步 index 要从 0 开始的整数。`)
+      else if (used[0] !== 'tap' && used[0] !== 'id') problems.push(`第 ${at} 步 index 只能配 tap / id 用。`)
+    }
     if (step.repeat !== undefined) {
       const times = Number(step.repeat)
       if (!(Number.isInteger(times) && times >= 1 && times <= 20)) problems.push(`第 ${at} 步 repeat 要写 1–20 的整数。`)
@@ -4914,6 +4919,7 @@ export function apply(ctx, config) {
               cls: { type: 'string', description: '按类名点，可只写后半段（配 index 挑第几个）' },
               exact: { type: 'boolean', description: '本步的文字/描述/类名要完全相等，默认包含匹配' },
               regex: { type: 'boolean', description: '把本步的 tap/id/desc/cls 当正则用' },
+              index: { type: 'integer', description: '匹配到多个时点第几个（从 0 开始，默认 0）：列表里四个「关注」按钮点第二个' },
               xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
@@ -5066,6 +5072,7 @@ export function apply(ctx, config) {
               cls: step.cls,
               exact: step.exact === true,
               regex: step.regex === true,
+              index: step.index,
               within_ref: step.within_ref,
               within_rect: step.within_rect,
             }
