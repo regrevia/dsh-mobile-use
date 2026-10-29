@@ -473,7 +473,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'xpath', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'wait_for_xpath', 'wait_xpath_gone', 'assert_text', 'assert_gone', 'assert_xpath', 'assert_xpath_gone', 'assert_count_min', 'assert_no_crash', 'sleep_ms', 'until', 'dismiss']
+  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'wait_activity_gone', 'wait_for_xpath', 'wait_xpath_gone', 'assert_text', 'assert_gone', 'assert_xpath', 'assert_xpath_gone', 'assert_count_min', 'assert_no_crash', 'sleep_ms', 'until', 'dismiss']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -594,6 +594,13 @@ function validateSteps(steps) {
         problems.push(`第 ${at} 步 wait_activity 要写页面正则，例如 "MainActivity"。`)
       } else {
         try { new RegExp(step.wait_activity, 'i') } catch { problems.push(`第 ${at} 步 wait_activity 不是合法正则：${step.wait_activity}`) }
+      }
+    }
+    if (step.wait_activity_gone !== undefined) {
+      if (typeof step.wait_activity_gone !== 'string' || step.wait_activity_gone.trim() === '') {
+        problems.push(`第 ${at} 步 wait_activity_gone 要写页面正则，例如 "SplashActivity"。`)
+      } else {
+        try { new RegExp(step.wait_activity_gone, 'i') } catch { problems.push(`第 ${at} 步 wait_activity_gone 不是合法正则：${step.wait_activity_gone}`) }
       }
     }
     for (const key of ['wait_all', 'wait_any']) {
@@ -1835,6 +1842,8 @@ function matches(state, want) {
   const present = (needle) => (needle ? hit(needle) : true)
   const absent = (needle) => (needle ? !hit(needle) : true)
   if (want.activity && !new RegExp(want.activity, 'i').test(state.activity)) return false
+  /* 离开某页：登录页/启动页已经翻过去，等价于等「页面不再匹配这个正则」。 */
+  if (want.activity_gone && new RegExp(want.activity_gone, 'i').test(state.activity)) return false
   if (want.pkg) {
     const pkg = String(want.pkg).toLowerCase()
     const somewhere = String(state.activity || '').toLowerCase().includes(pkg)
@@ -3916,6 +3925,8 @@ export function apply(ctx, config) {
         text: { type: 'string', description: '等这段文字出现在界面上（子串匹配）' },
         id: { type: 'string', description: '等这个资源 id 出现（可只写后半段）' },
         desc: { type: 'string', description: '等这个 content-desc 出现' },
+        activity: { type: 'string', description: '等前台 Activity 匹配这个正则（同 adb_ui 的 wait_for_activity）' },
+        activity_gone: { type: 'string', description: '等前台 Activity 不再是这个正则：离开启动页/登录页再往下走，比猜文字稳' },
         gone: { type: 'string', description: '等这段文字从界面上消失（关弹窗、等加载完）' },
         xpath: { type: 'string', description: '等这个 XPath 命中（同 adb_find 写法），结构定位用' },
         xpath_gone: { type: 'string', description: '等这个 XPath 不再命中（列表清空、浮层收起）' },
@@ -3973,6 +3984,7 @@ export function apply(ctx, config) {
         texts: args.texts,
         any_texts: args.any_texts,
         activity: args.activity,
+        activity_gone: args.activity_gone,
         until: args.until,
         xpath: args.xpath,
         xpath_gone: args.xpath_gone,
@@ -4961,6 +4973,7 @@ export function apply(ctx, config) {
               wait_text: { type: 'string', description: '等这段文字出现再做下一步' },
               wait_gone: { type: 'string', description: '等这段文字消失再做下一步' },
               wait_activity: { type: 'string', description: '等前台页面切到这个正则再做下一步，例如 "ScanActivity"' },
+              wait_activity_gone: { type: 'string', description: '等前台页面不再是这个正则（离开启动页/登录页再往下走）' },
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               until: { type: 'string', enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'], description: '配 wait_text / assert_text：等同一个控件进入这个状态才算过（灰按钮不会误判成可点）' },
@@ -5160,6 +5173,7 @@ export function apply(ctx, config) {
             texts: step.wait_all,
             any_texts: step.wait_any,
             activity: step.wait_activity,
+            activity_gone: step.wait_activity_gone,
             xpath: step.wait_for_xpath,
             xpath_gone: step.wait_xpath_gone,
             until: step.until,

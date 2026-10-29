@@ -560,6 +560,17 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('等页面离开：activity_gone 与 activity 互补', () => {
+  const state = { activity: 'com.demo/.SplashActivity', nodes: [] }
+  assert.equal(matches(state, { activity_gone: 'SplashActivity' }), false, '还停在启动页')
+  assert.equal(matches(state, { activity_gone: 'MainActivity' }), true, '已经不在 MainActivity')
+  assert.equal(matches(state, { activity: 'Splash' }), true)
+  assert.equal(matches(state, { activity: 'Main' }), false)
+  assert.equal(validateSteps([{ tap: '登录', wait_activity_gone: 'SplashActivity' }]).ok, true)
+  assert.equal(validateSteps([{ tap: '登录', wait_activity_gone: '(' }]).ok, false, '坏正则要拦')
+  assert.equal(validateSteps([{ tap: '登录', wait_activity_gone: '' }]).ok, false)
+})
+
 it('adb_do 步骤：index 挑第几个匹配（列表里四个「关注」点第二个）', () => {
   assert.equal(validateSteps([{ tap: '关注', index: 1 }]).ok, true)
   assert.equal(validateSteps([{ tap: '关注', index: 0 }]).ok, true)
