@@ -20,6 +20,15 @@
 - MIUI 设置分屏：`adb_do [{scroll_to:"关于手机",direction:"up"},{wait_idle:true},{assert_text:"关于手机"}]` 应通过。
 - 收尾 `adb_action home`。
 
+## 2.5 新等待/输入（本轮新增，未在设备上验过）
+
+- `adb_do [{tap:"设置"},{wait_stable:true},{assert_text:"设置"}]`：每步回执里有「等静止 xxxms」。
+- `adb_wait {text:"WLAN",timeout_ms:3000}` 与 `adb_wait {stable:true}`：命中时 `matched:true`，超时时带一次 OCR 兜底后的页面摘要。
+- `adb_tap {ref:n,wait_stable:true}`：回执里除「界面已变化」外还有静止耗时。
+- `adb_input {text:"hello",submit:"enter"}`：一次调用同时有输入回执和提交结果。
+- `adb_input {text:"你好",ime:"adb"}`：改成 ADBKeyboard 上屏后切回原输入法（`settings get secure default_input_method` 复核）。
+- 注意：共用宠物设备上不要跑 `ime set`，只跑只读的 `ime list` / 默认输入法查询。
+
 ## 3. 回归
 
 - `npm test` → 21 项通过；`node ~/.dsh/tools/style-lint.mjs .` → 通过。
