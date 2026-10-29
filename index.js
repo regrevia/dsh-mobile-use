@@ -3972,6 +3972,7 @@ export function apply(ctx, config) {
         wait_for_xpath: { type: 'string', description: '点完等这个 XPath 命中（列表行、结构化结果）' },
         wait_xpath_gone: { type: 'string', description: '点完等这个 XPath 不再命中（弹层收起）' },
         shot: { type: 'boolean', description: '点完留一张截图（返回绝对路径）：要看颜色、自绘界面、弹窗样式时用，省一次 adb_shot' },
+        tree: { type: 'boolean', description: '点完把最新整棵树也带回来（这次本来就为判变化读过，不多花设备时间）：ref 属于这份新快照，接着点下一项不用再 adb_ui' },
         scroll: { type: 'integer', description: '目标不在当前屏时最多滑几次（1–15）：滑到就点，滑不到报错。只在按文字/id/描述/类名找时有效' },
         scroll_direction: { type: 'string', description: '边滑边找的手指方向：up/down/left/right，默认 up（把下面的内容拉上来）' },
         wait_ms: { type: 'integer', description: '目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）：点早了不用再来一轮' },
@@ -3999,6 +4000,8 @@ export function apply(ctx, config) {
             required: ['path', 'bytes'],
             additionalProperties: false,
           },
+          tree: { type: ['string', 'null'], description: 'tree=true 时的新树（ref 属于这份快照）' },
+          snapshot_id: { type: ['string', 'null'], description: 'tree=true 时新树的快照编号' },
           stable: { type: ['boolean', 'null'], description: 'wait_stable 时：是否等到了静止' },
           quiet_ms: { type: ['integer', 'null'] },
           scrolled: { type: 'integer', description: '为了找到目标滑了几次；没滑就不出现' },
@@ -4179,11 +4182,13 @@ export function apply(ctx, config) {
       let shot = null
       if (changed === false) shot = await captureEvidence(device, 'tap-miss')
       else if (args.shot === true) shot = await captureEvidence(device, 'adb_tap')
+      /* 判变化那次已经读过树了，顺手把它交出去：ref 属于这份新快照，接着点下一项不用再单独 adb_ui。 */
+      const freshTree = args.tree === true && after !== null ? after.tree.lines.join('\n') : null
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
       const slid = scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''
-      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}${shot === null ? '' : ` · 截图 ${shot.path}`}`
+      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}${freshTree === null ? '' : ' · 已附新树，ref 可直接接着用'}${shot === null ? '' : ` · 截图 ${shot.path}`}`
       return {
-        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs, reason, delta, shot,
+        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs, reason, delta, shot, tree: freshTree, snapshot_id: after?.snapshotId ?? null,
         ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started,
       }
     },
