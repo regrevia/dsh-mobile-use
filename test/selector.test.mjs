@@ -432,4 +432,22 @@ it('retryBudget：不给就只跑一次，retry 夹在 0–3', () => {
   assert.equal(retryBudget(null), 1)
 })
 
+it('depth 只列到第 N 层：深树先看骨架，别让容器吃满行数', () => {
+  const node = (over) => ({
+    cls: 'android.widget.TextView', text: '', desc: '', id: '', clickable: false, longClickable: false,
+    scrollable: false, checked: false, selected: false, focused: false, enabled: true, password: false,
+    depth: 1, x1: 0, y1: 0, x2: 100, y2: 40, ...over,
+  })
+  const nodes = [
+    node({ text: '设置', depth: 2 }),
+    node({ text: 'WLAN', depth: 3, y1: 40, y2: 80 }),
+    node({ text: '很深的说明', depth: 9, y1: 80, y2: 120 }),
+  ]
+  assert.equal(compactTree(nodes, {}).kept, 3)
+  const shallow = compactTree(nodes, { depth: 3 })
+  assert.equal(shallow.kept, 2)
+  assert.ok(!shallow.lines.join('\n').includes('很深的说明'))
+  assert.equal(compactTree(nodes, { depth: 0 }).kept, 0)
+})
+
 console.log(`\n${pass} 项通过\n`)

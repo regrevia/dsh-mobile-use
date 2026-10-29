@@ -148,6 +148,7 @@
 | 步骤预校验 | 走到一半才发现参数写错 | `validateSteps` 在注入前逐条查：动作冲突、regex、`scroll` 范围、`scroll_direction` 取值，一次报清「第几步要改什么」 | `6aad1d1` / `39388c2` |
 | 按方向滑/按框滑 | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | `cb678f2` |
 | 输完直接提交 | u2 有 `press('search')`，Appium 的 `mobile: performEditorAction` | `adb_input {submit:"enter"|"search"}` 在打字同一次调用里发 66/84 键，省一个回合 | 本轮 |
+| 截断与层级可见 | Appium `pageSource` 给全量但巨长；u2 无层级开关 | `adb_ui` 在行数打满时明说「已截断：只列了 k/t 个节点」并给收窄办法，`depth` 只要骨架，别让容器吃满 400 行 | 本轮 |
 | 中文上屏走输入法广播 | ADBKeyboard / u2 `send_keys`、Appium `setText` 的 IME 通道（~200 ms 上屏） | `adb_input {ime:"adb"}` / `adb_do` 每步 `ime`：装了 ADBKeyboard 时一次 `am broadcast ADB_INPUT_B64` 整段上屏，默认 `auto` 只在它已是当前输入法时才用、绝不悄悄改用户输入法，`adb` 明确切换并切回；没读回文字就报错，绝不二次粘贴 | 本轮 |
 | 每步安全重试 | Appium 的 `implicit waits` + 重试插件、u2 的 `wait(timeout)` 循环 | `adb_do` 每步 `retry`（0–3）只重来「还没注入」的失败：查询超时/快照失效能自愈，已点过/打过字再失败直接报错，绝不重复注入 | 本轮 |
 | 超时前的 OCR 兜底 | 无对照（竞品的定位器直接吃无障碍文本） | 轮询为快不跑 OCR，但超时前补一次带 OCR 的读再判「没有」：自绘界面不会把「有」判成「没有」 | 本轮 |

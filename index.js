@@ -1441,6 +1441,8 @@ function interesting(node, full) {
 function compactTree(nodes, options) {
   const full = options.full === true
   const maxNodes = Math.min(Math.max(options.maxNodes ?? MAX_NODES.default, 1), MAX_NODES.max)
+  /* 只列到第 N 层：设置页那种「一层套一层」的树上，深处全是容器和图标，先看骨架再往里翻。 */
+  const maxDepth = Number.isFinite(Number(options.depth)) ? Number(options.depth) : Infinity
   const lines = []
   const refs = []
   /** 每个深度上正在打开的容器签名，用来消除父子重复文字。 */
@@ -1450,7 +1452,7 @@ function compactTree(nodes, options) {
     const signature = `${node.text}\u0000${node.desc}\u0000${node.id}`
     ancestors.length = Math.min(ancestors.length, node.depth)
     const duplicated = (node.text || node.desc) && ancestors.includes(signature)
-    if (!duplicated && interesting(node, full) && kept < maxNodes) {
+    if (!duplicated && node.depth <= maxDepth && interesting(node, full) && kept < maxNodes) {
       const text = oneLine(node.text, 42)
       const desc = oneLine(node.desc, 32)
       const id = node.id ? shortId(node.id) : ''
@@ -2902,6 +2904,7 @@ export function apply(ctx, config) {
         filter: { type: 'string', description: '只返回包含这段文字的控件行（不区分大小写）' },
         full: { type: 'boolean', description: '连没有文字的结构容器也返回，用于排查布局；默认只给有文字/可点击的节点' },
         max_nodes: { type: 'integer', description: `最多返回多少行，默认 ${MAX_NODES.default}` },
+        depth: { type: 'integer', description: '只列到第 N 层：设置页那种深树先看骨架，深处容器和图标不占行' },
         wait_for_text: { type: 'string', description: '等到界面上出现这段文字再返回（子串匹配），配合 timeout_ms' },
         wait_for_id: { type: 'string', description: '等到界面上出现这个资源 id（子串匹配）' },
         wait_for_activity: { type: 'string', description: '等到前台 Activity 匹配这个正则，例如 "ScanActivity"' },
@@ -2963,7 +2966,7 @@ export function apply(ctx, config) {
         state = calmed.state
         stability = calmed
       } else {
-        state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, ocr: args.ocr ?? 'auto' })
+        state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, depth: args.depth, ocr: args.ocr ?? 'auto' })
       }
       const lines = state.tree.lines
       const filtered = args.filter
@@ -2994,6 +2997,10 @@ export function apply(ctx, config) {
       const scrollable = lines.filter((line) => line.includes('~')).length
       const focusLine = lines.find((line) => /\[f\]/.test(line))
         ?? lines.find((line) => /\[edit\]/.test(line) || /EditText/.test(line))
+      const nodeCap = Math.min(Math.max(args.max_nodes ?? MAX_NODES.default, 1), MAX_NODES.max)
+      const clipped = state.tree.kept >= nodeCap && state.tree.total > state.tree.kept
+        ? `已截断：只列了 ${state.tree.kept}/${state.tree.total} 个节点，用 filter 收窄、depth 限量，或把 max_nodes 调大（上限 ${MAX_NODES.max}）`
+        : ''
       const digest = state.tree.kept === 0
         ? '文本树为空（游戏或自绘界面）：用 adb_shot 看画面，动效差异用 adb_motion 量'
         : [`可点 ${clickable}`, scrollable > 0 ? `可滚 ${scrollable}` : '', focusLine ? `焦点 ref${focusLine.trim().split(/\s+/)[0]} ${oneLine(focusLine.trim().split(/\s+/).slice(1).join(' '), 30)}` : ''].filter(Boolean).join(' / ')
@@ -3003,6 +3010,7 @@ export function apply(ctx, config) {
         digest,
         state.source === 'uiautomator2' ? '' : `· 来源 ${state.source}`,
         state.ocrNote ?? '',
+        clipped,
         state.changed ? '' : '（与上一次读取相同）',
         shouldWait ? (matched ? `等待命中，${Date.now() - started}ms` : `等待超时 ${args.timeout_ms ?? 15_000}ms，界面未变化`) : '',
         stability === null ? '' : stability.stable
