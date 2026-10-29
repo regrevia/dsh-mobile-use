@@ -44,6 +44,7 @@ const EXPECTED = [
   'adb_state', 'adb_device', 'adb_mirror',
   'adb_file',
   'adb_pinch',
+  'adb_record',
 ]
 
 /** 递归查 schema：类型得认识、required 得真在 properties 里、不许有 undefined 描述。 */

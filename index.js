@@ -280,6 +280,37 @@ function pinchArgs(mode, percent, steps) {
   return { method, params: [Math.round(rawPercent), Math.round(rawSteps)] }
 }
 
+
+/**
+ * 录一段屏幕：设备端 screenrecord 跑满时长自己退，再把 mp4 取回宿主并删掉设备上的副本。
+ * 只观察不注入，所以前台是谁都能录。
+ * @param {string} serial - 设备序列号。
+ * @param {number} seconds - 录多久，2–30 秒。
+ * @param {number} [bitRateMbps] - 码率，默认 8 Mbps。
+ * @returns {Promise<{ok: boolean, path?: string, bytes?: number, seconds: number, note?: string}>} 结果。
+ */
+async function recordScreen(serial, seconds, bitRateMbps = 8) {
+  const limit = Math.min(30, Math.max(2, Math.round(Number(seconds) || 5)))
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const name = `dsh-rec-${stamp}.mp4`
+  const remote = `/sdcard/Download/${name}`
+  const run = await adb(['-s', serial, 'shell', 'screenrecord', '--time-limit', String(limit), '--bit-rate', String(Math.round(Math.min(50, Math.max(1, bitRateMbps)) * 1_000_000)), remote], { timeout: (limit + 25) * 1000 })
+  if (!run.ok) return { ok: false, seconds: limit, note: `screenrecord 起不来：${oneLine(run.out || run.err, 160)}` }
+  const sized = await adb(['-s', serial, 'shell', 'stat', '-c', '%s', remote], { timeout: 12_000 })
+  const bytes = Number(String(sized.out ?? '').trim())
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    await adb(['-s', serial, 'shell', 'rm', '-f', remote], { timeout: 8000 })
+    return { ok: false, seconds: limit, note: `录完没拿到文件大小，设备上可能没生成：${oneLine(sized.out || sized.err, 160)}` }
+  }
+  const dir = join(homedir(), '.dsh', 'adb-record', serial)
+  await mkdir(dir, { recursive: true })
+  const path = join(dir, name)
+  const pulled = await adb(['-s', serial, 'pull', remote, path], { timeout: 60_000, direct: true, buffer: 4 << 20 })
+  await adb(['-s', serial, 'shell', 'rm', '-f', remote], { timeout: 8000 })
+  if (!pulled.ok) return { ok: false, seconds: limit, note: `录制成功但取回失败：${oneLine(pulled.out || pulled.err, 160)}` }
+  return { ok: true, path, bytes, seconds: limit }
+}
+
 /**
  * 设备列表。`adb devices -l` 顺带给出型号，便于在错误信息里说清是哪台。
  * @returns {Promise<Array<{serial: string, state: string, model: string}>>} 设备。
@@ -6045,6 +6076,49 @@ ctx.effect(() => ctx.tools.register({
     },
   }), 'adb_pinch')
 
+  /* 录屏：Appium 的 startRecordingScreen 等价物，一次调用录完 + 取回 + 清设备副本。
+     只读观察，不动前台；返回宿主上的绝对路径，可直接给用户或 ffmpeg 再切。 */
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_record',
+    description: '录一段屏幕并取回宿主：`seconds` 给 2–30 秒，阻塞到录完（默认 5 秒），返回 mp4 绝对路径与字节数。只观察不注入，前台是哪个应用都行；录完自动删设备上的临时文件。看动效、复现路径、给用户交付现场都用它。',
+    parameters: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string', description: '设备序列号，只有一台可省略' },
+        seconds: { type: 'integer', description: '录多久，2–30 秒，默认 5' },
+        bit_rate_mbps: { type: 'number', description: '码率，1–50 Mbps，默认 8；画面动得快就调大' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          path: { type: ['string', 'null'], description: '宿主上的 mp4 绝对路径，失败时为 null' },
+          bytes: { type: 'integer' },
+          seconds: { type: 'integer' },
+          message: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'path', 'bytes', 'seconds', 'message', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const started = Date.now()
+      const made = await recordScreen(device, args.seconds, args.bit_rate_mbps)
+      const elapsed = Date.now() - started
+      if (!made.ok) {
+        return { ok: false, path: null, bytes: 0, seconds: made.seconds, message: `${made.note}；${elapsed}ms。`, elapsed_ms: elapsed }
+      }
+      const size = made.bytes >= 1 << 20 ? `${(made.bytes / (1 << 20)).toFixed(1)}MB` : `${Math.round(made.bytes / 1024)}KB`
+      return { ok: true, path: made.path, bytes: made.bytes, seconds: made.seconds, message: `录了 ${made.seconds}s，${size}，已取回宿主；${elapsed}ms。`, elapsed_ms: elapsed }
+    },
+  }), 'adb_record')
+
   ctx.effect(() => ctx.tools.register({
     name: 'adb_shot',
     description: '截一张设备屏幕，缩到长边 900px 后返回文件路径，用 read_image 看。给 `ref` 就只截那个控件（按最近一次 adb_ui 的编号自动裁），给 `region` 截任意一块。只在确实需要看颜色、布局、相机/扫码画面时用；「页面对不对、按钮在不在、有没有报错」用 adb_ui 文本树，快十倍且不花图片 token。scale=0 保留原图。',
@@ -6526,6 +6600,7 @@ ctx.effect(() => ctx.tools.register({
 export const __internals = {
   selectNodes,
   pinchArgs,
+  recordScreen,
   nearMiss,
   collapseSameSpot,
   spotList,
