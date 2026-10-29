@@ -3646,6 +3646,7 @@ export function apply(ctx, config) {
         clear: { type: 'boolean', description: '输入前先清空当前聚焦输入框（END + 多次 DEL）' },
         ime: { type: 'string', enum: ['auto', 'clipboard', 'adb'], description: '中文怎么上屏：auto 默认（已装 ADBKeyboard 且它是当前输入法时走广播，否则剪贴板粘贴）、clipboard 只用剪贴板、adb 明确切到 ADBKeyboard 输完切回' },
         submit: { type: 'string', enum: ['enter', 'search'], description: '输完直接提交：enter 回车（聊天框、表单），search 搜索键（搜索框）。省掉一次 adb_input {key} 往返' },
+        verify: { type: 'boolean', description: '输完读一次树核对文字真的进了输入框（约 150ms）；ASCII 直发默认不读，中文本来就会回读' },
       },
       additionalProperties: false,
     },
@@ -3654,10 +3655,13 @@ export function apply(ctx, config) {
         type: 'object',
         properties: {
           ok: { type: 'boolean' },
+          method: { type: ['string', 'null'], description: '文字上屏走的通道：ime（广播）/ paste（剪贴板）/ input（直发）；只按键或滑动时为 null' },
+          field: { type: 'string', description: '输入框回读到的文字；没回读就是空串' },
+          verified: { type: ['boolean', 'null'], description: '回读是否包含要输入的文字；没回读就是 null' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'message', 'elapsed_ms'],
+        required: ['ok', 'method', 'field', 'verified', 'message', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.message),
@@ -3666,16 +3670,33 @@ export function apply(ctx, config) {
       const device = await serial()
       const started = Date.now()
       const messages = []
+      let method = null
+      let field = ''
+      let verified = null
+      let wanted = null
       if (args.clear) {
         const cleared = await clearFocusedField(device)
         messages.push(cleared.note)
       }
       if (args.text !== undefined) {
-        const wanted = String(args.text)
+        wanted = String(args.text)
         const typed = await inputTextVia(device, wanted, { ime: args.ime })
+        method = typed.how
+        field = typed.field
         lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${wanted.length} 字` : `输入文字 ${wanted.length} 字` })
         messages.push(typed.note)
-        if (typed.field !== '') messages.push(`输入框现在是「${oneLine(typed.field, 40)}」`)
+        /* 直发（ASCII）本来不回读：要核对的多花约 150ms 读一棵树，别让模型自己再补一次 adb_ui。 */
+        if (field === '' && args.verify === true) field = await focusedFieldText(device)
+        if (wanted !== '') {
+          verified = field === '' ? null : field.includes(wanted)
+          if (verified === false) {
+            messages.push(`核对不上：输入框里是「${oneLine(field, 30)}」，可能只进了一部分或焦点不在这个框`)
+          } else if (field !== '') {
+            messages.push(`输入框现在是「${oneLine(field, 40)}」`)
+          } else if (args.verify === true) {
+            messages.push('读完没看到输入框里的文字：可能没点中输入框，或它是自绘输入区')
+          }
+        }
       }
       if (args.submit !== undefined) {
         /* 输完顺手提交：搜索框/聊天框都要这一步，合成一次调用省一个模型回合。 */
@@ -3707,7 +3728,7 @@ export function apply(ctx, config) {
         messages.push(`已滑动 ${values.slice(0, 4).join(',')}（${duration}ms）`)
       }
       if (messages.length === 0) throw new Error('没有要执行的动作：给 text、key、swipe 或 clear 其中之一。')
-      return { ok: true, message: `${messages.join('；')}。`, elapsed_ms: Date.now() - started }
+      return { ok: true, method, field, verified, message: `${messages.join('；')}。`, elapsed_ms: Date.now() - started }
     },
   }), 'adb: adb_input')
 

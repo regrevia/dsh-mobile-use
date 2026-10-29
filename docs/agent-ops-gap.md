@@ -151,6 +151,7 @@
 | 按方向滑/按框滑 | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | `cb678f2` |
 | 输完直接提交 | u2 有 `press('search')`，Appium 的 `mobile: performEditorAction` | `adb_input {submit:"enter"|"search"}` 在打字同一次调用里发 66/84 键，省一个回合 | 本轮 |
 | 失败自动取证 | Appium/STF 的失败截图与 hierarchy 附件 | `adb_do` 失败时除「当前页面 + 屏上文字」外再留一张图到 `~/.dsh/adb-evidence/<序列号>/`（720px JPEG，实测 525ms/28KB，只留最近 20 张）；取证本身失败不影响原报错 | 本轮 |
+| 输入结果可验证 | u2 `set_text` 只回 ack；Appium `send_keys` 不回读 | `adb_input` 回执带 `method` / `field` / `verified`，`verify: true` 让 ASCII 直发也读一次输入框，核对不上直接说「框里现在是 X」 | 本轮 |
 | 带状态的等待 | Appium `ExpectedConditions.elementToBeClickable` / u2 `click_exists(timeout)` | `adb_wait` 新增 `until`：要求「同一个控件」既命中 text/id 又处于 enabled/clickable/checked/focused 才算等到，解决「控件出现了但还灰着」被误判成可点 | 本轮 |
 | 截断与层级可见 | Appium `pageSource` 给全量但巨长；u2 无层级开关 | `adb_ui` 在行数打满时明说「已截断：只列了 k/t 个节点」并给收窄办法，`depth` 只要骨架，别让容器吃满 400 行 | 本轮 |
 | 中文上屏走输入法广播 | ADBKeyboard / u2 `send_keys`、Appium `setText` 的 IME 通道（~200 ms 上屏） | `adb_input {ime:"adb"}` / `adb_do` 每步 `ime`：装了 ADBKeyboard 时一次 `am broadcast ADB_INPUT_B64` 整段上屏，默认 `auto` 只在它已是当前输入法时才用、绝不悄悄改用户输入法，`adb` 明确切换并切回；没读回文字就报错，绝不二次粘贴 | 本轮 |
