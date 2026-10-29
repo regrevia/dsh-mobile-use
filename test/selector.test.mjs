@@ -560,6 +560,23 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：repeat 只认会重复注入的动作，范围 1–20', () => {
+  assert.equal(validateSteps([{ tap: '下一集', repeat: 3 }]).ok, true)
+  assert.equal(validateSteps([{ swipe: [540, 2000, 540, 800, 300], repeat: 5 }]).ok, true)
+  assert.equal(validateSteps([{ key: 'KEYCODE_VOLUME_DOWN', repeat: 2 }]).ok, true)
+  assert.equal(validateSteps([{ 'scroll_to': '评论', repeat: 2 }]).ok, true)
+  assert.equal(validateSteps([{ tap: '下一集', repeat: 1 }]).ok, true)
+  const typing = validateSteps([{ text: '你好', repeat: 3 }])
+  assert.equal(typing.ok, false)
+  assert.match(typing.problems.join(' '), /repeat 只能配/)
+  assert.equal(validateSteps([{ tap: '下一集', repeat: '2' }]).ok, true)
+  for (const bad of [0, 21, 1.5]) {
+    const r = validateSteps([{ tap: '下一集', repeat: bad }])
+    assert.equal(r.ok, false, `repeat=${bad} 应被拒`)
+    assert.match(r.problems.join(' '), /repeat 要写 1–20 的整数/)
+  }
+})
+
 it('crashHint：只有真崩过才在失败信息里提一句', () => {
   assert.equal(crashHint({ ok: true, count: 0, last: '' }), '')
   assert.equal(crashHint({ ok: false, count: -1, last: '' }), '')

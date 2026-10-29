@@ -492,6 +492,13 @@ function validateSteps(steps) {
     if (step.long !== undefined && !['tap', 'id', 'ref', 'xpath'].includes(used[0] ?? '')) {
       problems.push(`第 ${at} 步 long 只能配 tap / id / ref 用。`)
     }
+    if (step.repeat !== undefined) {
+      const times = Number(step.repeat)
+      if (!(Number.isInteger(times) && times >= 1 && times <= 20)) problems.push(`第 ${at} 步 repeat 要写 1–20 的整数。`)
+      else if (times > 1 && !['tap', 'id', 'ref', 'xpath', 'swipe', 'key', 'action', 'scroll_to'].includes(used[0] ?? '')) {
+        problems.push(`第 ${at} 步 repeat 只能配点击 / 滑动 / 按键 / 系统动作 / scroll_to。`)
+      }
+    }
     if (step.ref !== undefined && !(Number.isInteger(step.ref) && step.ref >= 1)) {
       problems.push(`第 ${at} 步 ref 要从 1 开始的整数。`)
     }
@@ -4861,6 +4868,7 @@ export function apply(ctx, config) {
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               until: { type: 'string', enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'], description: '配 wait_text / assert_text：等同一个控件进入这个状态才算过（灰按钮不会误判成可点）' },
+              repeat: { type: 'integer', minimum: 1, maximum: 20, description: '这一步连着做几次（默认 1，最多 20）：连点「下一集」、连滑几屏不用把同一步抄十遍；只能配 tap / id / ref / xpath / swipe / key / action / scroll_to' },
               on_fail: { type: 'string', enum: ['stop', 'continue'], description: '这步失败怎么办：stop 停下报错（默认），continue 记一笔跳过接着跑后面的步骤——适合「有弹窗就点掉，没有就算了」这类允许失败的步骤' },
               dismiss: { type: 'boolean', description: '本步等待被权限/升级弹窗挡住时自动点掉确认按钮（最多 2 次）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
@@ -4925,9 +4933,16 @@ export function apply(ctx, config) {
            点过/打过字之后再重试就是重复注入，宁可报错让人看现场。 */
         const tries = retryBudget(step)
         let attempt = 0
-        for (;;) {
+        stepLoop: for (;;) {
         let injected = false
+        /* 同一步连着来几次：连点「下一集」、连滑几屏，别在 plan 里抄十遍。只认会重复注入的动作，
+           打字/等待/核对重复没有意义，配了就直接说清楚。 */
+        const repeat = Math.min(Math.max(Math.trunc(Number(step.repeat) || 1), 1), 20)
+        if (repeat > 1 && !(step.tap !== undefined || step.id !== undefined || step.ref !== undefined || step.xpath !== undefined || step.swipe !== undefined || step.key !== undefined || step.action !== undefined || step.scroll_to !== undefined)) {
+          throw new Error(`第 ${at} 步：repeat 只能配点击 / 滑动 / 按键 / 系统动作 / scroll_to。`)
+        }
         try {
+        for (let rep = 0; rep < repeat; rep += 1) {
         let node = null
         if (step.scroll_to !== undefined) {
           const target = typeof step.scroll_to === 'string' ? { text: step.scroll_to } : { ...step.scroll_to }
@@ -5088,7 +5103,8 @@ export function apply(ctx, config) {
           const popNote = checked.dismissed.length === 0 ? '' : `，先点掉了 ${checked.dismissed.join('/')}`
           done.push(step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」${stateNote}${popNote}` : `✓「${oneLine(String(step.assert_gone), 16)}」已消失${popNote}`)
         }
-      break
+        }
+      break stepLoop
         } catch (retryable) {
           attempt += 1
           if (injected || attempt >= tries) throw retryable
