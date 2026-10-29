@@ -148,6 +148,7 @@
 | 步骤预校验 | 走到一半才发现参数写错 | `validateSteps` 在注入前逐条查：动作冲突、regex、`scroll` 范围、`scroll_direction` 取值，一次报清「第几步要改什么」 | `6aad1d1` / `39388c2` |
 | 按方向滑/按框滑 | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | `cb678f2` |
 | 输完直接提交 | u2 有 `press('search')`，Appium 的 `mobile: performEditorAction` | `adb_input {submit:"enter"|"search"}` 在打字同一次调用里发 66/84 键，省一个回合 | 本轮 |
+| 每步安全重试 | Appium 的 `implicit waits` + 重试插件、u2 的 `wait(timeout)` 循环 | `adb_do` 每步 `retry`（0–3）只重来「还没注入」的失败：查询超时/快照失效能自愈，已点过/打过字再失败直接报错，绝不重复注入 | 本轮 |
 | 超时前的 OCR 兜底 | 无对照（竞品的定位器直接吃无障碍文本） | 轮询为快不跑 OCR，但超时前补一次带 OCR 的读再判「没有」：自绘界面不会把「有」判成「没有」 | 本轮 |
 | 轮询不跑 OCR | u2 的 `dumpWindowHierarchy` 不含 OCR，没这层浪费 | 等条件/等静止的每一次轮询走 `pollDump`（`ocr:false`）：自绘界面上原先是每读一次多花 1.5 s，现在只有交结果那一次做 OCR | 本轮 |
 | 只等条件的等待工具 | u2 的 `Watcher` 要常驻注册；Appium 只有 `wait`+定位 | `adb_wait` 一次调用等文字/id/描述/消失/多个条件/页面/界面静止，成功只回一句结论（不端回整棵树）；超时回「停在哪个页面、能点几个、焦点在哪」，模型不用再读一次 | 本轮 |

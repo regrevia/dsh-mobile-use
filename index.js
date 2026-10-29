@@ -270,6 +270,15 @@ function oneLine(value, limit) {
  * @param {any[]} steps - adb_do 的 steps。
  * @returns {{ok: boolean, problems: string[]}} problems 是给人看的一句话列表。
  */
+/**
+ * 一步最多跑几次：retry 是「注入前失败再来的次数」，0 表示只跑一次，上限 3。
+ * @param {any} step - 一步。
+ * @returns {number} 尝试次数。
+ */
+function retryBudget(step) {
+  return 1 + Math.min(3, Math.max(0, Number(step?.retry ?? 0) || 0))
+}
+
 function validateSteps(steps) {
   const problems = []
   const list = Array.isArray(steps) ? steps : []
@@ -3780,6 +3789,7 @@ export function apply(ctx, config) {
     description: [
       '一串动作一次调用跑完：点、滑、输入、按键、系统动作、等界面。',
       '每一步都能带上「等它生效」的条件，跑完一次性给结果；适合「点开→等加载→输入→发送」这种连着做的流程，比一步步调工具少好几个回合。',
+      '某一步失败不会把界面留在半路：当场说第几步、停在哪个页面、屏上有什么。每步可写 retry（0–3）重来注入前的偶发失败。',
       'steps 按顺序执行，任何一步失败就停，并报出是哪一步。',
     ].join(' '),
     parameters: {
@@ -3814,6 +3824,7 @@ export function apply(ctx, config) {
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
+              retry: { type: 'integer', minimum: 0, maximum: 3, description: '这一步在「还没点/还没打字」阶段失败时重来几次（默认 0）：查询超时、快照失效这类偶发失败用得上；已经注入过动作再失败就直接报错，不重复点' },
               assert_gone: { type: 'string', description: '这一步做完核对这段文字必须消失' },
               sleep_ms: { type: 'integer', description: '硬等多久（尽量用 wait_text 代替）' },
             },
@@ -3852,6 +3863,13 @@ export function apply(ctx, config) {
       try {
       for (const [index, step] of (args.steps ?? []).entries()) {
         const at = index + 1
+        /* 同一步只在「还没往设备注入任何东西」时重来：查询慢/快照失效这类失败重试有用，
+           点过/打过字之后再重试就是重复注入，宁可报错让人看现场。 */
+        const tries = retryBudget(step)
+        let attempt = 0
+        for (;;) {
+        let injected = false
+        try {
         let node = null
         if (step.scroll_to !== undefined) {
           node = await scrollToText(device, String(step.scroll_to), step.direction)
@@ -3891,6 +3909,7 @@ export function apply(ctx, config) {
             const y = Math.round((hit.y1 + hit.y2) / 2)
             target = { x, y, label: `「${oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)}」@${x},${y}` }
           }
+          injected = true
           const holdMs = step.long === true ? 700 : 0
           const fastStep = holdMs > 0 || fastInput.tap === null ? null : await fastInput.tap(device, target.x, target.y, {})
           if (fastStep === null) {
@@ -3903,6 +3922,7 @@ export function apply(ctx, config) {
         } else if (step.swipe !== undefined) {
           const s4 = step.swipe
           if (!Array.isArray(s4) || s4.length < 4) throw new Error(`第 ${at} 步 swipe 要写 [x1,y1,x2,y2,毫秒]。`)
+          injected = true
           const ms = s4[4] ?? 300
           const fastStep = fastInput.swipe === null ? null : await fastInput.swipe(device, s4[0], s4[1], s4[2], s4[3], ms)
           if (fastStep === null) {
@@ -3911,16 +3931,19 @@ export function apply(ctx, config) {
           }
           done.push(`滑 ${s4[0]},${s4[1]}→${s4[2]},${s4[3]}`)
         } else if (step.key !== undefined) {
+          injected = true
           const code = /^\d+$/.test(String(step.key)) ? String(step.key) : String(step.key).toUpperCase()
           const r = await sh(device, `input keyevent ${code}`, 10_000)
           if (!r.ok) throw new Error(`第 ${at} 步${failureNote(`按键 ${code}`, r)}`)
           done.push(`键 ${code}`)
         } else if (step.text !== undefined) {
           /* 与 adb_input 共用一条路径：ASCII 走 input text，中文走剪贴板粘贴。 */
+          injected = true
           const typed = await inputTextVia(device, String(step.text))
           lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${String(step.text).length} 字` : `输入文字 ${String(step.text).length} 字` })
           done.push(`输入 ${oneLine(String(step.text), 20)}`)
         } else if (step.action !== undefined) {
+          injected = true
           const cmd = ACTION_MAP[step.action]
           if (cmd === undefined) throw new Error(`第 ${at} 步 action 不认识：${step.action}`)
           const r = await sh(device, cmd, 12_000)
@@ -3969,6 +3992,13 @@ export function apply(ctx, config) {
             throw new Error(`第 ${at} 步核对失败：${step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`}${nearMiss(checked.state, { text: step.assert_text })}`)
           }
           done.push(step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」` : `✓「${oneLine(String(step.assert_gone), 16)}」已消失`)
+        }
+      break
+        } catch (retryable) {
+          attempt += 1
+          if (injected || attempt >= tries) throw retryable
+          await new Promise((resolve) => setTimeout(resolve, 200))
+        }
         }
       }
       } catch (error) {
@@ -5496,6 +5526,7 @@ export const __internals = {
   decodeEntities,
   digestLine,
   validateSteps,
+  retryBudget,
   resolveSerial,
   dumpState,
   foregroundActivity,

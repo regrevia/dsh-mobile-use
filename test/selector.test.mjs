@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -421,6 +421,15 @@ it('awaitStable：读不到控件时不算稳定（加载中的空树最会骗�
   const r = await awaitStable(async () => fakeState([]), { quietMs: 120, timeoutMs: 300 })
   assert.equal(r.stable, false)
   assert.equal(r.empty, true)
+})
+
+it('retryBudget：不给就只跑一次，retry 夹在 0–3', () => {
+  assert.equal(retryBudget({}), 1)
+  assert.equal(retryBudget({ retry: 0 }), 1)
+  assert.equal(retryBudget({ retry: 2 }), 3)
+  assert.equal(retryBudget({ retry: 9 }), 4)
+  assert.equal(retryBudget({ retry: -5 }), 1)
+  assert.equal(retryBudget(null), 1)
 })
 
 console.log(`\n${pass} 项通过\n`)
