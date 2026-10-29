@@ -360,4 +360,31 @@ it('swipeLine 按方向与 percent 出直线，默认行程与旧版一致，越
   assert.deepEqual(swipeLine(box, 'up', 0), [50, 110, 50, 90])
   assert.deepEqual(swipeLine(box, 'up', NaN), [50, 170, 50, 30])
 })
+
+it('直连 adb 的内存闸门：并发与预留字节都封顶，排队满了立刻报错', async () => {
+  const one = 8 << 20
+  const first = await acquireDirect(one)
+  const second = await acquireDirect(one)
+  const third = await acquireDirect(one)
+  let fourth = null
+  const pending = acquireDirect(one).then((release) => { fourth = release; return release })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(fourth, null)
+  first()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(typeof fourth, 'function')
+  ;(await pending)()
+  second()
+  third()
+  const held = []
+  for (let index = 0; index < DIRECT_GATE.queueMax; index += 1) {
+    held.push(acquireDirect(one).catch((error) => error))
+  }
+  await assert.rejects(() => acquireDirect(one), /排队 \d+ 条，已经到上限/)
+  for (const item of held) item.then((value) => { if (typeof value === 'function') value() })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  const back = await acquireDirect(one)
+  back()
+})
+
 console.log(`\n${pass} 项通过\n`)

@@ -82,6 +82,64 @@ function toText(value) {
   return Buffer.isBuffer(value) ? value.toString('utf8') : String(value)
 }
 
+/* 直连 adb 子进程的内存闸门：每条子进程都能吃到 maxBuffer（默认 64MB），十几条大输出命令
+   同时跑，峰值就是几百 MB；宿主和插件同一个进程，堆一满整个 DSH 就没了。这里限制同时在跑的
+   子进程数和它们预留的输出上限之和，超了排队；排不上就明确报错，宁可失败也不堆内存。 */
+const DIRECT_GATE = { max: 4, bytes: 24 << 20, queueMax: 16, waitMs: 30_000 }
+let directRunning = 0
+let directReserved = 0
+const directQueue = []
+
+/**
+ * 释放一条直连子进程的额度，并叫醒下一个排队的调用。
+ * @param {number} reserved - 这条命令预留的字节数。
+ */
+function releaseDirect(reserved) {
+  directReserved = Math.max(0, directReserved - reserved)
+  directRunning = Math.max(0, directRunning - 1)
+  const next = directQueue.shift()
+  if (next !== undefined) next()
+}
+
+/**
+ * 申请直连 adb 的内存额度。
+ * @param {number} reserved - 预留字节数。
+ * @returns {Promise<() => void>} 释放函数；申请不到时 reject。
+ */
+function acquireDirect(reserved) {
+  const need = Math.min(reserved, DIRECT_GATE.bytes)
+  return new Promise((resolve, reject) => {
+    const take = () => {
+      if (directRunning < DIRECT_GATE.max && directReserved + need <= DIRECT_GATE.bytes) {
+        directRunning += 1
+        directReserved += need
+        resolve(() => releaseDirect(need))
+        return true
+      }
+      return false
+    }
+    if (take()) return
+    if (directQueue.length >= DIRECT_GATE.queueMax) {
+      reject(new Error(`adb 直连命令排队 ${directQueue.length} 条，已经到上限：上一次调用还没收尾，稍后重试或改用常驻 shell。`))
+      return
+    }
+    let timer = null
+    const slot = () => {
+      if (timer !== null) clearTimeout(timer)
+      timer = null
+      if (!take()) directQueue.unshift(slot)
+    }
+    directQueue.push(slot)
+    timer = setTimeout(() => {
+      timer = null
+      const at = directQueue.indexOf(slot)
+      if (at >= 0) directQueue.splice(at, 1)
+      reject(new Error(`等 adb 直连额度超过 ${DIRECT_GATE.waitMs / 1000}s（同时最多 ${DIRECT_GATE.max} 条、合计 ${DIRECT_GATE.bytes >> 20}MB 输出）：别的调用还没结束，稍后重试。`))
+    }, DIRECT_GATE.waitMs)
+    if (typeof timer.unref === 'function') timer.unref()
+  })
+}
+
 /**
  * 跑一次 adb。
  * @param {string[]} args - adb 参数（不含 adb 自身）。
@@ -109,8 +167,9 @@ function adb(args, options = {}) {
     }
   }
   const started = Date.now()
-  return new Promise((resolve) => {
+  return acquireDirect(buffer).then((release) => new Promise((resolve) => {
     execFile(ADB, args, { timeout, maxBuffer: buffer, encoding: 'buffer' }, (error, stdout, stderr) => {
+      release()
       resolve({
         ok: !error,
         code: typeof error?.code === 'number' ? error.code : error ? -1 : 0,
@@ -121,7 +180,15 @@ function adb(args, options = {}) {
         timedOut: Boolean(error?.killed),
       })
     })
-  })
+  }), (error) => ({
+    ok: false,
+    code: -1,
+    out: '',
+    raw: Buffer.alloc(0),
+    err: error instanceof Error ? error.message : String(error),
+    ms: Date.now() - started,
+    timedOut: false,
+  }))
 }
 
 /**
@@ -5256,6 +5323,8 @@ export const __internals = {
   scrollFrames,
   swipeLine,
   rectForSelector,
+  acquireDirect,
+  DIRECT_GATE,
   guardOutput,
   awaitChange,
   tapMissReason,
