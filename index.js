@@ -1970,6 +1970,7 @@ async function waitFor(serial, want, timeoutMs, options = {}) {
   const dismissed = []
   const wanted = [want.text, want.id, want.desc, ...(normalList(want.texts)), ...(normalList(want.any_texts))]
   let state = await pollDump(serial)
+  let polls = 1
   let previous = state.tree.lines.join('\n')
   let unchanged = 0
   while (!matches(state, want)) {
@@ -1982,6 +1983,7 @@ async function waitFor(serial, want, timeoutMs, options = {}) {
           dismissed.push(label)
           await new Promise((resolve) => setTimeout(resolve, 200))
           state = await pollDump(serial)
+          polls += 1
           continue
         }
       }
@@ -1990,17 +1992,18 @@ async function waitFor(serial, want, timeoutMs, options = {}) {
       /* 轮询为了快不跑 OCR，自绘界面上文字只在 OCR 里：超时前补一次带 OCR 的读，别把「有」判成「没有」。 */
       const lastChance = await dumpState(serial, { ocr: 'auto' }).catch(() => null)
       if (lastChance !== null && matches(lastChance, want)) {
-        return { matched: true, elapsedMs: Date.now() - started, state: lastChance, dismissed }
+        return { matched: true, elapsedMs: Date.now() - started, state: lastChance, dismissed, polls }
       }
-      return { matched: false, elapsedMs: Date.now() - started, state: lastChance ?? state, dismissed }
+      return { matched: false, elapsedMs: Date.now() - started, state: lastChance ?? state, dismissed, polls }
     }
     await new Promise((resolve) => setTimeout(resolve, pollGap(unchanged, Date.now() - started)))
     state = await pollDump(serial)
+    polls += 1
     const line = state.tree.lines.join('\n')
     unchanged = line === previous ? unchanged + 1 : 0
     previous = line
   }
-  return { matched: true, elapsedMs: Date.now() - started, state, dismissed }
+  return { matched: true, elapsedMs: Date.now() - started, state, dismissed, polls }
 }
 
 /**
@@ -4026,11 +4029,13 @@ export function apply(ctx, config) {
       let state = null
       let satisfied = true
       let dismissed = []
+      let polls = 0
       if (askedCondition) {
         const waited = await waitFor(device, want, bounded(args.timeout_ms), { dismiss: args.dismiss === true })
         state = waited.state
         satisfied = waited.matched
         dismissed = waited.dismissed
+        polls = waited.polls ?? 0
       }
       let calm = null
       if (args.stable === true) {
@@ -4047,7 +4052,7 @@ export function apply(ctx, config) {
       const target = normalList([want.text, want.id, want.desc, want.gone, ...(normalList(want.texts)), ...(normalList(want.any_texts))]).join(' / ')
       const pieces = []
       const stateNote = args.until === undefined ? '' : ` 处于 ${args.until}`
-      if (askedCondition) pieces.push(satisfied ? `等到「${oneLine(target, 30)}」${stateNote}` : `${bounded(args.timeout_ms)}ms 内没等到「${oneLine(target, 30)}」${stateNote}`)
+      if (askedCondition) pieces.push(`${satisfied ? '等到' : `${bounded(args.timeout_ms)}ms 内没等到`}「${oneLine(target, 30)}」${stateNote}${polls > 0 ? ` · ${polls} 次轮询` : ''}`)
       if (calm !== null) {
         pieces.push(calm.stable
           ? `界面已静止 ${calm.quietMs}ms`
