@@ -560,6 +560,23 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：xpath 条件、数量下限、崩溃核对都能当一步', () => {
+  assert.equal(validateSteps([{ assert_xpath: '//*[@clickable="true"]' }]).ok, true)
+  assert.equal(validateSteps([{ wait_for_xpath: '//*[@text="订单"]', tap: '确定' }]).ok, true)
+  assert.equal(validateSteps([{ wait_xpath_gone: '//*[@text="加载中"]' }]).ok, true)
+  assert.equal(validateSteps([{ assert_count_min: 5, count_xpath: '//*[@text="订单"]' }]).ok, true)
+  assert.equal(validateSteps([{ assert_no_crash: true }]).ok, true)
+  const bad = validateSteps([{ assert_xpath: 'xpath' }])
+  assert.equal(bad.ok, false)
+  assert.match(bad.problems.join(''), /assert_xpath 要以/)
+  const noSel = validateSteps([{ assert_count_min: 3 }])
+  assert.equal(noSel.ok, false, '只说数几个、不说数什么，要当场拒')
+  assert.match(noSel.problems.join(''), /要说清数什么/)
+  const range = validateSteps([{ assert_count_min: 0, count_xpath: '//*' }])
+  assert.equal(range.ok, false)
+  assert.match(range.problems.join(''), /1–500/)
+})
+
 it('adb_do 步骤：xpath 单独成一步，也能长按；写错开头当场说', () => {
   assert.equal(validateSteps([{ xpath: '//*[@text="登录"]' }]).ok, true)
   assert.equal(validateSteps([{ xpath: '//node[2]', long: true }]).ok, true)

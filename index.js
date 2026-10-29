@@ -353,6 +353,27 @@ async function clipboardPut(serial, text, label = 'dsh') {
 }
 
 /**
+ * 数 crash 缓冲区里的崩溃块：每次 `FATAL EXCEPTION` 算一次，顺带带出进程行。
+ * 只能拿来比「跑之前 / 跑之后」，缓冲区本身会被系统轮转。
+ * @param {string} serial - 设备序列号。
+ * @returns {Promise<{ok: boolean, count: number, last: string}>} 次数与最后一条摘要；读不到时 count 为 -1。
+ */
+async function crashCount(serial) {
+  const log = await adb(['-s', serial, 'shell', 'logcat', '-b', 'crash', '-d', '-t', '600'], { timeout: 20_000 }).catch(() => null)
+  if (log === null || !log.ok) return { ok: false, count: -1, last: '' }
+  const lines = String(log.out ?? '').split('\n')
+  let count = 0
+  let last = ''
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!lines[i].includes('FATAL EXCEPTION')) continue
+    count += 1
+    const proc = lines.slice(i, i + 4).find((line) => line.includes('Process:')) ?? lines[i]
+    last = oneLine(proc, 140)
+  }
+  return { ok: true, count, last }
+}
+
+/**
  * 设备列表。`adb devices -l` 顺带给出型号，便于在错误信息里说清是哪台。
  * @returns {Promise<Array<{serial: string, state: string, model: string}>>} 设备。
  */
@@ -441,7 +462,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'xpath', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms', 'until', 'dismiss']
+  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'wait_for_xpath', 'wait_xpath_gone', 'assert_text', 'assert_gone', 'assert_xpath', 'assert_xpath_gone', 'assert_count_min', 'assert_no_crash', 'sleep_ms', 'until', 'dismiss']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -466,6 +487,18 @@ function validateSteps(steps) {
     if (step.xpath !== undefined) {
       const expr = String(step.xpath).trim()
       if (!expr.startsWith('/')) problems.push(`第 ${at} 步 xpath 要以 // 或 / 开头，例如 //*[@text="登录"]。`)
+    }
+    for (const key of ['wait_for_xpath', 'wait_xpath_gone', 'assert_xpath', 'assert_xpath_gone', 'count_xpath']) {
+      if (step[key] === undefined) continue
+      const expr = String(step[key]).trim()
+      if (!expr.startsWith('/')) problems.push(`第 ${at} 步 ${key} 要以 // 或 / 开头，例如 //*[@text="登录"]。`)
+    }
+    if (step.assert_count_min !== undefined) {
+      const least = Number(step.assert_count_min)
+      if (!(Number.isInteger(least) && least >= 1 && least <= 500)) problems.push(`第 ${at} 步 assert_count_min 要写 1–500 的整数。`)
+      else if (step.text === undefined && step.id === undefined && step.count_xpath === undefined && step.assert_xpath === undefined) {
+        problems.push(`第 ${at} 步 assert_count_min 要说清数什么：配 text / id / count_xpath 用。`)
+      }
     }
     if (step.swipe !== undefined) {
       const ok = Array.isArray(step.swipe) && step.swipe.length >= 4
@@ -4696,6 +4729,13 @@ export function apply(ctx, config) {
               ime: { type: 'string', enum: ['auto', 'clipboard', 'adb'], description: '输入文字怎么上屏，同 adb_input 的 ime' },
               retry: { type: 'integer', minimum: 0, maximum: 3, description: '这一步在「还没点/还没打字」阶段失败时重来几次（默认 0）：查询超时、快照失效这类偶发失败用得上；已经注入过动作再失败就直接报错，不重复点' },
               assert_gone: { type: 'string', description: '这一步做完核对这段文字必须消失' },
+              wait_for_xpath: { type: 'string', description: '这一步之后等这个 XPath 命中（同 adb_find 写法）' },
+              wait_xpath_gone: { type: 'string', description: '这一步之后等这个 XPath 不再命中' },
+              assert_xpath: { type: 'string', description: '这一步做完核对这个 XPath 必须命中（最多重试 3s），不在就算失败' },
+              assert_xpath_gone: { type: 'string', description: '这一步做完核对这个 XPath 必须不再命中' },
+              count_xpath: { type: 'string', description: '配 assert_count_min：数这个 XPath 命中几个；不写就用 text / id 数' },
+              assert_count_min: { type: 'integer', description: '这一步做完核对命中数至少这么多个（列表真加载出来了，不是空壳）' },
+              assert_no_crash: { type: 'boolean', description: '整串动作跑完核对期间没有新的崩溃（读 crash 缓冲区跟开始时比）' },
               sleep_ms: { type: 'integer', description: '硬等多久（尽量用 wait_text 代替）' },
             },
             additionalProperties: false,
@@ -4730,6 +4770,9 @@ export function apply(ctx, config) {
       const limit = args.timeout_ms ?? 8000
       const done = []
       let activity = ''
+      /* 只在有人要崩溃核对时才多读一次缓冲区，其余情况不为它多花一次 adb。 */
+      const wantsCrash = (args.steps ?? []).some((step) => step !== null && typeof step === 'object' && step.assert_no_crash === true)
+      const crashBefore = wantsCrash ? (await crashCount(device)).count : -1
       try {
       for (const [index, step] of (args.steps ?? []).entries()) {
         const at = index + 1
@@ -4838,13 +4881,15 @@ export function apply(ctx, config) {
           done.push(`等静止 ${calmed.ms}ms${calmed.stable ? '' : calmed.empty ? '（读不到控件）' : '（到点还没静）'}`)
         }
 
-        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined) {
+        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined || step.wait_for_xpath !== undefined || step.wait_xpath_gone !== undefined) {
           const waited = await waitFor(device, {
             text: step.wait_text,
             gone: step.wait_gone,
             texts: step.wait_all,
             any_texts: step.wait_any,
             activity: step.wait_activity,
+            xpath: step.wait_for_xpath,
+            xpath_gone: step.wait_xpath_gone,
             until: step.until,
           }, limit, { dismiss: step.dismiss === true })
           activity = waited.state.activity
@@ -4853,21 +4898,40 @@ export function apply(ctx, config) {
               : step.wait_gone ? `「${step.wait_gone}」还在`
                 : step.wait_activity ? `页面还没切到 /${step.wait_activity}/`
                   : step.wait_all ? `「${normalList(step.wait_all).join('」「')}」没全出现`
-                    : `「${normalList(step.wait_any).join('」「')}」一个都没出现`
+                    : step.wait_for_xpath !== undefined ? `没等到 \`${oneLine(step.wait_for_xpath, 60)}\``
+                      : step.wait_xpath_gone !== undefined ? `\`${oneLine(step.wait_xpath_gone, 60)}\` 还在`
+                        : `「${normalList(step.wait_any).join('」「')}」一个都没出现`
             throw new Error(`第 ${at} 步等界面超时 ${limit}ms：${wanted}`)
           }
-          const what = step.wait_text ?? (step.wait_activity ? `页面切到 ${step.wait_activity}` : step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
+          const what = step.wait_text ?? step.wait_for_xpath ?? step.wait_xpath_gone ?? (step.wait_activity ? `页面切到 ${step.wait_activity}` : step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
           done.push(`等 ${what} ${waited.elapsedMs}ms`)
         } else if (step.sleep_ms !== undefined) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.sleep_ms) || 0, 15_000)))
           done.push(`等 ${step.sleep_ms}ms`)
         }
 
-        if (step.assert_text !== undefined || step.assert_gone !== undefined) {
-          const checked = await waitFor(device, { text: step.assert_text, gone: step.assert_gone, until: step.until }, Math.min(limit, 3000), { dismiss: step.dismiss === true })
+        if (step.assert_text !== undefined || step.assert_gone !== undefined || step.assert_xpath !== undefined || step.assert_xpath_gone !== undefined || step.assert_count_min !== undefined) {
+          const countSel = step.count_xpath ?? step.assert_xpath
+          const checked = await waitFor(device, {
+            text: step.assert_count_min === undefined ? step.assert_text : (step.text ?? step.assert_text),
+            gone: step.assert_gone,
+            id: step.assert_count_min === undefined ? undefined : step.id,
+            xpath: countSel,
+            xpath_gone: step.assert_xpath_gone,
+            count_min: step.assert_count_min,
+            until: step.until,
+          }, Math.min(limit, 3000), { dismiss: step.dismiss === true })
           activity = checked.state.activity
           if (!checked.matched) {
-            throw new Error(`第 ${at} 步核对失败：${step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`}${nearMiss(checked.state, { text: step.assert_text })}`)
+            const counted = String(countSel ?? '').trim() !== ''
+              ? selectXPath(checked.state.nodes, String(countSel)).length
+              : selectNodes(checked.state, { text: step.text ?? step.assert_text, id: step.id }).length
+            const what = step.assert_count_min !== undefined
+              ? `命中的控件不到 ${step.assert_count_min} 个（当前 ${counted} 个）`
+              : step.assert_xpath !== undefined ? `界面上没有匹配 \`${oneLine(step.assert_xpath, 60)}\` 的控件`
+                : step.assert_xpath_gone !== undefined ? `\`${oneLine(step.assert_xpath_gone, 60)}\` 还有命中`
+                  : step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`
+            throw new Error(`第 ${at} 步核对失败：${what}${nearMiss(checked.state, { text: step.assert_text })}`)
           }
           const stateNote = step.until === undefined ? '' : `（处于 ${step.until}）`
           const popNote = checked.dismissed.length === 0 ? '' : `，先点掉了 ${checked.dismissed.join('/')}`
@@ -4895,6 +4959,19 @@ export function apply(ctx, config) {
         }
         const evidence = await captureEvidence(device, 'adb_do')
         throw new Error(failureSuffix({ message, activity: now, digest, shotPath: evidence?.path }))
+      }
+      if (wantsCrash) {
+        const after = await crashCount(device)
+        if (after.ok && crashBefore >= 0 && after.count > crashBefore) {
+          const evidence = await captureEvidence(device, 'adb_do-crash')
+          throw new Error(failureSuffix({
+            message: `这串动作跑完多了 ${after.count - crashBefore} 次崩溃：${after.last || '（崩溃行读不出来）'}`,
+            activity: await foregroundActivity(device).catch(() => ''),
+            digest: '',
+            shotPath: evidence?.path,
+          }))
+        }
+        done.push(after.ok && crashBefore >= 0 ? '✓ 期间没崩' : '崩溃核对跳过（crash 缓冲区读不到）')
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
       const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
@@ -6772,6 +6849,7 @@ export const __internals = {
   recordScreen,
   clipboardGet,
   clipboardPut,
+  crashCount,
   nearMiss,
   collapseSameSpot,
   spotList,
