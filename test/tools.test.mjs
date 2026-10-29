@@ -37,6 +37,69 @@ const ctx = new Proxy({}, {
 })
 apply(ctx, {})
 
+/* 宿主注册工具时按 JSON Schema 子集校验：多类型数组、minItems/minimum 这类关键字直接报错，
+   整个插件注册失败、工具全不可见。这里照宿主那套子集把每份 schema 走一遍。 */
+const SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
+const CONSTRAINT = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const'])
+const ANNOTATION = new Set(['description', 'title', 'default', 'examples'])
+const ONE_OF_SIBLINGS = ['properties', 'required', 'additionalProperties', 'items', 'enum', 'const']
+
+function lintSchema(node, path, out, seen = new Set()) {
+  if (node === null || typeof node !== 'object' || Array.isArray(node)) {
+    out.push(`${path} 必须是 schema 对象`)
+    return
+  }
+  if (seen.has(node)) return
+  seen.add(node)
+  for (const key of Object.keys(node)) {
+    if (!CONSTRAINT.has(key) && !ANNOTATION.has(key)) out.push(`${path}.${key} 不是宿主支持的 schema 关键字`)
+  }
+  if (node.description !== undefined && typeof node.description !== 'string') out.push(`${path}.description 必须是字符串`)
+  const hasType = Object.hasOwn(node, 'type')
+  const hasOneOf = Object.hasOwn(node, 'oneOf')
+  if (hasType && hasOneOf) {
+    out.push(`${path} 不能同时写 type 和 oneOf`)
+    return
+  }
+  if (!hasType && !hasOneOf) {
+    for (const key of ONE_OF_SIBLINGS) if (Object.hasOwn(node, key)) out.push(`${path}.${key} 需要 type 或 oneOf 才成立`)
+    return
+  }
+  if (hasOneOf) {
+    for (const key of ONE_OF_SIBLINGS) if (Object.hasOwn(node, key)) out.push(`${path}.${key} 不能和 oneOf 并列`)
+    if (!Array.isArray(node.oneOf) || node.oneOf.length < 2) out.push(`${path}.oneOf 至少要有两种分支`)
+    else node.oneOf.forEach((branch, i) => lintSchema(branch, `${path}.oneOf[${i}]`, out, seen))
+    return
+  }
+  if (typeof node.type !== 'string' || !SCHEMA_TYPES.has(node.type)) {
+    out.push(`${path}.type 必须是单个类型字符串（宿主不支持类型数组），现在是 ${JSON.stringify(node.type)}`)
+    return
+  }
+  if (node.type === 'object') {
+    if (node.properties !== undefined) {
+      if (node.properties === null || typeof node.properties !== 'object' || Array.isArray(node.properties)) out.push(`${path}.properties 必须是对象`)
+      else for (const [name, child] of Object.entries(node.properties)) lintSchema(child, `${path}.properties.${name}`, out, seen)
+    }
+    if (node.required !== undefined) {
+      if (!Array.isArray(node.required)) out.push(`${path}.required 必须是数组`)
+      else for (const name of node.required) {
+        if (typeof name !== 'string') out.push(`${path}.required 每项必须是字符串`)
+        else if (node.properties === undefined || !Object.hasOwn(node.properties, name)) out.push(`${path}.required 里的 ${name} 没在 properties 里声明`)
+      }
+    }
+    if (node.additionalProperties !== undefined && typeof node.additionalProperties !== 'boolean' && (typeof node.additionalProperties !== 'object' || node.additionalProperties === null)) out.push(`${path}.additionalProperties 只能是布尔或 schema`)
+  }
+  if (node.type === 'array' && node.items !== undefined) lintSchema(node.items, `${path}.items`, out, seen)
+}
+
+function schemasOf(def) {
+  const list = []
+  if (def.parameters) list.push(['parameters', def.parameters])
+  if (def.output?.schema) list.push(['output.schema', def.output.schema])
+  if (def.render?.schema) list.push(['render.schema', def.render.schema])
+  return list
+}
+
 const EXPECTED = [
   'adb_ui', 'adb_wait', 'adb_tap', 'adb_gesture', 'adb_input', 'adb_app', 'adb_sh',
   'adb_scroll_to', 'adb_do', 'adb_anim', 'adb_find', 'adb_window', 'adb_watch', 'adb_proc',
@@ -142,6 +205,14 @@ await it('内部导出面齐全：失败取证 / XPath / 控件截图', () => {
   for (const key of ['failureSuffix', 'annotateFailure', 'selectXPath', 'elementRegion', 'screenshot', 'nodeForRef']) {
     expect(__internals[key] !== undefined, `__internals 少了 ${key}`)
   }
+})
+
+await it('工具 schema 只用宿主支持的 JSON Schema 子集', () => {
+  const problems = []
+  for (const def of tools) {
+    for (const [where, schema] of schemasOf(def)) lintSchema(schema, `${def.name}.${where}`, problems)
+  }
+  expect(problems.length === 0, problems.slice(0, 8).join('\n'))
 })
 
 console.log(`\n${pass} 项通过\n`)
