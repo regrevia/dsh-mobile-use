@@ -560,6 +560,14 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：on_fail=continue 让这一步允许失败', () => {
+  assert.equal(validateSteps([{ tap: '确定', on_fail: 'continue' }]).ok, true)
+  assert.equal(validateSteps([{ tap: '确定', on_fail: 'stop' }]).ok, true)
+  const bad = validateSteps([{ tap: '确定', on_fail: 'skip' }])
+  assert.equal(bad.ok, false)
+  assert.match(bad.problems.join(''), /on_fail 只能写 stop|on_fail 只能写/)
+})
+
 it('within_ref / within_rect 解析成同一个框：xpath 也能按框裁', () => {
   const state = { nodes: [], refs: [{ ref: 3, node: { x1: 100, y1: 200, x2: 300, y2: 400 } }] }
   assert.deepEqual(withinBox(state, { within_ref: 3 }), [100, 200, 200, 200])

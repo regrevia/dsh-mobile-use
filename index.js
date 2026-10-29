@@ -520,6 +520,9 @@ function validateSteps(steps) {
         if (extra.length > 0) problems.push(`第 ${at} 步 scroll_to 里有不认识的字段 ${extra.join(' / ')}：只能写 ${known.join(' / ')}。`)
       }
     }
+    if (step.on_fail !== undefined && !['stop', 'continue'].includes(String(step.on_fail))) {
+      problems.push(`第 ${at} 步 on_fail 只能写 stop（失败就停）或 continue（失败记一笔接着跑）。`)
+    }
     if (step.assert_count_min !== undefined) {
       const least = Number(step.assert_count_min)
       if (!(Number.isInteger(least) && least >= 1 && least <= 500)) problems.push(`第 ${at} 步 assert_count_min 要写 1–500 的整数。`)
@@ -4809,6 +4812,7 @@ export function apply(ctx, config) {
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               until: { type: 'string', enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'], description: '配 wait_text / assert_text：等同一个控件进入这个状态才算过（灰按钮不会误判成可点）' },
+              on_fail: { type: 'string', enum: ['stop', 'continue'], description: '这步失败怎么办：stop 停下报错（默认），continue 记一笔跳过接着跑后面的步骤——适合「有弹窗就点掉，没有就算了」这类允许失败的步骤' },
               dismiss: { type: 'boolean', description: '本步等待被权限/升级弹窗挡住时自动点掉确认按钮（最多 2 次）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
               ime: { type: 'string', enum: ['auto', 'clipboard', 'adb'], description: '输入文字怎么上屏，同 adb_input 的 ime' },
@@ -4837,6 +4841,7 @@ export function apply(ctx, config) {
         properties: {
           ok: { type: 'boolean' },
           steps: { type: 'integer' },
+          skipped: { type: 'integer', description: 'on_fail=continue 的步骤里失败跳过了几步' },
           activity: { type: 'string' },
           summary: { type: 'string' },
           elapsed_ms: { type: 'integer' },
@@ -4854,12 +4859,13 @@ export function apply(ctx, config) {
       const began = Date.now()
       const limit = args.timeout_ms ?? 8000
       const done = []
+      let skipped = 0
       let activity = ''
       /* 只在有人要崩溃核对时才多读一次缓冲区，其余情况不为它多花一次 adb。 */
       const wantsCrash = (args.steps ?? []).some((step) => step !== null && typeof step === 'object' && step.assert_no_crash === true)
       const crashBefore = wantsCrash ? (await crashCount(device)).count : -1
-      try {
       for (const [index, step] of (args.steps ?? []).entries()) {
+        try {
         const at = index + 1
         /* 同一步只在「还没往设备注入任何东西」时重来：查询慢/快照失效这类失败重试有用，
            点过/打过字之后再重试就是重复注入，宁可报错让人看现场。 */
@@ -5031,9 +5037,15 @@ export function apply(ctx, config) {
           await new Promise((resolve) => setTimeout(resolve, 200))
         }
         }
-      }
       } catch (error) {
         const message = String((error && error.message) || error)
+        if (step.on_fail === 'continue') {
+          /* 这一步允许失败：记一笔接着跑，不抓截图（截图留给真正停下的那次）。 */
+          skipped += 1
+          done.push(`⚠ 跳过：${oneLine(message, 60)}`)
+          activity = (await foregroundActivity(device).catch(() => '')) || activity
+          continue
+        }
         /* 失败现场自己说话：当前页面 + 屏上的一段文字，省掉「失败后再调一次 adb_ui」。 */
         let now = ''
         let digest = ''
@@ -5046,6 +5058,7 @@ export function apply(ctx, config) {
         }
         const evidence = await captureEvidence(device, 'adb_do')
         throw new Error(failureSuffix({ message, activity: now, digest, shotPath: evidence?.path }))
+      }
       }
       if (wantsCrash) {
         const after = await crashCount(device)
@@ -5061,8 +5074,8 @@ export function apply(ctx, config) {
         done.push(after.ok && crashBefore >= 0 ? '✓ 期间没崩' : '崩溃核对跳过（crash 缓冲区读不到）')
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
-      const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
-      return { ok: true, steps: done.length, activity, summary, elapsed_ms: Date.now() - began }
+      const summary = [`${done.length} 步跑完${skipped > 0 ? `（跳过 ${skipped} 步）` : ''}（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
+      return { ok: true, steps: done.length, skipped, activity, summary, elapsed_ms: Date.now() - began }
     },
   }, 'adb: adb_do')), 'adb_do')
 
