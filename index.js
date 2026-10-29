@@ -3842,11 +3842,13 @@ export function apply(ctx, config) {
       const shouldWait = Boolean(want.text || want.id || want.activity || want.gone || want.xpath || want.xpath_gone)
       let state
       let matched = true
+      let polls = 0
       let stability = null
       if (shouldWait) {
         const waited = await waitFor(device, want, args.timeout_ms ?? 15_000)
         state = waited.state
         matched = waited.matched
+        polls = waited.polls ?? 0
       } else if (args.wait_idle === true || args.wait_stable === true) {
         /* 等界面自己静下来：树签名连续 idle_ms 不变才算稳定，省掉模型 sleep 后再读一次。 */
         const calmed = await awaitStable(
@@ -3901,7 +3903,7 @@ export function apply(ctx, config) {
         depthNote,
         clipped,
         state.changed ? '' : '（与上一次读取相同）',
-        shouldWait ? (matched ? `等待命中，${Date.now() - started}ms` : `等待超时 ${args.timeout_ms ?? 15_000}ms，界面未变化`) : '',
+        shouldWait ? (matched ? `等待命中，${Date.now() - started}ms${polls > 0 ? ` / ${polls} 次轮询` : ''}` : `等待超时 ${args.timeout_ms ?? 15_000}ms，界面未变化${polls > 0 ? `，已轮询 ${polls} 次` : ''}`) : '',
         stability === null ? '' : stability.stable
           ? `已静止 ${stability.quietMs}ms（${stability.dumps} 次读取，${stability.ms}ms）`
           : stability.empty
