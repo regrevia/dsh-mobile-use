@@ -4868,6 +4868,7 @@ export function apply(ctx, config) {
         },
         timeout_ms: { type: 'integer', description: '每步等待上限，默认 8000' },
         shot: { type: 'boolean', description: '整串跑完留一张截图（返回绝对路径）：要看颜色、自绘界面、弹窗样式时用，省一次 adb_shot' },
+        tree: { type: 'boolean', description: '整串跑完读一次树带回来（约 0.12s）：跑完这串接着点下一项时，ref 已经是新快照的，不用再 adb_ui' },
       },
       required: ['steps'],
       additionalProperties: false,
@@ -4881,6 +4882,8 @@ export function apply(ctx, config) {
           skipped: { type: 'integer', description: 'on_fail=continue 的步骤里失败跳过了几步' },
           activity: { type: 'string' },
           shot: { type: ['object', 'null'], description: 'shot=true 时的截图（含绝对路径）' },
+          tree: { type: ['string', 'null'], description: 'tree=true 时的界面树（ref 属于这份快照）' },
+          snapshot_id: { type: ['string', 'null'], description: 'tree=true 时的快照编号' },
           summary: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
@@ -5117,8 +5120,22 @@ export function apply(ctx, config) {
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
       const shot = args.shot === true ? await captureEvidence(device, 'adb_do') : null
-      const summary = [`${done.length} 步跑完${skipped > 0 ? `（跳过 ${skipped} 步）` : ''}（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`), ...(shot === null ? [] : ['', `截图 ${shot.path}`])].join('\n')
-      return { ok: true, steps: done.length, skipped, activity, shot, summary, elapsed_ms: Date.now() - began }
+      /* 整串跑完的界面通常就是下一步的起点：要就顺手读一次，ref 直接归到这份新快照上。 */
+      let endState = null
+      if (args.tree === true) {
+        try {
+          endState = await dumpState(device, { maxNodes: MAX_NODES.default, ocr: 'auto' })
+        } catch {
+          endState = null
+        }
+      }
+      const summary = [`${done.length} 步跑完${skipped > 0 ? `（跳过 ${skipped} 步）` : ''}（${Date.now() - began}ms）`, `当前 ${endState?.activity || activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`), ...(shot === null ? [] : ['', `截图 ${shot.path}`]), ...(endState === null ? [] : ['', endState.tree.lines.join('\n')])].join('\n')
+      return {
+        ok: true, steps: done.length, skipped, activity: endState?.activity || activity, shot,
+        tree: endState === null ? null : endState.tree.lines.join('\n'),
+        snapshot_id: endState === null ? null : endState.snapshotId,
+        summary, elapsed_ms: Date.now() - began,
+      }
     },
   }, 'adb: adb_do')), 'adb_do')
 
