@@ -5181,7 +5181,7 @@ export function apply(ctx, config) {
           done.push(`等静止 ${calmed.ms}ms${calmed.stable ? '' : calmed.empty ? '（读不到控件）' : '（到点还没静）'}`)
         }
 
-        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined || step.wait_for_xpath !== undefined || step.wait_xpath_gone !== undefined) {
+        if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined || step.wait_activity_gone !== undefined || step.wait_for_xpath !== undefined || step.wait_xpath_gone !== undefined) {
           const waited = await waitFor(device, {
             text: step.wait_text,
             gone: step.wait_gone,
@@ -5200,13 +5200,14 @@ export function apply(ctx, config) {
             const wanted = step.wait_text ? `没等到「${step.wait_text}」`
               : step.wait_gone ? `「${step.wait_gone}」还在`
                 : step.wait_activity ? `页面还没切到 /${step.wait_activity}/`
+                  : step.wait_activity_gone ? `页面还停在 /${step.wait_activity_gone}/`
                   : step.wait_all ? `「${normalList(step.wait_all).join('」「')}」没全出现`
                     : step.wait_for_xpath !== undefined ? `没等到 \`${oneLine(step.wait_for_xpath, 60)}\``
                       : step.wait_xpath_gone !== undefined ? `\`${oneLine(step.wait_xpath_gone, 60)}\` 还在`
                         : `「${normalList(step.wait_any).join('」「')}」一个都没出现`
             throw new Error(`第 ${at} 步等界面超时 ${limit}ms：${wanted}`)
           }
-          const what = step.wait_text ?? step.wait_for_xpath ?? step.wait_xpath_gone ?? (step.wait_activity ? `页面切到 ${step.wait_activity}` : step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
+          const what = step.wait_text ?? step.wait_for_xpath ?? step.wait_xpath_gone ?? (step.wait_activity_gone ? `离开页面 ${step.wait_activity_gone}` : step.wait_activity ? `页面切到 ${step.wait_activity}` : step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
           done.push(`等 ${what} ${waited.elapsedMs}ms`)
         } else if (step.sleep_ms !== undefined) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.sleep_ms) || 0, 15_000)))
