@@ -102,3 +102,4 @@ node scripts/device-bench.mjs --n 5 --write    # 追加：滚动找字（会滑�
 - 端到端「手指/鼠标动作 → 画面可见」的延迟（需要屏幕侧高速摄影或合成器时间戳）。
 - MSE 播放分支：保留了 `/dev/mse` 诊断入口，但在这台设备 + Electron 侧栏上始终没进 `onReady`，所以默认路径是上面的 JPEG 长轮询；哪天补齐再单独量。
 - 与 scrcpy / dsh-android / DesktopCommander 的同机对比，属于 Phase E，口径不同不能直接引用它们的宣传数字。
+| 2026-10-29 | `dumpState` 全树 vs `depth:4` | 37/94 行 · 297 ms（两次 dump） | 实测宠物页内容在第 6–8 层，`depth` 给浅会一行为空，已加提示 |

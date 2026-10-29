@@ -2997,6 +2997,11 @@ export function apply(ctx, config) {
       const scrollable = lines.filter((line) => line.includes('~')).length
       const focusLine = lines.find((line) => /\[f\]/.test(line))
         ?? lines.find((line) => /\[edit\]/.test(line) || /EditText/.test(line))
+      /* depth 给浅了会一行都不剩：别让模型以为这屏是空的，直接说控件在第几层。 */
+      const deepest = state.nodes.length === 0 ? 0 : Math.max(...state.nodes.map((node) => Number(node.depth) || 0))
+      const depthNote = args.depth !== undefined && state.tree.kept === 0 && state.tree.total > 0
+        ? `depth=${args.depth} 一个控件都没列出来：这屏内容在第 ${deepest} 层，depth 调到 ${deepest} 或去掉`
+        : ''
       const nodeCap = Math.min(Math.max(args.max_nodes ?? MAX_NODES.default, 1), MAX_NODES.max)
       const clipped = state.tree.kept >= nodeCap && state.tree.total > state.tree.kept
         ? `已截断：只列了 ${state.tree.kept}/${state.tree.total} 个节点，用 filter 收窄、depth 限量，或把 max_nodes 调大（上限 ${MAX_NODES.max}）`
@@ -3010,6 +3015,7 @@ export function apply(ctx, config) {
         digest,
         state.source === 'uiautomator2' ? '' : `· 来源 ${state.source}`,
         state.ocrNote ?? '',
+        depthNote,
         clipped,
         state.changed ? '' : '（与上一次读取相同）',
         shouldWait ? (matched ? `等待命中，${Date.now() - started}ms` : `等待超时 ${args.timeout_ms ?? 15_000}ms，界面未变化`) : '',
