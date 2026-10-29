@@ -148,7 +148,7 @@
 | 步骤预校验 | 走到一半才发现参数写错 | `validateSteps` 在注入前逐条查：动作冲突、regex、`scroll` 范围、`scroll_direction` 取值，一次报清「第几步要改什么」 | `6aad1d1` / `39388c2` |
 | 按方向滑/按框滑 | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | `cb678f2` |
 | 只等条件的等待工具 | u2 的 `Watcher` 要常驻注册；Appium 只有 `wait`+定位 | `adb_wait` 一次调用等文字/id/描述/消失/多个条件/页面/界面静止，成功只回一句结论（不端回整棵树）；超时回「停在哪个页面、能点几个、焦点在哪」，模型不用再读一次 | 本轮 |
-| 等界面静止 | u2 `wait_stable(seconds=5.0)`；Appium `waitForIdleTimeout` 是会话级 | `awaitStable`：树签名连续 `idle_ms`（默认 400）不变才算静止，`adb_ui {wait_stable}` 与 `adb_do` 每步 `wait_stable` 共用同一判据；读不到控件不算静止（加载中的空树最会骗人），回执直接说「已静止 / 到点还在变 / 一直读不到控件」 | 本轮 |
+| 等界面静止 | u2 `wait_stable(seconds=5.0)`；Appium `waitForIdleTimeout` 是会话级 | `awaitStable`：树签名连续 `idle_ms`（默认 400）不变才算静止，`adb_ui {wait_stable}`、`adb_tap {wait_stable}`、`adb_do` 每步 `wait_stable` 共用同一判据；读不到控件不算静止（加载中的空树最会骗人），回执直接说「已静止 / 到点还在变 / 一直读不到控件」 | 本轮 |
 
 
 

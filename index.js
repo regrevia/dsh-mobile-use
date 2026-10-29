@@ -3049,6 +3049,8 @@ export function apply(ctx, config) {
         scroll: { type: 'integer', description: '目标不在当前屏时最多滑几次（1–15）：滑到就点，滑不到报错。只在按文字/id/描述/类名找时有效' },
         scroll_direction: { type: 'string', description: '边滑边找的手指方向：up/down/left/right，默认 up（把下面的内容拉上来）' },
         wait_ms: { type: 'integer', description: '目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）：点早了不用再来一轮' },
+        wait_stable: { type: 'boolean', description: '点完等界面静止（树签名连续 quiet_ms 不变）再返回：动画/加载结束才知道点中了什么。给了 wait_for_text/id/gone 时以那些条件为准' },
+        quiet_ms: { type: 'integer', description: 'wait_stable 用：连续多久没变化算静止，默认 400' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 10000' },
       },
       additionalProperties: false,
@@ -3062,6 +3064,8 @@ export function apply(ctx, config) {
           activity: { type: 'string' },
           matched: { type: 'boolean' },
           changed: { type: 'boolean', description: '点后界面树是否变了；没变大概率没点中或动画未结束' },
+          stable: { type: ['boolean', 'null'], description: 'wait_stable 时：是否等到了静止' },
+          quiet_ms: { type: ['integer', 'null'] },
           scrolled: { type: 'integer', description: '为了找到目标滑了几次；没滑就不出现' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
@@ -3177,6 +3181,8 @@ export function apply(ctx, config) {
       let matched = true
       let detail = ''
       let changed = null
+      let stable = null
+      let quietMs = null
       if (shouldWait) {
         const waited = await waitFor(device, want, args.timeout_ms ?? 10_000)
         matched = waited.matched
@@ -3184,6 +3190,22 @@ export function apply(ctx, config) {
         detail = matched
           ? `，等待命中 ${waited.elapsedMs}ms · 当前 ${activity || '未知页面'}`
           : `，等待超时 ${args.timeout_ms ?? 10_000}ms，界面没出现预期变化`
+      } else if (args.wait_stable === true) {
+        /* 点完等它静下来再判「变没变」：动画中途读到的树会骗人。 */
+        const calmed = await awaitStable(() => dumpState(device, {}), {
+          quietMs: args.quiet_ms ?? 400,
+          timeoutMs: args.timeout_ms ?? 10_000,
+        })
+        const after = calmed.state
+        stable = calmed.stable
+        quietMs = calmed.quietMs
+        activity = after.activity
+        if (prior && prior.signature) changed = after.tree.lines.join('\n') !== prior.signature
+        detail = calmed.stable
+          ? `，界面已静止 ${calmed.quietMs}ms · 当前 ${activity || '未知页面'}${changed === false ? `：界面没变化（${tapMissReason(after, { x, y }, missTarget, prior)}）` : changed === true ? '，界面已变化' : ''}`
+          : calmed.empty
+            ? '，点已发出，但一直读不到控件（可能还在加载或这屏自己画的）'
+            : `，点了但 ${calmed.ms}ms 内画面还在变，先别按旧坐标点`
       } else if (prior && prior.signature && Array.isArray(prior.nodes) && prior.nodes.length > 0
         && Date.now() - prior.at < 15_000) {
         /* 没给等待条件时给一次回执：界面没变化就是可疑信号，别让模型再去读一遍树才发现。 */
@@ -3201,7 +3223,10 @@ export function apply(ctx, config) {
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
       const slid = scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''
       const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
-      return { ok: true, target, activity, matched, changed, ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started }
+      return {
+        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs,
+        ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started,
+      }
     },
   }), 'adb: adb_tap')
 
