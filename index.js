@@ -3720,7 +3720,7 @@ export function apply(ctx, config) {
   }), 'adb: adb_ui')
   /* 只等条件、不把整棵树端回来：轮询回合里最费 token 的是「sleep 再读一次树」。
      条件满足立刻返回，超时也返回当下这一屏摘要（能点几个、停在哪个页面），模型不用再读一遍。 */
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_wait',
     description: '等一个条件成立就返回，不返回整棵控件树：等文字/资源 id/页面出现（text/id/desc/activity）、等某段文字消失（gone）、等几段文字全部出现（texts）、等任意一个出现（any_texts），或者等界面静止（stable）。比 sleep 后 adb_ui 省一大截 token；超时会告诉当下停在哪个页面、能点什么，方便决定下一步。',
     parameters: {
@@ -3861,10 +3861,10 @@ export function apply(ctx, config) {
         elapsed_ms: Date.now() - started,
       }
     },
-  }), 'adb: adb_wait')
+  }, 'adb: adb_wait')), 'adb_wait')
 
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_tap',
     description: '在 Android 设备上点一下：用 ref（来自最近一次 adb_ui/adb_find）、文字、资源 id、描述、类名，或者绝对坐标 point="x,y"。long=true 长按；index 挑第几个匹配；exact/regex 改匹配方式。目标不在当前屏就带 scroll=3 边滑边找，找到直接点——省掉「滑一次、读一次树、再点」的回合。',
     parameters: {
@@ -4103,7 +4103,7 @@ export function apply(ctx, config) {
         ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started,
       }
     },
-  }), 'adb: adb_tap')
+  }, 'adb: adb_tap')), 'adb_tap')
 
   ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_gesture',
@@ -4696,7 +4696,7 @@ export function apply(ctx, config) {
     },
   }, 'adb_scroll_to')), 'adb: adb_scroll_to')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_do',
     description: [
       '一串动作一次调用跑完：点、滑、输入、按键、系统动作、等界面。',
@@ -4990,7 +4990,7 @@ export function apply(ctx, config) {
       const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
       return { ok: true, steps: done.length, activity, summary, elapsed_ms: Date.now() - began }
     },
-  }), 'adb: adb_do')
+  }, 'adb: adb_do')), 'adb_do')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_anim',
@@ -5275,7 +5275,7 @@ function matchNode(nodes, sel) {
   return pick(nodes.filter((node) => !sel.text || node.text === sel.text)) || pick(nodes)
 }
 
-ctx.effect(() => ctx.tools.register({
+ctx.effect(() => ctx.tools.register(withEvidence({
   name: 'adb_find',
   description: '按选择器搜控件，一次拿到全部命中：序号、ref（可直接 adb_tap ref=）、id、文字、描述、矩形、中心点、是否可点/可用/勾选/选中/可滚/有焦点；命中后同一快照内可直接操作，不必再 adb_ui。用于「先确认有几个、在哪、能不能点」再动手。',
   parameters: {
@@ -5447,7 +5447,7 @@ ctx.effect(() => ctx.tools.register({
       elapsed_ms: Date.now() - began,
     }
   },
-}))
+}, 'adb: adb_find')), 'adb_find')
 
 ctx.effect(() => ctx.tools.register({
   name: 'adb_window',
