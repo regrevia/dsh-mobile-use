@@ -42,6 +42,7 @@ const EXPECTED = [
   'adb_scroll_to', 'adb_do', 'adb_anim', 'adb_find', 'adb_window', 'adb_watch', 'adb_proc',
   'adb_crash', 'adb_events', 'adb_web', 'adb_action', 'adb_shot', 'adb_recent', 'adb_motion',
   'adb_state', 'adb_device', 'adb_mirror',
+  'adb_file',
 ]
 
 /** 递归查 schema：类型得认识、required 得真在 properties 里、不许有 undefined 描述。 */

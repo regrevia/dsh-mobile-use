@@ -136,6 +136,7 @@
 | XPath 全链路 | 只有 find 支持 XPath，点/滑/串流程还得换写法 | `adb_find` / `adb_scroll_to` / `adb_do` 步骤都吃同一个 `xpath`，写一次到处能用 | 本轮 |
 | XPath 等待 | 等结构条件只能靠 sleep 再读树 | `adb_wait` / `adb_action` 支持 `xpath` / `xpath_gone`，和文字条件可同时成立 | 本轮 |
 | XPath 等待全覆盖 | 只有 `adb_wait` 能等结构条件 | `adb_ui` / `adb_tap` / `adb_gesture` / `adb_action` 的等待参数统一收 `wait_for_xpath` / `wait_xpath_gone` | 本轮 |
+| 文件推拉 | 只能 `adb_app install` 装包，取不回设备上的截图/导出物 | `adb_file` 一次调用做 `ls` / `pull` / `push`，白名单目录 + 大小上限，推拉后两端 md5 自证 | 本轮 |
 | 动作后确认 | 按返回/回桌面后还要再调一次 `adb_ui` 或 `adb_wait` | `adb_action` 带 `wait_for_text` / `wait_until_gone` / `timeout_ms`，动作+确认一次调用；超时会说清当前页面 | 本轮 |
 | 失败自动取证 | 竞品都要模型自己再调一次截图/树 | 本插件把 `failureSuffix` 收成统一一句：页面 + 屏上前几行 + 截图路径，`adb_do` / `adb_tap` / `adb_wait` / `adb_find` / `adb_gesture` / `adb_input` / `adb_app` / `adb_sh` / `adb_scroll_to` / `adb_action` 全走它 | 本轮（单测覆盖拼装与去重） |
 | 元素级截图 | u2 元素 `.screenshot()`；用于「这张卡片长什么样」这类必须看图的问题，避免整屏 612–665 ms【实测】 |

@@ -195,6 +195,70 @@ function adb(args, options = {}) {
   }))
 }
 
+/* 文件只在白名单目录里读写：agent 一次手滑不该把设备上别的目录清空。 */
+const FILE_ROOTS = [
+  '/sdcard/Download',
+  '/sdcard/Pictures',
+  '/sdcard/DCIM',
+  '/sdcard/Documents',
+  '/sdcard/Movies',
+  '/sdcard/Music',
+  '/sdcard/Android/media',
+  '/data/local/tmp',
+]
+const FILE_MAX_MB = 512
+
+/**
+ * 校验设备路径是否落在白名单里。
+ * @param {unknown} remote - 用户给的设备路径。
+ * @returns {string} 规范化后的绝对路径；不合法返回空串。
+ */
+function fileRemoteOk(remote) {
+  const clean = String(remote ?? '').trim().replace(/\/+$/, '')
+  if (!clean.startsWith('/') || clean === '') return ''
+  return FILE_ROOTS.some((root) => clean === root || clean.startsWith(`${root}/`)) ? clean : ''
+}
+
+/**
+ * 路径最后一段，用作落盘文件名。
+ * @param {string} remote - 设备路径。
+ * @returns {string} 文件名。
+ */
+function fileBase(remote) {
+  const clean = String(remote).replace(/\/+$/, '')
+  return clean.slice(clean.lastIndexOf('/') + 1) || 'file'
+}
+
+/**
+ * 把 `ls -l` 一行拆成 name/size/dir。
+ * @param {string} line - 一行输出。
+ * @returns {{name: string, size: number, dir: boolean} | null} 解析结果。
+ */
+function parseLsLine(line) {
+  const text = String(line).trim()
+  if (text === '' || text.startsWith('total ')) return null
+  const parts = text.split(/\s+/)
+  if (parts.length < 8) return null
+  const dir = parts[0].startsWith('d')
+  const size = Number(parts[4])
+  const name = parts.slice(7).join(' ')
+  if (!Number.isFinite(size) || name === '') return null
+  return { name, size, dir }
+}
+
+/**
+ * 本地文件 md5，用于推拉完自证一致。
+ * @param {string} path - 本地绝对路径。
+ * @returns {Promise<string>} 十六进制摘要；算不出返回空串。
+ */
+function md5Local(path) {
+  return new Promise((resolve) => {
+    execFile('md5', ['-q', path], { timeout: 60_000, maxBuffer: 1 << 20 }, (error, stdout) => {
+      resolve(error ? '' : String(stdout ?? '').trim())
+    })
+  })
+}
+
 /**
  * 设备列表。`adb devices -l` 顺带给出型号，便于在错误信息里说清是哪台。
  * @returns {Promise<Array<{serial: string, state: string, model: string}>>} 设备。
@@ -5765,6 +5829,111 @@ ctx.effect(() => ctx.tools.register({
       return { ok: true, summary: `${label}完成（${r.ms}ms）。界面变化用 adb_ui 确认。`, elapsed_ms: Date.now() - began }
     },
   }, 'adb_action')), 'adb: adb_action')
+
+  /* 设备 ↔ 宿主文件：截图/导出物取回来、测试素材推上去，都走一次调用并自证 md5。
+     白名单只放开常见媒体与临时目录，写错路径直接拒绝，不碰系统其他部分。 */
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_file',
+    description: '在设备与宿主之间取放文件：`action` 为 ls 列目录、pull 取回单个文件、push 推一个文件上去。只允许常见媒体与临时目录（Download/Pictures/DCIM/Documents/Movies/Music/Android/media 与 /data/local/tmp），pull 默认落到 ~/.dsh/adb-files/<设备>/ 并比对两边 md5，推拉完回执写着多少字节、是否一致。要截图用 adb_shot，不要绕这一圈。',
+    parameters: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string', description: '设备序列号，只有一台可省略' },
+        action: { type: 'string', enum: ['ls', 'pull', 'push'], description: 'ls 列目录，pull 取回，push 推上去' },
+        remote: { type: 'string', description: '设备上的绝对路径，必须在白名单目录里；push 时可给目录，自动接上文件名' },
+        local: { type: 'string', description: '宿主路径：pull 是落点（给目录以 / 结尾就放进去），push 是源文件；pull 不给就落到 ~/.dsh/adb-files/<设备>/' },
+        max_mb: { type: 'integer', description: `单个文件上限，默认 64，最大 ${FILE_MAX_MB}` },
+      },
+      required: ['action', 'remote'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          remote: { type: 'string' },
+          local: { type: 'string' },
+          bytes: { type: 'integer' },
+          md5: { type: 'string' },
+          verified: { type: 'boolean' },
+          entries: {
+            type: 'array',
+            description: 'ls 的条目；推拉时为空',
+            items: {
+              type: 'object',
+              properties: { name: { type: 'string' }, size: { type: 'integer' }, dir: { type: 'boolean' } },
+              required: ['name', 'size', 'dir'],
+              additionalProperties: false,
+            },
+          },
+          summary: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'action', 'remote', 'local', 'bytes', 'md5', 'verified', 'entries', 'summary', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.summary),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const action = String(args.action ?? '')
+      const remote = fileRemoteOk(args.remote)
+      const blank = { action, local: '', bytes: 0, md5: '', verified: false, entries: [] }
+      const miss = (summary) => ({ ...blank, ok: false, remote: String(args.remote ?? ''), summary, elapsed_ms: Date.now() - began })
+      if (remote === '') return miss(`设备路径要在白名单里：${FILE_ROOTS.join('、')}；写错目录不执行。`)
+      const rawMb = Number(args.max_mb ?? 64)
+      const capMb = Number.isFinite(rawMb) ? Math.min(FILE_MAX_MB, Math.max(1, rawMb)) : 64
+      const capBytes = capMb << 20
+      if (action === 'ls') {
+        const r = await adb(['-s', device, 'shell', 'ls', '-l', remote], { timeout: 20_000 })
+        if (!r.ok) return miss(`列目录失败：${oneLine(r.err || r.out, 160)}`)
+        const entries = r.out.split('\n').map(parseLsLine).filter(Boolean).slice(0, 200)
+        const lines = entries.slice(0, 12).map((each) => `${each.dir ? 'dir' : `${each.size}B`} ${each.name}`)
+        const summary = `${remote}：${entries.length} 项${entries.length > 12 ? '（只列前 12）' : ''}${lines.length > 0 ? `\n${lines.join('\n')}` : ''}`
+        return { ...blank, ok: true, remote, entries, summary, elapsed_ms: Date.now() - began }
+      }
+      if (action === 'pull') {
+        const sizeOut = await adb(['-s', device, 'shell', 'stat', '-c', '%s', remote], { timeout: 15_000 })
+        const size = Number(String(sizeOut.out ?? '').trim())
+        if (!sizeOut.ok || !Number.isFinite(size)) return miss(`${remote} 取不到文件大小，像是目录或不存在：列目录用 action=ls。`)
+        if (size > capBytes) return miss(`${remote} 有 ${size}B，超过上限 ${capMb}MB，确实要取就调大 max_mb。`)
+        const asked = typeof args.local === 'string' ? args.local.trim() : ''
+        const base = fileBase(remote)
+        const target = asked === '' ? join(homedir(), '.dsh', 'adb-files', device.replace(/[^\w.-]/g, '_'), base) : asked.endsWith('/') ? join(asked, base) : asked
+        await mkdir(dirname(target), { recursive: true })
+        const r = await adb(['-s', device, 'pull', remote, target], { timeout: 180_000, buffer: 4 << 20, direct: true })
+        if (!r.ok) return miss(`拉取失败：${oneLine(r.err || r.out, 160)}`)
+        const md5 = await md5Local(target)
+        const digest = String((await adb(['-s', device, 'shell', 'md5sum', remote], { timeout: 20_000 })).out ?? '').trim().split(/\s+/)[0] || ''
+        const verified = md5 !== '' && md5.toLowerCase() === digest.toLowerCase()
+        const info = await stat(target).catch(() => null)
+        const bytes = info?.size ?? size
+        const tail = verified ? 'md5 一致' : 'md5 不一致：文件可能被截断，别直接当成功'
+        return { ...blank, ok: true, remote, local: target, bytes, md5: verified ? md5 : '', verified, summary: `已取回 ${target}（${bytes}B），${tail}。`, elapsed_ms: Date.now() - began }
+      }
+      if (action === 'push') {
+        const asked = typeof args.local === 'string' ? args.local.trim() : ''
+        if (asked === '') return miss('push 需要 local：说明要推宿主上的哪个文件。')
+        const info = await stat(asked).catch(() => null)
+        if (!info) return miss(`宿主上找不到 ${asked}。`)
+        if (info.isDirectory()) return miss('push 只推单个文件：目录先打包。')
+        if (info.size > capBytes) return miss(`${asked} 有 ${info.size}B，超过上限 ${capMb}MB，确实要推就调大 max_mb。`)
+        const kind = await adb(['-s', device, 'shell', 'stat', '-c', '%F', remote], { timeout: 15_000 })
+        const target = String(kind.out ?? '').includes('directory') ? join(remote, fileBase(asked)) : remote
+        const r = await adb(['-s', device, 'push', asked, target], { timeout: 180_000, buffer: 4 << 20, direct: true })
+        if (!r.ok) return miss(`推送失败：${oneLine(r.err || r.out, 160)}`)
+        const md5 = await md5Local(asked)
+        const digest = String((await adb(['-s', device, 'shell', 'md5sum', target], { timeout: 20_000 })).out ?? '').trim().split(/\s+/)[0] || ''
+        const verified = md5 !== '' && md5.toLowerCase() === digest.toLowerCase()
+        const tail = verified ? 'md5 一致' : 'md5 不一致：别当成推成功'
+        return { ...blank, ok: true, remote: target, local: asked, bytes: info.size, md5: verified ? md5 : '', verified, summary: `已推上去 ${target}（${info.size}B），${tail}。`, elapsed_ms: Date.now() - began }
+      }
+      return miss('action 只能是 ls / pull / push。')
+    },
+  }), 'adb_file')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_shot',
