@@ -1645,6 +1645,14 @@ function matches(state, want) {
   if (want.xpath_gone !== undefined && want.xpath_gone !== null && String(want.xpath_gone).trim() !== '') {
     if (selectXPath(state.nodes, String(want.xpath_gone)).length > 0) return false
   }
+  /* 数量条件：列表刷到第 N 项才算加载完，比等某段固定文字稳（项文字每次都可能不同）。 */
+  const countMin = Number(want.count_min)
+  if (Number.isFinite(countMin) && countMin > 0) {
+    const counted = String(want.xpath ?? '').trim() !== ''
+      ? selectXPath(state.nodes, String(want.xpath)).length
+      : selectNodes(state, { text: want.text, id: want.id, desc: want.desc }).length
+    if (counted < countMin) return false
+  }
   if (!present(want.text)) return false
   if (!present(want.id)) return false
   if (!present(want.desc)) return false
@@ -3543,6 +3551,7 @@ export function apply(ctx, config) {
         xpath_gone: { type: 'string', description: '等这个 XPath 不再命中（列表清空、浮层收起）' },
         texts: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等多个条件）' },
         any_texts: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗）' },
+        count_min: { type: 'integer', description: '等同一批选择器命中的控件至少这么多个（列表加载到 ≥5 项）；配合 text/id/desc/xpath 用' },
         activity: { type: 'string', description: '等前台页面切到这个正则，例如 "ScanActivity"' },
         until: {
           type: 'string',
@@ -3595,9 +3604,17 @@ export function apply(ctx, config) {
         until: args.until,
         xpath: args.xpath,
         xpath_gone: args.xpath_gone,
+        count_min: args.count_min,
       }
       const bounded = (value) => Math.min(60_000, Math.max(200, Number(value ?? 15_000)))
       const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
+      if (args.count_min !== undefined && !args.text && !args.id && !args.desc && !args.xpath) {
+        return {
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,
+          summary: 'count_min 要说清数什么：先给 text / id / desc / xpath，再给至少几个。',
+          elapsed_ms: Date.now() - started,
+        }
+      }
       if (args.until !== undefined && !args.text && !args.id && !args.desc && !args.xpath) {
         return {
           ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,
@@ -3608,7 +3625,7 @@ export function apply(ctx, config) {
       if (!askedCondition && args.stable !== true) {
         return {
           ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,
-          summary: '什么都没等：给 text / id / desc / gone / texts / any_texts / activity，或者 stable=true。',
+          summary: '什么都没等：给 text / id / desc / gone / texts / any_texts / activity / count_min，或者 stable=true。',
           elapsed_ms: Date.now() - started,
         }
       }

@@ -574,4 +574,20 @@ it('等待条件吃 XPath：命中才算过，gone 反过来，和文字条件�
   assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', text: '草稿' }), false)
 })
 
+it('数量条件：命中数不到 count_min 就不算过，xpath 按命中数算', () => {
+  const nodes = [
+    { index: 0, text: '邮件一', id: 'app:id/row', desc: '', cls: 'android.widget.TextView', x1: 0, y1: 0, x2: 10, y2: 10 },
+    { index: 1, text: '邮件二', id: 'app:id/row', desc: '', cls: 'android.widget.TextView', x1: 0, y1: 20, x2: 10, y2: 30 },
+    { index: 2, text: '到底了', id: 'app:id/footer', desc: '', cls: 'android.widget.TextView', x1: 0, y1: 40, x2: 10, y2: 50 },
+  ]
+  const state = { activity: 'InboxActivity', nodes }
+  assert.equal(matches(state, { text: '邮件', count_min: 2 }), true)
+  assert.equal(matches(state, { text: '邮件', count_min: 3 }), false)
+  assert.equal(matches(state, { id: 'app:id/row', count_min: 2 }), true)
+  assert.equal(matches(state, { id: 'app:id/row', count_min: 3 }), false)
+  assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', count_min: 2 }), true)
+  assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', count_min: 1, text: '邮件二' }), true)
+  assert.equal(matches(state, { text: '邮件', count_min: 0 }), true)
+})
+
 console.log(`\n${pass} 项通过\n`)
