@@ -17,7 +17,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, open, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -2688,6 +2688,33 @@ async function inputTextVia(serial, text, options = {}) {
   }
 }
 
+/** 失败取证目录：按设备分桶，每条用例一张图，超过上限就删最老的。 */
+const EVIDENCE_KEEP = 20
+
+/**
+ * 失败时留一张图：错误信息里只有文字时，「按钮被键盘挡住」「弹了权限框」这类问题
+ * 光看文字树判断不了，事后还能翻这张图。只往 ~/.dsh/adb-evidence 下写，按设备分目录、只留最近 20 张。
+ * @param {string} serial - 设备。
+ * @param {string} label - 文件名里的用途标记（如 `adb_do`）。
+ * @returns {Promise<{path: string, bytes: number}|null>} 存成返回路径，存不下返回 null（取证永远不该顶替原来的报错）。
+ */
+async function captureEvidence(serial, label) {
+  try {
+    const dir = join(homedir(), '.dsh', 'adb-evidence', serial.replace(/[^\w.-]/g, '_'))
+    await mkdir(dir, { recursive: true })
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const path = join(dir, `${stamp}-${label.replace(/[^\w.-]/g, '_')}.jpg`)
+    const shot = await screenshot(serial, { scale: 720, path })
+    const names = (await readdir(dir).catch(() => [])).filter((name) => name.endsWith('.jpg')).sort()
+    for (const old of names.slice(0, Math.max(0, names.length - EVIDENCE_KEEP))) {
+      await rm(join(dir, old), { force: true }).catch(() => undefined)
+    }
+    return { path, bytes: shot.bytes }
+  } catch {
+    return null
+  }
+}
+
 /**
  * 读 PNG 的 IHDR 尺寸（字节 16..24）。缩图后以文件为准，避免手算误差。
  * @param {string} path - PNG 路径。
@@ -4111,11 +4138,13 @@ export function apply(ctx, config) {
         } catch {
           now = await foregroundActivity(device).catch(() => '')
         }
+        const evidence = await captureEvidence(device, 'adb_do')
         const hint = /没有|越界|ambiguous_target|核对失败/.test(message)
           ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
           : ''
         const where = [now ? `当前页面 ${now}` : '', digest ? `屏上 ${digest}` : ''].filter(Boolean).join(' · ')
-        throw new Error(`${message}${where ? ` · ${where}` : ''}${hint ? ` · ${hint}` : ''}`)
+        const shotNote = evidence === null ? '' : `截图 ${evidence.path}`
+        throw new Error(`${message}${where ? ` · ${where}` : ''}${shotNote ? ` · ${shotNote}` : ''}${hint ? ` · ${hint}` : ''}`)
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
       const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
@@ -5639,6 +5668,7 @@ export const __internals = {
   rectForSelector,
   acquireDirect,
   DIRECT_GATE,
+  captureEvidence,
   guardOutput,
   awaitChange,
   tapMissReason,

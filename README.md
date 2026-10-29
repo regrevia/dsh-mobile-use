@@ -142,7 +142,7 @@ cd dsh-mobile-use
 | `adb_shot` | 只在要看颜色/布局/相机画面时截图，默认缩到长边 900 px，返回路径给 `read_image`；`region="x,y,w,h"` 只回一块（看桌宠、小图标时体积降一个量级） |
 | `adb_device` | 列设备、状态、型号、当前选中设备与分辨率 |
 | `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
-| `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步；每步可 `retry` 重来注入前的偶发失败 |
+| `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步；每步可 `retry` 重来注入前的偶发失败；失败时自动留一张截图到 `~/.dsh/adb-evidence/<序列号>/`（只留最近 20 张） |
 | `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode` |
 | `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 「刚才那几秒」的 6 帧拼图：动效比例/位移/卡顿这类单帧看不出的问题用它。优先用直播内存帧，没有就现场录一小段（约 +4.5 s），都不行才回落到磁盘段**并注明「不是刚刚」** |

@@ -29,6 +29,11 @@
 - `adb_input {text:"你好",ime:"adb"}`：改成 ADBKeyboard 上屏后切回原输入法（`settings get secure default_input_method` 复核）。
 - 注意：共用宠物设备上不要跑 `ime set`，只跑只读的 `ime list` / 默认输入法查询。
 
+## 2.6 失败取证（本轮新增，未在设备上验过）
+
+- 故意 `adb_do [{tap:"不存在的按钮"}]`：报错末尾应带 `截图 /Users/apple/.dsh/adb-evidence/<序列号>/…jpg`，且文件真的存在、能打开。
+- 同一设备连续失败 21 次：目录里只留最近 20 张。
+
 ## 3. 回归
 
 - `npm test` → 21 项通过；`node ~/.dsh/tools/style-lint.mjs .` → 通过。
