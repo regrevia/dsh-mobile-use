@@ -2321,11 +2321,25 @@ export function setupMirror(ctx, tools) {
     }
   }
 
-  const mount = (scope) => scope.effect(() => {
-    const server = scope.get?.('webServer') ?? ctx.get?.('webServer')
-    if (server?.register === undefined) return undefined
-    return server.register({ kind: 'prefix', path: ROUTE, handler })
-  }, 'adb: 实时镜像路由')
+  const mount = (scope) => {
+    /* During a manual profile reload Cordis can deliver a late inject callback
+       after this scope has already been disposed. Never let that lifecycle race
+       turn into INACTIVE_EFFECT and take down the desktop host. */
+    try {
+      return scope.effect(() => {
+        const server = scope.get?.('webServer') ?? ctx.get?.('webServer')
+        if (server?.register === undefined) return undefined
+        return server.register({ kind: 'prefix', path: ROUTE, handler })
+      }, 'adb: 实时镜像路由')
+    } catch (error) {
+      try {
+        ctx.logger?.warn?.(`[adb] 跳过失活上下文的镜像挂载: ${String(error?.message ?? error)}`)
+      } catch {
+        /* 日志失败也不能把宿主带走 */
+      }
+      return undefined
+    }
+  }
   if (typeof ctx.inject === 'function') ctx.inject(['webServer'], mount)
   else mount(ctx)
 

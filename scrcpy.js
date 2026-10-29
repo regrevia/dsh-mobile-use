@@ -708,6 +708,7 @@ export class ScrcpyChannel extends EventEmitter {
 
     this._state = 'idle'
     this._stopped = false
+    this._disposed = false
     this._scid = 0
     this._netServer = null
     this._sockets = []
@@ -787,6 +788,7 @@ export class ScrcpyChannel extends EventEmitter {
     }
     this._state = 'starting'
     this._stopped = false
+    this._disposed = false
     this._scid = (Number(this._options.scid) || randomInt(1, 0x7fffffff)) >>> 0
     this._parser = new VideoStreamParser({
       protocol: this._options.protocol,
@@ -1415,6 +1417,12 @@ export class ScrcpyChannel extends EventEmitter {
   }
 
   _dispose() {
+    /* `closed` listeners may call stop() to reap the device-side server.
+       Mark disposal before emitting `closed`, otherwise stop -> closed -> stop
+       recursively starts more adb commands until the host exhausts the stack. */
+    if (this._disposed) return
+    this._disposed = true
+
     // 0) 收掉设备端的服务进程：只删 forward 会留下僵尸，占着编码器
     this._killDeviceServer()
 

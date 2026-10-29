@@ -698,6 +698,22 @@ it('stop() 会触发正在等 ready 的收尾，且不重复触发', () => {
   assert.deepEqual(seen, [false])
 })
 
+it('closed 监听器里调用 stop() 不递归清理或重复发事件', () => {
+  const channel = new ScrcpyChannel()
+  let closed = 0
+  channel.on('closed', () => {
+    closed += 1
+    channel.stop()
+  })
+
+  channel._state = 'running'
+  channel.stop()
+
+  assert.equal(closed, 1)
+  assert.equal(channel._disposed, true)
+  assert.equal(channel.state, 'stopped')
+})
+
 it('push* 在控制 socket 未连上时返回 false 并计数，不抛', () => {
   const channel = new ScrcpyChannel()
   assert.equal(channel.pushTouch({ x: 1, y: 2 }), false)
