@@ -490,7 +490,12 @@ function validateSteps(steps) {
       problems.push(`第 ${at} 步同时给了 ${used.slice(0, 3).join(' 和 ')}：一步只做一个动作。`)
     }
     if (step.long !== undefined && !['tap', 'id', 'ref', 'xpath'].includes(used[0] ?? '')) {
-      problems.push(`第 ${at} 步 long 只能配 tap / id / ref 用。`)
+      problems.push(`第 ${at} 步 long 只能配 tap / id / ref / xpath 用。`)
+    }
+    if (step.long_ms !== undefined) {
+      const hold = step.long_ms
+      if (!(typeof hold === 'number' && Number.isInteger(hold) && hold >= 200 && hold <= 5000)) problems.push(`第 ${at} 步 long_ms 要写 200–5000 毫秒，例如 1200。`)
+      else if (!['tap', 'id', 'ref', 'xpath'].includes(used[0] ?? '')) problems.push(`第 ${at} 步 long_ms 只能配 tap / id / ref / xpath 用。`)
     }
     if ((step.desc !== undefined || step.cls !== undefined) && !['tap', 'id', 'scroll_to'].includes(used[0] ?? '')) {
       problems.push(`第 ${at} 步 desc / cls 是找目标的写法，要配 tap / id / scroll_to 用。`)
@@ -4949,7 +4954,8 @@ export function apply(ctx, config) {
               index: { type: 'integer', description: '匹配到多个时点第几个（从 0 开始，默认 0）：列表里四个「关注」按钮点第二个' },
               xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
-              long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
+              long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref/xpath），默认按 700ms' },
+              long_ms: { type: 'integer', description: '长按多少毫秒（200–5000，默认 700）：拖拽手柄、长按菜单要更久时写它' },
               within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找目标或核对：点列表某一行里的按钮，或只在这一行里等/断言「已关注」（先 adb_find 拿那一行的 ref）' },
               within_rect: { type: 'array', items: { type: 'integer' }, minItems: 4, maxItems: 4, description: '同上，但直接给坐标框 [x,y,w,h]；不先取 ref 的场合用' },
               scroll_to: {
@@ -5126,7 +5132,9 @@ export function apply(ctx, config) {
             target = { x, y, label: `「${oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)}」@${x},${y}` }
           }
           injected = true
-          const holdMs = step.long === true ? 700 : 0
+          const holdMs = step.long === true || step.long_ms !== undefined
+            ? Math.min(5000, Math.max(200, Number(step.long_ms) || 700))
+            : 0
           const fastStep = holdMs > 0 || fastInput.tap === null ? null : await fastInput.tap(device, target.x, target.y, {})
           if (fastStep === null) {
             const command = holdMs > 0 ? `input swipe ${target.x} ${target.y} ${target.x} ${target.y} ${holdMs}` : `input tap ${target.x} ${target.y}`

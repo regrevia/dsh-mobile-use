@@ -560,6 +560,15 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：long_ms 控长按时长（默认 700，越界被拦）', () => {
+  assert.equal(validateSteps([{ tap: '按住说话', long_ms: 1200 }]).ok, true)
+  assert.equal(validateSteps([{ tap: '按住说话', long: true, long_ms: 300 }]).ok, true)
+  assert.equal(validateSteps([{ tap: '按住说话', long_ms: 100 }]).ok, false)
+  assert.equal(validateSteps([{ tap: '按住说话', long_ms: 9000 }]).ok, false)
+  assert.equal(validateSteps([{ tap: '按住说话', long_ms: '1200' }]).ok, false)
+  assert.equal(validateSteps([{ swipe: [1, 2, 3, 4, 300], long_ms: 900 }]).ok, false, '滑动步不比长按')
+})
+
 it('等页面离开：activity_gone 与 activity 互补', () => {
   const state = { activity: 'com.demo/.SplashActivity', nodes: [] }
   assert.equal(matches(state, { activity_gone: 'SplashActivity' }), false, '还停在启动页')
