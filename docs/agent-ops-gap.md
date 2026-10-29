@@ -121,7 +121,7 @@
 
 | 能力 | 为什么 | 抄谁 | 接口草案 | 验证 |
 | --- | --- | --- | --- | --- |
-| 规则化弹窗处置（watcher） | 权限/升级/评分弹窗是重复劳动，模型每见一次就重读一次树 | u2 `d.watcher.when("允许").click()` + `watcher.start(interval)` + `wait_stable` | `adb_rules { "when": "text:允许", "do": "tap", "scope": "device" }`，命中回 `handled:[...]` | 连跑 20 次含弹窗流程：模型侧 `adb_ui` 次数下降 ≥30%，且 `handled` 全命中 |
+| 规则化弹窗处置（watcher） | 已落地「单次等待内自动处置」：`adb_wait {dismiss:true}` 命中确认按钮就点掉、最多 2 次，回执列 `dismissed`（不做常驻 timer，宿主不背后台循环） | u2 `watcher` | `adb_wait {dismiss}` | 单测覆盖识别与避让（`findBlocker`） |
 | 属性面扩展 | 「已勾选/可滚动/密码框/输入类型」现在是模型从行尾符号猜 | Appium 元素属性表（`input-type`/`hint`/`password`/`text-entry-key`） | `adb_ui` 行尾追加 `@edit` `#pwd` `%hint`；`adb_find` 加 `checked`/`selected`/`scrollable`/`editable` | 同一表单页：模型定位「密码框」所需读行数从全树 59 行降到 `filter` 后 2 行 |
 | 树深度与压缩 | 千节点页面全量 dump 既慢又灌 token | u2 `dump_hierarchy(compressed, max_depth)`；Appium `snapshotMaxDepth`/`ignoreUnimportantViews` | `adb_ui { "depth": 3, "compact": true }` | 大页面 dump `elapsed_ms` p50 下降 ≥40%，且 `adb_tap` 命中率不降 |
 | 手势与元素绑定 | 现在 `adb_gesture` 要绝对坐标，模型得先从树里算中心点 | Appium `mobile: swipeGesture`（元素 + 方向 + 百分比） | `adb_gesture { "ref": 12, "direction": "up", "percent": 0.8 }`；`scroll_by { "ref": 12, "direction": "down", "times": 3 }` | 列表翻页任务：坐标换算类失败（点了空白）从 N 次降到 0 |
