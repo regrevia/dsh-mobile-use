@@ -283,7 +283,7 @@ function validateSteps(steps) {
   const problems = []
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
-  const actions = ['tap', 'id', 'ref', 'swipe', 'key', 'text', 'action', 'scroll_to']
+  const actions = ['tap', 'id', 'ref', 'xpath', 'swipe', 'key', 'text', 'action', 'scroll_to']
   const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms', 'until', 'dismiss']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
@@ -294,17 +294,21 @@ function validateSteps(steps) {
     }
     const used = actions.filter((key) => step[key] !== undefined)
     if (used.length === 0 && !preconditions.some((key) => step[key] !== undefined)) {
-      problems.push(`第 ${at} 步什么都没做：给一个动作（tap/id/ref/scroll_to/swipe/key/text/action）。`)
+      problems.push(`第 ${at} 步什么都没做：给一个动作（tap/id/ref/xpath/scroll_to/swipe/key/text/action）。`)
       continue
     }
     if (used.length > 1) {
       problems.push(`第 ${at} 步同时给了 ${used.slice(0, 3).join(' 和 ')}：一步只做一个动作。`)
     }
-    if (step.long !== undefined && !['tap', 'id', 'ref'].includes(used[0] ?? '')) {
+    if (step.long !== undefined && !['tap', 'id', 'ref', 'xpath'].includes(used[0] ?? '')) {
       problems.push(`第 ${at} 步 long 只能配 tap / id / ref 用。`)
     }
     if (step.ref !== undefined && !(Number.isInteger(step.ref) && step.ref >= 1)) {
       problems.push(`第 ${at} 步 ref 要从 1 开始的整数。`)
+    }
+    if (step.xpath !== undefined) {
+      const expr = String(step.xpath).trim()
+      if (!expr.startsWith('/')) problems.push(`第 ${at} 步 xpath 要以 // 或 / 开头，例如 //*[@text="登录"]。`)
     }
     if (step.swipe !== undefined) {
       const ok = Array.isArray(step.swipe) && step.swipe.length >= 4
@@ -2025,14 +2029,15 @@ async function scrollToText(serial, text, direction) {
 async function scrollToSelector(serial, want, direction, maxAttempts) {
   const size = await screenSize(serial)
   const dir = ['up', 'down', 'left', 'right'].includes(direction) ? direction : 'up'
-  const label = want.text || want.id || want.desc || want.cls || '目标'
+  const label = want.text || want.id || want.desc || want.cls || want.xpath || '目标'
   const limit = Math.max(1, Math.min(15, Math.round(Number(maxAttempts) || 3)))
   const stuck = new Set()
   let previous = ''
   let lastBox = null
   for (let attempt = 0; attempt <= limit; attempt += 1) {
     const state = attempt === 0 ? await snapshotForSelector(serial) : await pollDump(serial)
-    const hits = selectNodes(state, { ...want, all: true }).filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
+    const pool = want.xpath !== undefined ? selectXPath(state.nodes, want.xpath) : selectNodes(state, { ...want, all: true })
+    const hits = pool.filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
     if (hits.length > 0) return hits[want.index ?? 0] ?? hits[0]
     if (attempt === limit) break
     /* 同一个框滑完界面没变 = 那个框到底了；换下一个可滚容器，全都不动才报错，别在错的应用里盲滑。 */
@@ -4219,6 +4224,7 @@ export function apply(ctx, config) {
         cls: { type: 'string', description: '类名，可只写后半段' },
         exact: { type: 'boolean', description: '完全相等，默认包含匹配' },
         regex: { type: 'boolean', description: 'text/id/desc 当正则用' },
+        xpath: { type: 'string', description: 'XPath 定位（同 adb_find），目标结构复杂时用' },
         index: { type: 'integer', description: '命中多个时取第几个，从 0 开始' },
         within_ref: { type: 'integer', description: '只在这个控件范围内滑（给可滚容器的 ref，比整屏滑准）' },
         direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: '手指往哪个方向滑，默认 up（把下面的内容拉上来）' },
@@ -4259,6 +4265,7 @@ export function apply(ctx, config) {
         cls: args.cls,
         exact: args.exact,
         regex: args.regex,
+        xpath: args.xpath,
         within_ref: args.within_ref,
         index: args.index,
         all: true,
@@ -4274,7 +4281,7 @@ export function apply(ctx, config) {
       let swipes = 0
       let target = null
       for (;;) {
-        const hits = selectNodes(state, sel)
+        const hits = args.xpath !== undefined ? selectXPath(state.nodes, args.xpath) : selectNodes(state, sel)
         const visible = hits.filter((node) => {
           const w = node.x2 - node.x1
           const h = node.y2 - node.y1
@@ -4383,6 +4390,7 @@ export function apply(ctx, config) {
             properties: {
               tap: { type: 'string', description: '点哪个：文字内容，或用 "x,y" 坐标' },
               id: { type: 'string', description: '按资源 id 点' },
+              xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
               scroll_to: { type: 'string', description: '先边滑边找这段文字，找到就点它；找不到算失败' },
@@ -4457,12 +4465,19 @@ export function apply(ctx, config) {
           node = await scrollToText(device, String(step.scroll_to), step.direction)
           done.push(`滑到「${oneLine(String(step.scroll_to), 16)}」`)
         }
-        if (step.tap !== undefined || step.id !== undefined || step.ref !== undefined || node !== null) {
+        if (step.tap !== undefined || step.id !== undefined || step.ref !== undefined || step.xpath !== undefined || node !== null) {
           let point = null
           if (node !== null) {
             /* scroll_to 已经定位到目标，直接算坐标点它。 */
           } else if (step.ref !== undefined) {
             node = await nodeForRef(device, Number(step.ref))
+          } else if (step.xpath !== undefined) {
+            const state = await snapshotForSelector(device)
+            const hits = selectXPath(state.nodes, String(step.xpath))
+            if (hits.length === 0) {
+              throw new Error(`第 ${at} 步：xpath 没命中「${String(step.xpath)}」。` + nearMiss(state, { text: String(step.xpath) }))
+            }
+            node = hits[0]
           } else if (step.tap !== undefined && /^\s*-?\d+\s*,\s*-?\d+\s*$/.test(String(step.tap))) {
             const parts = String(step.tap).split(',').map((value) => Number(value.trim()))
             point = { x: parts[0], y: parts[1] }

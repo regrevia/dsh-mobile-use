@@ -553,4 +553,11 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：xpath 单独成一步，也能长按；写错开头当场说', () => {
+  assert.equal(validateSteps([{ xpath: '//*[@text="登录"]' }]).ok, true)
+  assert.equal(validateSteps([{ xpath: '//node[2]', long: true }]).ok, true)
+  assert.equal(validateSteps([{ xpath: 'xpath' }]).ok, false)
+  assert.equal(validateSteps([{ xpath: '//*[@text="x"]', swipe: [1, 2, 3, 4] }]).ok, false)
+})
+
 console.log(`\n${pass} 项通过\n`)
