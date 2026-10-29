@@ -1574,6 +1574,13 @@ function matches(state, want) {
       || state.nodes.some((node) => String(node.pkg || '').toLowerCase().includes(pkg))
     if (!somewhere) return false
   }
+  /* XPath 条件：结构定位（第几个、属性组合）没法用文字表达，这里直接求值。 */
+  if (want.xpath !== undefined && want.xpath !== null && String(want.xpath).trim() !== '') {
+    if (selectXPath(state.nodes, String(want.xpath)).length === 0) return false
+  }
+  if (want.xpath_gone !== undefined && want.xpath_gone !== null && String(want.xpath_gone).trim() !== '') {
+    if (selectXPath(state.nodes, String(want.xpath_gone)).length > 0) return false
+  }
   if (!present(want.text)) return false
   if (!present(want.id)) return false
   if (!present(want.desc)) return false
@@ -3464,6 +3471,8 @@ export function apply(ctx, config) {
         id: { type: 'string', description: '等这个资源 id 出现（可只写后半段）' },
         desc: { type: 'string', description: '等这个 content-desc 出现' },
         gone: { type: 'string', description: '等这段文字从界面上消失（关弹窗、等加载完）' },
+        xpath: { type: 'string', description: '等这个 XPath 命中（同 adb_find 写法），结构定位用' },
+        xpath_gone: { type: 'string', description: '等这个 XPath 不再命中（列表清空、浮层收起）' },
         texts: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等多个条件）' },
         any_texts: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗）' },
         activity: { type: 'string', description: '等前台页面切到这个正则，例如 "ScanActivity"' },
@@ -3516,13 +3525,15 @@ export function apply(ctx, config) {
         any_texts: args.any_texts,
         activity: args.activity,
         until: args.until,
+        xpath: args.xpath,
+        xpath_gone: args.xpath_gone,
       }
       const bounded = (value) => Math.min(60_000, Math.max(200, Number(value ?? 15_000)))
       const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
-      if (args.until !== undefined && !args.text && !args.id && !args.desc) {
+      if (args.until !== undefined && !args.text && !args.id && !args.desc && !args.xpath) {
         return {
           ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,
-          summary: 'until 要配合 text / id / desc 用：先说要等哪个控件，再说等到它处于什么状态。',
+          summary: 'until 要配合 text / id / desc / xpath 用：先说要等哪个控件，再说等到它处于什么状态。',
           elapsed_ms: Date.now() - started,
         }
       }

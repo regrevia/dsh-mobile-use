@@ -560,4 +560,18 @@ it('adb_do 步骤：xpath 单独成一步，也能长按；写错开头当场说
   assert.equal(validateSteps([{ xpath: '//*[@text="x"]', swipe: [1, 2, 3, 4] }]).ok, false)
 })
 
+it('等待条件吃 XPath：命中才算过，gone 反过来，和文字条件能同时成立', () => {
+  const nodes = [
+    { index: 0, text: '收件箱', id: 'app:id/title', desc: '', cls: 'android.widget.TextView', x1: 0, y1: 0, x2: 10, y2: 10 },
+    { index: 1, text: '邮件一', id: 'app:id/row', desc: '', cls: 'android.widget.TextView', x1: 0, y1: 20, x2: 10, y2: 30 },
+  ]
+  const state = { activity: 'InboxActivity', nodes }
+  assert.equal(matches(state, { xpath: '//android.widget.TextView[@id="app:id/row"]' }), true)
+  assert.equal(matches(state, { xpath: '//*[@text="不存在的"]' }), false)
+  assert.equal(matches(state, { xpath_gone: '//*[@text="不存在的"]' }), true)
+  assert.equal(matches(state, { xpath_gone: '//*[@text="邮件一"]' }), false)
+  assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', text: '邮件' }), true)
+  assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', text: '草稿' }), false)
+})
+
 console.log(`\n${pass} 项通过\n`)

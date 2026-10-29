@@ -133,7 +133,7 @@ cd dsh-mobile-use
 | 工具 | 作用 |
 | --- | --- |
 | `adb_ui` | 读界面文本树：`ref`、控件类型、文字、`#资源id`、`@中心坐标`，尾部 `*` 可点击 / `~` 可滚动 / `[x]` 勾选 / `[off]` 不可用。支持 `filter`、`full`、`depth`（只列到第 N 层）、`max_nodes`（默认 400，打满会明说「已截断」并给收窄办法）、`wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`（替代 sleep + 反复截图） |
-| `adb_wait` | 只等条件、不返回整棵树，省 token：`text` / `id` / `desc` / `gone` / `texts`（全出现）/ `any_texts`（任一出现）/ `activity` / `stable`（界面静止）。超时会说清停在哪个页面、能点什么；`until` 等同一个控件进入某状态（`enabled` / `clickable` / `checked` / `focused`）才返回，灰按钮不会误判成等到；`dismiss: true` 被权限/升级/评分弹窗挡住时自动点掉确认按钮（最多 2 次）再接着等，回执列 `dismissed`；没等到会自动留一张截图（`shot.path`，只失败才抓） |
+| `adb_wait` | 只等条件、不返回整棵树，省 token：`text` / `id` / `desc` / `gone` / `texts`（全出现）/ `any_texts`（任一出现）/ `activity` / `stable`（界面静止）。超时会说清停在哪个页面、能点什么；`until` 等同一个控件进入某状态（`enabled` / `clickable` / `checked` / `focused`）才返回，灰按钮不会误判成等到；`dismiss: true` 被权限/升级/评分弹窗挡住时自动点掉确认按钮（最多 2 次）再接着等，回执列 `dismissed`；没等到会自动留一张截图（`shot.path`，只失败才抓）；也能等 `xpath` 命中 / `xpath_gone` 消失 |
 | `adb_tap` | 按 `ref` / `text` / `id` / `desc` / `point="x,y"` 点击，`long: true` 长按；可带 `wait_for_text` / `wait_for_id` / `wait_until_gone` 点完直接等结果，或 `wait_stable` 等界面静止再回执「变了没变」；回执里 `changed` 说变没变，`reason` 给原因码（`keyboard-covered` / `obscured` / `unclickable` / `gone` / `page-switched` / `no-response` / `same-screen`），`delta` 直接列出这次多/少了哪几行；没生效还会自动留一张截图（`shot.path`） |
 | `adb_input` | `text`（ASCII，空格自动转义）、`key`（ENTER/BACK/DEL…）、`submit`（`enter` / `search`，输完直接提交）、`ime`（`auto` / `clipboard` / `adb`，ADBKeyboard 已装且是当前输入法时中文走广播更快）、`swipe`、`clear`；回执给 `method`（ime/paste/input）、`field`（输入框回读）、`verified`，`verify: true` 时 ASCII 直发也回读一次，不用再补 `adb_ui` |
 | `adb_gesture` | 真人轨迹：`points` 折线逐点 DOWN/MOVE/UP，`duration_ms`、`hold_ms`；曲线拖拽、按住再拖 |
