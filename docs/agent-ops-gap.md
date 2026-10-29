@@ -135,6 +135,7 @@
 | toast / 系统弹窗文本进树 | Appium `enableNotificationListener`（保留 3 500 ms）；本插件可用 `adb_events` 补，但文本进树更省一次调用 |
 | XPath 定位 | Appium 的 XPath 要多一次服务端往返；uiautomator2 没有 XPath | `adb_find xpath=` 支持 `/` `//`、tag/`*`、`@attr`、`@attr="v"`、`contains(@attr,"v")`、`[n]`、`[last()]`、`not(@attr)`，在已 dump 的节点上本地求值 | 本轮（单测 44 项 + 真机 94 节点 19–266 µs） |
 | XPath 全链路 | 只有 find 支持 XPath，点/滑/串流程还得换写法 | `adb_find` / `adb_scroll_to` / `adb_do` 步骤都吃同一个 `xpath`，写一次到处能用 | 本轮 |
+| 滚动找目标的状态门槛 | 滑到看见就算到，灰着点不动还得再来一轮 | `adb_scroll_to` 加 `until`（要求真的 enabled/clickable 才算到位）与 `dismiss`（挡路弹窗自动点掉，回执说点了什么） | 本轮 |
 | XPath 等待 | 等结构条件只能靠 sleep 再读树 | `adb_wait` / `adb_action` 支持 `xpath` / `xpath_gone`，和文字条件可同时成立 | 本轮 |
 | XPath 等待全覆盖 | 只有 `adb_wait` 能等结构条件 | `adb_ui` / `adb_tap` / `adb_gesture` / `adb_action` 的等待参数统一收 `wait_for_xpath` / `wait_xpath_gone` | 本轮 |
 | 文件推拉 | 只能 `adb_app install` 装包，取不回设备上的截图/导出物 | `adb_file` 一次调用做 `ls` / `pull` / `push`，白名单目录 + 大小上限，推拉后两端 md5 自证 | 本轮 |
