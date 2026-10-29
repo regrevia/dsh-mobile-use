@@ -10,13 +10,13 @@
 不开宿主也能量设备侧原语，改完一处改动就能对比前后：
 
 ```bash
-node scripts/device-bench.mjs --n 5            # 只读：dump / 读前台 / 等文字
-node scripts/device-bench.mjs --n 5 --write    # 追加：滚动找字（会滑屏）
+node test/device-bench.mjs --n 5            # 只读：dump / 读前台 / 等文字
+node test/device-bench.mjs --n 5 --write    # 追加：滚动找字（会滑屏）
 ```
 
 2026-10-29 等静止实测（同一屏，只读）：`awaitStable` `quiet_ms=400` 691 ms / 3 次 dump、`quiet_ms=200` 472 ms / 2 次、`quiet_ms=120` 524 ms / 2 次；单次轮询 dump 156–176 ms（均值 169）。所以「等静止」比「sleep 1 s 再 dump」省约 300 ms，且不会把动画中途读到的树当真。
 
-2026-10-29 再测（前台 `com.whale.pet/HistoryActivity`，只读）：轮询用的 `pollDump`（`ocr:false`）单次 **155 ms**、连读 5 次 820 ms；`scripts/device-bench.mjs --n 2` 现在会正常退出（`EXIT=0`，dump 均值 164 ms、`foregroundActivity` 84 ms、`waitFor` 600 ms 超时实耗 713 ms）——之前「跑不完」是 u2 的 RPC 连接让事件循环不退出，不是设备慢，脚本末尾补了 `process.exit(0)`。
+2026-10-29 再测（前台 `com.whale.pet/HistoryActivity`，只读）：轮询用的 `pollDump`（`ocr:false`）单次 **155 ms**、连读 5 次 820 ms；`test/device-bench.mjs --n 2` 现在会正常退出（`EXIT=0`，dump 均值 164 ms、`foregroundActivity` 84 ms、`waitFor` 600 ms 超时实耗 713 ms）——之前「跑不完」是 u2 的 RPC 连接让事件循环不退出，不是设备慢，脚本末尾补了 `process.exit(0)`。
 
 2026-10-29 复测（同一台机器，前台 `com.whale.pet/.MainActivity`）：`dumpState` 94–142 ms（均值 118）、`foregroundActivity` 63–77 ms、`adb_ui` 整屏 156 ms、`adb_find` 命中 5 个 86 ms、`waitFor` 600 ms 超时实耗 708 ms（一次 dump + 120 ms 轮询 + 一次 dump）。
 

@@ -3,13 +3,13 @@
  * 默认不点不滑，但会动设备状态（home 这类）；加 --tap 才真点一下可点击节点。
  * 任何一项 ❌ 都会让退出码非零：脚本最后按失败数返回非零退出码。
  *
- *   node selftest.mjs            # 不点不滑
- *   node selftest.mjs --tap      # 额外验证 adb_tap 的点按路径
- *   node selftest.mjs --serial emulator-5554
+ *   node test/selftest.mjs            # 不点不滑
+ *   node test/selftest.mjs --tap      # 额外验证 adb_tap 的点按路径
+ *   node test/selftest.mjs --serial emulator-5554
  */
 
 import fs from 'node:fs'
-import { apply } from './index.js'
+import { apply } from '../index.js'
 
 const argv = process.argv.slice(2)
 const wantTap = argv.includes('--tap')
@@ -384,7 +384,7 @@ try {
 }
 try {
   const build = await probe('/state')
-  const want = String(fs.readFileSync(new URL('./client.rev', import.meta.url), 'utf8')).trim()
+  const want = String(fs.readFileSync(new URL('../client.rev', import.meta.url), 'utf8')).trim()
   if (build.code === 200 && build.body?.build === want) ok('页面版本对齐', `build=${build.body.build}`)
   else bad('页面版本不一致', `state=${build.body?.build} client.rev=${want}`)
 } catch (error) {
@@ -393,8 +393,8 @@ try {
 try {
   /* 两边各写一份版本号，谁改了另一份没跟上，页面就会一直拿旧代码和自己的版本对不上：
      这种不一致只有对着看才会发现，所以单独比一份，不一致就当场失败。 */
-  const want = String(fs.readFileSync(new URL('./client.rev', import.meta.url), 'utf8')).trim()
-  const page = fs.readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+  const want = String(fs.readFileSync(new URL('../client.rev', import.meta.url), 'utf8')).trim()
+  const page = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
   const declared = /__ADBM_BUILD\s*=\s*'([^']*)'/.exec(page)?.[1] ?? ''
   if (declared === want) ok('client.js 与 client.rev 同号', declared)
   else bad('client.js 版本没跟上 client.rev', `client.js=${declared} client.rev=${want}`)
