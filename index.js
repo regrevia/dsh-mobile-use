@@ -1528,6 +1528,26 @@ function nextSnapshotId(serial) {
 /** 上一次 adb_ui 的行，changed_only 用来做差。 */
 const lastUiLines = new Map()
 
+/** 控件状态条件：等「出现」还不够，很多界面是出现了但还压着不可点（灰按钮、刚渲染一半的开关）。 */
+const NODE_STATES = {
+  visible: () => true,
+  enabled: (node) => node.enabled !== false,
+  clickable: (node) => node.clickable === true,
+  checked: (node) => node.checked === true,
+  focused: (node) => node.focused === true,
+}
+
+/**
+ * 这个控件现在是不是满足要求的状态。
+ * @param {any} node - 控件节点。
+ * @param {string} until - 状态名，见 NODE_STATES。
+ * @returns {boolean} 是否满足。
+ */
+function nodeStateOk(node, until) {
+  const predicate = NODE_STATES[until]
+  return predicate ? Boolean(predicate(node)) : true
+}
+
 /**
  * 判断 waitPredicate 是否满足。
  * text/id/desc/texts/any_texts/gone 都按「文字、描述、id 里包含」判断；activity 当正则；
@@ -1559,6 +1579,16 @@ function matches(state, want) {
   /* 满足任意一个就算过：加载完 / 报错弹窗，两种结局都能继续往下走。 */
   const anyOf = normalList(want.any_texts)
   if (anyOf.length > 0 && !anyOf.some((needle) => hit(needle))) return false
+  /* 带状态条件时，要求「同一个控件」既命中文字/id 又处于该状态：
+     按钮出现在屏上但还 disabled 时不该算等到，否则点下去是空动作。 */
+  if (want.until) {
+    const needle = String(want.text ?? want.id ?? want.desc ?? '').toLowerCase()
+    const qualified = state.nodes.some((node) => {
+      const hay = `${node.text} ${node.desc} ${node.id}`.toLowerCase()
+      return (needle === '' || hay.includes(needle)) && nodeStateOk(node, want.until)
+    })
+    if (!qualified) return false
+  }
   return true
 }
 
@@ -3107,6 +3137,11 @@ export function apply(ctx, config) {
         texts: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等多个条件）' },
         any_texts: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗）' },
         activity: { type: 'string', description: '等前台页面切到这个正则，例如 "ScanActivity"' },
+        until: {
+          type: 'string',
+          enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'],
+          description: '配合 text/id/desc：等到同一个控件处于这个状态才算过（默认出现就算），例如等按钮变 enabled 再点、等开关变 checked',
+        },
         stable: { type: 'boolean', description: '等界面静止：树签名连续 quiet_ms 不变才算（动画/加载结束）' },
         quiet_ms: { type: 'integer', description: 'stable 用：连续多久没变化算静止，默认 400' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 15000' },
@@ -3141,9 +3176,17 @@ export function apply(ctx, config) {
         texts: args.texts,
         any_texts: args.any_texts,
         activity: args.activity,
+        until: args.until,
       }
       const bounded = (value) => Math.min(60_000, Math.max(200, Number(value ?? 15_000)))
       const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
+      if (args.until !== undefined && !args.text && !args.id && !args.desc) {
+        return {
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '',
+          summary: 'until 要配合 text / id / desc 用：先说要等哪个控件，再说等到它处于什么状态。',
+          elapsed_ms: Date.now() - started,
+        }
+      }
       if (!askedCondition && args.stable !== true) {
         return {
           ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '',
@@ -3173,7 +3216,8 @@ export function apply(ctx, config) {
       const here = `${state.activity || '未知页面'} · ${state.tree.kept}/${state.tree.total} 节点${clickable > 0 ? ` · 可点 ${clickable}` : ''}${focusLine ? ` · 焦点 ${oneLine(focusLine.trim().split(/\s+/).slice(1).join(' '), 24)}` : ''}`
       const target = normalList([want.text, want.id, want.desc, want.gone, ...(normalList(want.texts)), ...(normalList(want.any_texts))]).join(' / ')
       const pieces = []
-      if (askedCondition) pieces.push(satisfied ? `等到「${oneLine(target, 30)}」` : `${bounded(args.timeout_ms)}ms 内没等到「${oneLine(target, 30)}」`)
+      const stateNote = args.until === undefined ? '' : ` 处于 ${args.until}`
+      if (askedCondition) pieces.push(satisfied ? `等到「${oneLine(target, 30)}」${stateNote}` : `${bounded(args.timeout_ms)}ms 内没等到「${oneLine(target, 30)}」${stateNote}`)
       if (calm !== null) {
         pieces.push(calm.stable
           ? `界面已静止 ${calm.quietMs}ms`
@@ -5694,6 +5738,7 @@ export const __internals = {
   collapseSameSpot,
   spotList,
   matches,
+  nodeStateOk,
   parseNodes,
   compactTree,
   shortId,

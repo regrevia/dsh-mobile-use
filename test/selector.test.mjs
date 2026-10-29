@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -473,6 +473,22 @@ it('点后差异：多出/少了哪几行分开列，limit 只截总数', () => 
   assert.deepEqual(diffLines([], after), after.map((line) => `+ ${line}`))
   assert.deepEqual(diffLines(before, before), [])
   assert.deepEqual(diffLines(undefined, []), [])
+})
+
+it('带状态的等待：控件出现了但还灰着不算等到，要同一个控件同时满足', () => {
+  const node = (over) => ({ x1: 0, y1: 0, x2: 200, y2: 100, text: '', desc: '', id: '', cls: 'android.widget.Button', pkg: 'com.demo', clickable: false, enabled: true, ...over })
+  const state = { activity: '.Main', nodes: [node({ text: '保存', enabled: false }), node({ text: '保存草稿', clickable: true })] }
+  assert.equal(matches(state, { text: '保存' }), true)
+  assert.equal(matches(state, { text: '保存', until: 'clickable' }), true)
+  const grey = { activity: '.Main', nodes: [node({ text: '保存', enabled: false, clickable: false })] }
+  assert.equal(matches(grey, { text: '保存' }), true)
+  assert.equal(matches(grey, { text: '保存', until: 'enabled' }), false, '灰按钮不该算等到')
+  assert.equal(matches(grey, { text: '保存', until: 'clickable' }), false)
+  assert.equal(nodeStateOk({ enabled: false }, 'enabled'), false)
+  assert.equal(nodeStateOk({ checked: true }, 'checked'), true)
+  assert.equal(nodeStateOk({ focused: true }, 'focused'), true)
+  assert.equal(nodeStateOk({}, 'visible'), true)
+  assert.equal(nodeStateOk({}, '没这个状态'), true, '未知状态不拦，避免老参数静默失效')
 })
 
 console.log(`\n${pass} 项通过\n`)
