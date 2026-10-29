@@ -4652,10 +4652,17 @@ ctx.effect(() => ctx.tools.register({
         count: { type: 'integer' },
         lines: { type: 'array' },
         matches: { type: 'array' },
+        shot: {
+          type: ['object', 'null'],
+          description: '没找到时自动留的截图（只没找到才抓，约 0.5s）：{path, bytes}',
+          properties: { path: { type: 'string' }, bytes: { type: 'integer' } },
+          required: ['path', 'bytes'],
+          additionalProperties: false,
+        },
         snapshot_id: { type: 'string' },
         elapsed_ms: { type: 'integer' },
       },
-      required: ['serial', 'activity', 'summary', 'count', 'lines', 'matches', 'snapshot_id', 'elapsed_ms'],
+      required: ['serial', 'activity', 'summary', 'count', 'lines', 'matches', 'shot', 'snapshot_id', 'elapsed_ms'],
       additionalProperties: false,
     },
     render: (_args, value) => textBlock(value.summary + '\n' + value.lines.join('\n')),
@@ -4735,13 +4742,15 @@ ctx.effect(() => ctx.tools.register({
       Date.now() - began + 'ms',
       hits.length === 0 ? nearMiss(state, args) : '',
     ].filter(Boolean).join(' · ')
+    const shot = hits.length === 0 ? await captureEvidence(device, 'adb_find') : null
     return {
       serial: device,
       activity: state.activity || '',
-      summary,
+      summary: shot === null ? summary : `${summary} · 截图 ${shot.path}`,
       count: hits.length,
       lines: lines.length > 0 ? lines : ['（没有命中）'],
       matches,
+      shot,
       snapshot_id: state.snapshotId,
       elapsed_ms: Date.now() - began,
     }
