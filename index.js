@@ -1781,9 +1781,12 @@ function nodeStateOk(node, until) {
  * @returns {boolean} 是否满足。
  */
 function matches(state, want) {
+  /* within_ref / within_rect：所有「有没有这段文字」的判断都只看框里的控件。 */
+  const box = withinBox(state, want)
+  const inBox = (node) => inWithinBox(node, box)
   const hit = (needle) => {
     const lower = String(needle).toLowerCase()
-    return state.nodes.some((node) => `${node.text} ${node.desc} ${node.id}`.toLowerCase().includes(lower))
+    return state.nodes.some((node) => inBox(node) && `${node.text} ${node.desc} ${node.id}`.toLowerCase().includes(lower))
   }
   const present = (needle) => (needle ? hit(needle) : true)
   const absent = (needle) => (needle ? !hit(needle) : true)
@@ -1796,17 +1799,17 @@ function matches(state, want) {
   }
   /* XPath 条件：结构定位（第几个、属性组合）没法用文字表达，这里直接求值。 */
   if (want.xpath !== undefined && want.xpath !== null && String(want.xpath).trim() !== '') {
-    if (selectXPath(state.nodes, String(want.xpath)).length === 0) return false
+    if (selectXPath(state.nodes, String(want.xpath)).filter(inBox).length === 0) return false
   }
   if (want.xpath_gone !== undefined && want.xpath_gone !== null && String(want.xpath_gone).trim() !== '') {
-    if (selectXPath(state.nodes, String(want.xpath_gone)).length > 0) return false
+    if (selectXPath(state.nodes, String(want.xpath_gone)).filter(inBox).length > 0) return false
   }
   /* 数量条件：列表刷到第 N 项才算加载完，比等某段固定文字稳（项文字每次都可能不同）。 */
   const countMin = Number(want.count_min)
   if (Number.isFinite(countMin) && countMin > 0) {
     const counted = String(want.xpath ?? '').trim() !== ''
-      ? selectXPath(state.nodes, String(want.xpath)).length
-      : selectNodes(state, { text: want.text, id: want.id, desc: want.desc }).length
+      ? selectXPath(state.nodes, String(want.xpath)).filter(inBox).length
+      : selectNodes(state, { text: want.text, id: want.id, desc: want.desc, within_ref: want.within_ref, within_rect: want.within_rect }).length
     if (counted < countMin) return false
   }
   if (!present(want.text)) return false
@@ -1823,6 +1826,7 @@ function matches(state, want) {
   if (want.until) {
     const needle = String(want.text ?? want.id ?? want.desc ?? '').toLowerCase()
     const qualified = state.nodes.some((node) => {
+      if (!inBox(node)) return false
       const hay = `${node.text} ${node.desc} ${node.id}`.toLowerCase()
       return (needle === '' || hay.includes(needle)) && nodeStateOk(node, want.until)
     })
@@ -3792,6 +3796,8 @@ export function apply(ctx, config) {
         texts: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等多个条件）' },
         any_texts: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗）' },
         count_min: { type: 'integer', description: '等同一批选择器命中的控件至少这么多个（列表加载到 ≥5 项）；配合 text/id/desc/xpath 用' },
+        within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内等：等列表某一行里的按钮出现/变可点（先 adb_find 拿那一行的 ref）' },
+        within_rect: { type: 'array', items: { type: 'integer' }, description: '同上，但直接给坐标框 [x,y,w,h]；不先取 ref 的场合用' },
         activity: { type: 'string', description: '等前台页面切到这个正则，例如 "ScanActivity"' },
         until: {
           type: 'string',
@@ -3845,9 +3851,11 @@ export function apply(ctx, config) {
         xpath: args.xpath,
         xpath_gone: args.xpath_gone,
         count_min: args.count_min,
+        within_ref: args.within_ref,
+        within_rect: args.within_rect,
       }
       const bounded = (value) => Math.min(60_000, Math.max(200, Number(value ?? 15_000)))
-      const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
+      const askedCondition = Object.entries(want).some(([key, value]) => key !== 'within_ref' && key !== 'within_rect' && (Array.isArray(value) ? value.length > 0 : value !== undefined))
       if (args.count_min !== undefined && !args.text && !args.id && !args.desc && !args.xpath) {
         return {
           ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,

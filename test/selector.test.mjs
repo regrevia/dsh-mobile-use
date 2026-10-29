@@ -560,6 +560,18 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('等待条件也认 within_ref：只看框里的文字', () => {
+  const inside = { text: '保存', x1: 500, y1: 900, x2: 600, y2: 1000 }
+  const outside = { text: '取消', x1: 0, y1: 0, x2: 100, y2: 100 }
+  const state = { activity: 'A', nodes: [inside, outside], refs: [{ ref: 1, node: { x1: 450, y1: 850, x2: 650, y2: 1050 } }] }
+  assert.equal(matches(state, { text: '保存' }), true)
+  assert.equal(matches(state, { text: '保存', within_ref: 1 }), true)
+  assert.equal(matches(state, { text: '取消' }), true)
+  assert.equal(matches(state, { text: '取消', within_ref: 1 }), false)
+  assert.equal(matches(state, { count_min: 1, text: '保存', within_ref: 1 }), true)
+  assert.equal(matches(state, { count_min: 2, within_ref: 1, text: '保存' }), false)
+})
+
 it('adb_do 步骤：on_fail=continue 让这一步允许失败', () => {
   assert.equal(validateSteps([{ tap: '确定', on_fail: 'continue' }]).ok, true)
   assert.equal(validateSteps([{ tap: '确定', on_fail: 'stop' }]).ok, true)
