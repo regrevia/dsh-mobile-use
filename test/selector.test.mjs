@@ -560,6 +560,10 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：tap 可以配 within_ref 限定范围', () => {
+  assert.equal(validateSteps([{ tap: '关注', within_ref: 12 }]).ok, true)
+})
+
 it('adb_do 步骤：输入步可以带 clear 先清空', () => {
   assert.equal(validateSteps([{ tap: '搜索框' }, { text: '耳机', clear: true }]).ok, true)
 })

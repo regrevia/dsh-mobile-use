@@ -4787,6 +4787,7 @@ export function apply(ctx, config) {
               xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
+              within_ref: { type: 'integer', description: '配 tap/id：只在这个 ref 的矩形范围内找目标（点列表某一行里的按钮/开关，先 adb_find 拿那一行的 ref）' },
               scroll_to: {
                 description: '先边滑边找目标再动作：给文字，或给 {text|id|desc|cls|xpath, direction, until, dismiss, max_swipes} 说清找什么、往哪滑',
                 oneOf: [
@@ -4916,7 +4917,7 @@ export function apply(ctx, config) {
           } else {
             /* 按文字/id 点之前先确认快照还对应现在的界面，页面换了就重新 dump，不拿旧坐标点。 */
             await snapshotForSelector(device)
-            const want = { text: step.tap, id: step.id }
+            const want = { text: step.tap, id: step.id, within_ref: step.within_ref }
             try {
               node = await awaitNode(device, want, step.wait_ms)
             } catch (error) {
