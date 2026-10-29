@@ -5916,6 +5916,7 @@ export const __internals = {
   waitFor,
   findBlocker,
   failureSuffix,
+  annotateFailure,
   tapPointFast,
   awaitStable,
   scrollToText,
