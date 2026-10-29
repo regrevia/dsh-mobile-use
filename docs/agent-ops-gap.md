@@ -147,6 +147,19 @@
 
 | 按方向滑/按框滑（`adb_gesture {direction, percent, from}`） | Appium `mobile: swipeGesture` 的 direction+percent 写法 | 给了 direction 就按屏幕/控件框算直线，percent 控制行程（0.1–1，默认 0.7），不用模型手算坐标；`from` 给控件就滑它，否则挑最内层可滚容器 | 本轮 |
 
+
+## 崩溃防线（本机真实 OOM 沉淀）
+
+宿主和插件同一个 Node 进程，内存问题不是「插件出错」而是「整个 DSH 没了」。三类崩溃分开算：
+
+| 崩溃 | 证据 | 归属 | 状态 |
+| --- | --- | --- | --- |
+| `RangeError: Maximum call stack` | 栈里是 `stop()` / `emit('closed')` | 插件：关闭路径不幂等，stop→closed→stop 递归 | 已修（`scrcpy.js` 一次性清理保护 + 回归测试） |
+| `node::OOMErrorHandler`、堆 ≈4GB、无插件栈 | `.ips` + `crash-*-host.log` | 宿主/核心（大会话恢复、其他插件） | 不归本插件；插件侧只做加固 |
+| 插件侧内存放大点 | `adb()` 直连子进程默认各自 64MB 输出 | 插件：并发大输出叠成几百 MB | 已修（全局闸门：并发 ≤4、预留合计 ≤24MB、排队 ≤16、等 30s 明确报错） |
+
+判读顺序：先 `.ips` 里是 `OOMErrorHandler` 还是 `RangeError`，再决定查缓存/并发还是查递归/关闭路径。两条不要混着归因。
+
 ### 明确不抄
 
 - **Appium 整机那套**（server + session + W3C 协议）：为跨端一致性付的抽象税，对本插件是纯延迟。
