@@ -560,6 +560,27 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：scroll_to 能写对象，说清找什么、往哪滑', () => {
+  assert.equal(validateSteps([{ scroll_to: '设置' }]).ok, true)
+  const obj = validateSteps([{ scroll_to: { xpath: '//*[@text="设置"]', direction: 'down', until: 'clickable', dismiss: true, max_swipes: 12 } }])
+  assert.equal(obj.ok, true, obj.problems.join(''))
+  const empty = validateSteps([{ scroll_to: { direction: 'up' } }])
+  assert.equal(empty.ok, false)
+  assert.match(empty.problems.join(''), /要说清找什么/)
+  const typo = validateSteps([{ scroll_to: { text: 'a', max_swipe: 3 } }])
+  assert.equal(typo.ok, false)
+  assert.match(typo.problems.join(''), /不认识的字段 max_swipe/)
+  const state = validateSteps([{ scroll_to: { text: 'a', until: '灰' } }])
+  assert.equal(state.ok, false)
+  assert.match(state.problems.join(''), /until 只能是/)
+  const num = validateSteps([{ scroll_to: { text: 'a', max_swipes: 0 } }])
+  assert.equal(num.ok, false)
+  assert.match(num.problems.join(''), /1–15/)
+  const badSlash = validateSteps([{ scroll_to: { xpath: 'text="a"' } }])
+  assert.equal(badSlash.ok, false)
+  assert.match(badSlash.problems.join(''), /scroll_to\.xpath 要以/)
+})
+
 it('adb_do 步骤：xpath 条件、数量下限、崩溃核对都能当一步', () => {
   assert.equal(validateSteps([{ assert_xpath: '//*[@clickable="true"]' }]).ok, true)
   assert.equal(validateSteps([{ wait_for_xpath: '//*[@text="订单"]', tap: '确定' }]).ok, true)

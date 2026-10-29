@@ -493,6 +493,33 @@ function validateSteps(steps) {
       const expr = String(step[key]).trim()
       if (!expr.startsWith('/')) problems.push(`第 ${at} 步 ${key} 要以 // 或 / 开头，例如 //*[@text="登录"]。`)
     }
+    if (step.scroll_to !== undefined && typeof step.scroll_to !== 'string') {
+      const target = step.scroll_to
+      if (target === null || typeof target !== 'object' || Array.isArray(target)) {
+        problems.push(`第 ${at} 步 scroll_to 要么直接写文字，要么写 {text|id|desc|cls|xpath, direction, until, dismiss, max_swipes}。`)
+      } else {
+        const pickers = ['text', 'id', 'desc', 'cls', 'xpath']
+        if (!pickers.some((key) => typeof target[key] === 'string' && target[key].trim() !== '')) {
+          problems.push(`第 ${at} 步 scroll_to 要说清找什么：text / id / desc / cls / xpath 至少写一个。`)
+        }
+        if (target.xpath !== undefined && !String(target.xpath).trim().startsWith('/')) {
+          problems.push(`第 ${at} 步 scroll_to.xpath 要以 // 或 / 开头，例如 //*[@text="登录"]。`)
+        }
+        if (target.direction !== undefined && !directions.includes(String(target.direction))) {
+          problems.push(`第 ${at} 步 scroll_to.direction 只能是 up / down / left / right。`)
+        }
+        if (target.until !== undefined && !['visible', 'enabled', 'clickable', 'checked', 'focused'].includes(String(target.until))) {
+          problems.push(`第 ${at} 步 scroll_to.until 只能是 visible / enabled / clickable / checked / focused。`)
+        }
+        if (target.max_swipes !== undefined) {
+          const times = Number(target.max_swipes)
+          if (!(Number.isInteger(times) && times >= 1 && times <= 15)) problems.push(`第 ${at} 步 scroll_to.max_swipes 要写 1–15 的整数。`)
+        }
+        const known = [...pickers, 'direction', 'until', 'dismiss', 'max_swipes']
+        const extra = Object.keys(target).filter((key) => !known.includes(key))
+        if (extra.length > 0) problems.push(`第 ${at} 步 scroll_to 里有不认识的字段 ${extra.join(' / ')}：只能写 ${known.join(' / ')}。`)
+      }
+    }
     if (step.assert_count_min !== undefined) {
       const least = Number(step.assert_count_min)
       if (!(Number.isInteger(least) && least >= 1 && least <= 500)) problems.push(`第 ${at} 步 assert_count_min 要写 1–500 的整数。`)
@@ -2231,7 +2258,7 @@ async function scrollToText(serial, text, direction) {
  * @param {number} maxAttempts - 最多滑几次（1–15）。
  * @returns {Promise<any>} 命中的节点。
  */
-async function scrollToSelector(serial, want, direction, maxAttempts) {
+async function scrollToSelector(serial, want, direction, maxAttempts, options = {}) {
   const size = await screenSize(serial)
   const dir = ['up', 'down', 'left', 'right'].includes(direction) ? direction : 'up'
   const label = want.text || want.id || want.desc || want.cls || want.xpath || '目标'
@@ -2242,9 +2269,16 @@ async function scrollToSelector(serial, want, direction, maxAttempts) {
   for (let attempt = 0; attempt <= limit; attempt += 1) {
     const state = attempt === 0 ? await snapshotForSelector(serial) : await pollDump(serial)
     const pool = want.xpath !== undefined ? selectXPath(state.nodes, want.xpath) : selectNodes(state, { ...want, all: true })
-    const hits = pool.filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
+    const hits = pool.filter((node) => node.x2 > node.x1 && node.y2 > node.y1 && nodeStateOk(node, options.until))
     if (hits.length > 0) return hits[want.index ?? 0] ?? hits[0]
     if (attempt === limit) break
+    if (options.dismiss === true) {
+      const blocker = findBlocker(state, [want.text, want.id, want.desc].filter((item) => typeof item === 'string' && item !== ''))
+      if (blocker !== null && await tapPointFast(serial, (blocker.x1 + blocker.x2) / 2, (blocker.y1 + blocker.y2) / 2)) {
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        continue
+      }
+    }
     /* 同一个框滑完界面没变 = 那个框到底了；换下一个可滚容器，全都不动才报错，别在错的应用里盲滑。 */
     const signature = state.tree.lines.join('\n')
     if (lastBox !== null && signature === previous) {
@@ -4719,7 +4753,27 @@ export function apply(ctx, config) {
               xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
-              scroll_to: { type: 'string', description: '先边滑边找这段文字，找到就点它；找不到算失败' },
+              scroll_to: {
+                description: '先边滑边找目标再动作：给文字，或给 {text|id|desc|cls|xpath, direction, until, dismiss, max_swipes} 说清找什么、往哪滑',
+                oneOf: [
+                  { type: 'string' },
+                  {
+                    type: 'object',
+                    properties: {
+                      text: { type: 'string' },
+                      id: { type: 'string' },
+                      desc: { type: 'string' },
+                      cls: { type: 'string' },
+                      xpath: { type: 'string' },
+                      direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+                      until: { type: 'string', enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'] },
+                      dismiss: { type: 'boolean' },
+                      max_swipes: { type: 'integer' },
+                    },
+                    additionalProperties: false,
+                  },
+                ],
+              },
               scroll: { type: 'integer', description: '按文字/id 点时先滑几次找目标（1–15）：当前屏没有就边滑边找，找到再点' },
               scroll_direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'scroll 的滑动方向，默认 up（把下面的内容拉上来）' },
               wait_ms: { type: 'integer', description: '这一步的目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）' },
@@ -4798,8 +4852,10 @@ export function apply(ctx, config) {
         try {
         let node = null
         if (step.scroll_to !== undefined) {
-          node = await scrollToText(device, String(step.scroll_to), step.direction)
-          done.push(`滑到「${oneLine(String(step.scroll_to), 16)}」`)
+          const target = typeof step.scroll_to === 'string' ? { text: step.scroll_to } : { ...step.scroll_to }
+          const label = target.text || target.id || target.desc || target.cls || target.xpath || ''
+          node = await scrollToSelector(device, target, target.direction ?? step.direction, target.max_swipes ?? 8, { until: target.until, dismiss: target.dismiss === true })
+          done.push(`滑到「${oneLine(label, 16)}」${target.until ? `（${target.until}）` : ''}`)
         }
         if (step.tap !== undefined || step.id !== undefined || step.ref !== undefined || step.xpath !== undefined || node !== null) {
           let point = null
