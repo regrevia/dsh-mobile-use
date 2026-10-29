@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, dezero, pollGap, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -751,6 +751,14 @@ it('等待条件也认 within_ref：只看框里的文字', () => {
   assert.equal(matches(state, { text: '取消', within_ref: 1 }), false)
   assert.equal(matches(state, { count_min: 1, text: '保存', within_ref: 1 }), true)
   assert.equal(matches(state, { count_min: 2, within_ref: 1, text: '保存' }), false)
+})
+
+it('等静止的结论：没静下来要算失败，读不到树不算', () => {
+  assert.equal(stableFailure({ stable: true, empty: false, ms: 400 }), null)
+  /* 游戏/视频自己画的屏没有树，empty 是正常现象，不能当成「前提没成立」。 */
+  assert.equal(stableFailure({ stable: false, empty: true, ms: 5000 }), null)
+  assert.match(stableFailure({ stable: false, empty: false, ms: 5000 }), /画面还在变.*5000ms/)
+  assert.match(stableFailure({ stable: false, empty: false }), /画面还在变/)
 })
 
 it('adb_do 步骤：on_fail=continue 让这一步允许失败', () => {

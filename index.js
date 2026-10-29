@@ -2982,6 +2982,18 @@ async function awaitChange(serial, signature, options = {}) {
  * @param {{quietMs?: number, timeoutMs?: number}} [options] - 静止窗口与总上限。
  * @returns {Promise<{state: any, stable: boolean, quietMs: number, ms: number, dumps: number, empty: boolean}>} 结果。
  */
+/**
+ * 等静止的结论是不是「没等到」。
+ * 读不到控件（empty）不算失败：这屏可能自己在画（游戏/视频），本来就没有树可以静。
+ * @param {{ stable?: boolean, empty?: boolean, ms?: number }} calmed - awaitStable 的返回。
+ * @returns {string | null} 失败原因；等到了或读不到树时返回 null。
+ */
+function stableFailure(calmed) {
+  if (calmed?.stable === true || calmed?.empty === true) return null
+  const ms = Number(calmed?.ms ?? 0)
+  return `画面还在变，${ms > 0 ? `${ms}ms ` : ''}内没静下来`
+}
+
 async function awaitStable(dump, options = {}) {
   const quietMs = Math.max(120, Number(options.quietMs ?? 400))
   const timeoutMs = Math.max(quietMs, Number(options.timeoutMs ?? 5000))
@@ -4388,7 +4400,7 @@ export function apply(ctx, config) {
           ? `，界面已静止 ${calmed.quietMs}ms · 当前 ${activity || '未知页面'}${changed === false ? `：界面没变化（${tapMissReason(after, { x, y }, missTarget, prior)}）` : changed === true ? '，界面已变化' : ''}`
           : calmed.empty
             ? '，点已发出，但一直读不到控件（可能还在加载或这屏自己画的）'
-            : `，点了但 ${calmed.ms}ms 内画面还在变，先别按旧坐标点`
+            : `，点了但${stableFailure(calmed)}，先别按旧坐标点`
       } else if (prior && prior.signature && Array.isArray(prior.nodes) && prior.nodes.length > 0
         && Date.now() - prior.at < 15_000) {
         /* 没给等待条件时给一次回执：界面没变化就是可疑信号，别让模型再去读一遍树才发现。 */
@@ -5292,6 +5304,9 @@ export function apply(ctx, config) {
           })
           activity = calmed.state.activity
           done.push(`等静止 ${calmed.ms}ms${calmed.stable ? '' : calmed.empty ? '（读不到控件）' : '（到点还没静）'}`)
+          /* 等不到静止 = 这一步的前提没成立：不能记成功，否则后面的判断都建在动画中途的树上。 */
+          const stillMoving = stableFailure(calmed)
+          if (stillMoving !== null) throw new Error(`第 ${at} 步等界面静止超时 ${limit}ms：${stillMoving}`)
         }
 
         if (step.wait_text !== undefined || step.wait_gone !== undefined || step.wait_all !== undefined || step.wait_any !== undefined || step.wait_activity !== undefined || step.wait_activity_gone !== undefined || step.wait_for_xpath !== undefined || step.wait_xpath_gone !== undefined) {
@@ -7342,6 +7357,7 @@ export const __internals = {
   annotateFailure,
   tapPointFast,
   awaitStable,
+  stableFailure,
   scrollToText,
   scrollToSelector,
   u2Dump,
