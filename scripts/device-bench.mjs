@@ -61,3 +61,5 @@ if (dumpRows.length > 0) {
   const avg = Math.round(dumpRows.reduce((sum, ms) => sum + ms, 0) / dumpRows.length)
   console.log(`dump 均值 ${avg}ms（${dumpRows.join('/')}）`)
 }
+/* u2 的 RPC 连接不会自己断，事件循环因此不退出：跑完直接走人，别让命令行卡在那儿。 */
+process.exit(0)

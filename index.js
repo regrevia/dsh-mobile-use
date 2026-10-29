@@ -1571,11 +1571,11 @@ function normalList(value) {
  */
 async function waitFor(serial, want, timeoutMs) {
   const started = Date.now()
-  let state = await dumpState(serial, {})
+  let state = await pollDump(serial)
   while (!matches(state, want)) {
     if (Date.now() - started > timeoutMs) return { matched: false, elapsedMs: Date.now() - started, state }
     await new Promise((resolve) => setTimeout(resolve, 120))
-    state = await dumpState(serial, {})
+    state = await pollDump(serial)
   }
   return { matched: true, elapsedMs: Date.now() - started, state }
 }
@@ -1720,6 +1720,14 @@ async function dumpState(serial, options) {
 }
 
 /**
+ * 轮询里的 dump：不走 OCR。等条件/等静止一秒要读好几次树，自绘界面每读一次都会多花 1.5s 补 OCR；
+ * OCR 只在对模型交结果的那一次做（adb_ui / adb_find 的最终 dump）。
+ * @param {string} serial - 设备。
+ * @returns {Promise<any>} 状态。
+ */
+const pollDump = (serial) => dumpState(serial, { ocr: false })
+
+/**
  * 校验手上这次快照还能用：没有快照、过期、或编号对不上都直接说清楚，不拿旧 ref 乱点。
  * @param {string} serial - 设备。
  * @param {string | undefined} snapshotId - 调用方带的快照编号（可省略）。
@@ -1763,7 +1771,7 @@ async function freshNodeFor(serial, node, snapshotId) {
   const cached = lastTrees.get(serial)
   if (!cached || Date.now() - cached.at <= REF_SOFT_TTL_MS) return node
   const label = oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)
-  const next = await dumpState(serial, {})
+  const next = await pollDump(serial)
   const ox = (node.x1 + node.x2) / 2
   const oy = (node.y1 + node.y2) / 2
   /* 同一段文字常有多份（父容器 + 子节点、左右分栏），按「离旧位置最近」认领，不算歧义。 */
@@ -1919,7 +1927,7 @@ async function scrollToSelector(serial, want, direction, maxAttempts) {
   let previous = ''
   let lastBox = null
   for (let attempt = 0; attempt <= limit; attempt += 1) {
-    const state = attempt === 0 ? await snapshotForSelector(serial) : await dumpState(serial, {})
+    const state = attempt === 0 ? await snapshotForSelector(serial) : await pollDump(serial)
     const hits = selectNodes(state, { ...want, all: true }).filter((node) => node.x2 > node.x1 && node.y2 > node.y1)
     if (hits.length > 0) return hits[want.index ?? 0] ?? hits[0]
     if (attempt === limit) break
@@ -2166,7 +2174,7 @@ async function awaitNode(device, want, waitMs) {
       await new Promise((resolve) => setTimeout(resolve, 120))
       try {
         /* dumpState 会刷新 lastTrees，nodeForSelector 读到的就是这一轮的新界面。 */
-        await dumpState(device, {})
+        await pollDump(device)
         return nodeForSelector(device, want)
       } catch (inner) {
         last = inner
@@ -2412,7 +2420,7 @@ async function awaitChange(serial, signature, options = {}) {
   let state = null
   for (const wait of waits) {
     await new Promise((resolve) => setTimeout(resolve, wait))
-    state = await dumpState(serial, {})
+    state = await pollDump(serial)
     if (Array.isArray(state.nodes) && state.nodes.length > 0 && state.tree.lines.join('\n') !== signature) return state
   }
   return state
@@ -3192,7 +3200,7 @@ export function apply(ctx, config) {
           : `，等待超时 ${args.timeout_ms ?? 10_000}ms，界面没出现预期变化`
       } else if (args.wait_stable === true) {
         /* 点完等它静下来再判「变没变」：动画中途读到的树会骗人。 */
-        const calmed = await awaitStable(() => dumpState(device, {}), {
+        const calmed = await awaitStable(() => pollDump(device), {
           quietMs: args.quiet_ms ?? 400,
           timeoutMs: args.timeout_ms ?? 10_000,
         })
@@ -3659,7 +3667,7 @@ export function apply(ctx, config) {
         const point = `${Math.round((hit.x1 + hit.x2) / 2)},${Math.round((hit.y1 + hit.y2) / 2)}`
         return { ref: entry ? entry.ref : null, point }
       }
-      let state = await dumpState(device, {})
+      let state = await pollDump(device)
       let swipes = 0
       let target = null
       for (;;) {
@@ -3692,7 +3700,7 @@ export function apply(ctx, config) {
         }
         swipes += 1
         await new Promise((resolve) => setTimeout(resolve, 260))
-        state = await dumpState(device, {})
+        state = await pollDump(device)
         if (state.tree.lines.join('\n') === before) {
           const again = selectNodes(state, sel)
           if (again.length === 0) {
@@ -3907,7 +3915,7 @@ export function apply(ctx, config) {
 
         if (step.wait_idle === true || step.wait_stable === true) {
           /* 等界面静止：树签名连续 idle_ms 不变才算稳定，最多等到本步上限。 */
-          const calmed = await awaitStable(() => dumpState(device, {}), {
+          const calmed = await awaitStable(() => pollDump(device), {
             quietMs: step.idle_ms ?? 400,
             timeoutMs: limit,
           })
