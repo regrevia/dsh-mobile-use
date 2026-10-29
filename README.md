@@ -146,6 +146,12 @@ cd dsh-mobile-use
 | `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode` |
 | `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 「刚才那几秒」的 6 帧拼图：动效比例/位移/卡顿这类单帧看不出的问题用它。优先用直播内存帧，没有就现场录一小段（约 +4.5 s），都不行才回落到磁盘段**并注明「不是刚刚」** |
+| `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |
+| `adb_scroll_to` | 滚到目标出现：给 `text`/`id`/`desc` 一路滑到看见为止，回执带滑动次数、命中节点和是否到底；不用模型自己算滑动次数 |
+| `adb_anim` | 动画/过渡诊断：开 `animation_scale` 相关的 debug 开关看窗口动画、过渡、Animator 时长，定位「它到底在动什么」 |
+| `adb_proc` | 进程/内存：`top` / `mem` / `list` 一次 shell 拿回，判卡顿、被杀、内存涨，不用截图猜 |
+| `adb_events` | 系统事件：logcat 里按 tag/pid 抓崩溃、ANR、Activity 切换，回执按时间倒序 |
+| `adb_web` | 内嵌 H5：CDP 直读 DOM，返回 CSS 矩形和换算后的设备坐标，可直接喂 `adb_tap point=`；App 没开 WebView 调试时明确报错 |
 | `adb_window` | 按窗口看界面：一次 dump 列出所有可见窗口（前台页、悬浮窗/桌宠、状态栏、输入法），给包名、尺寸、位置和窗口内控件树。`adb_ui` 只看前台页文字，悬浮窗/桌宠这类独立窗口用它；实测 236 ms（含前台 Activity 查询） |
 | `adb_watch` | 采样一个控件的几何随时间变化：`id`/`text`/`class` 选靶，给出宽高与位置序列、最大单步、抖动次数、多久稳住，用来量化「刚才那个东西大小/位置变化不协调」。动画在 WebView 画布内部时几何不变，会如实说明并指向 `adb_motion` |
 | `adb_motion` | 量化「刚才那几秒」的动效：传 `region="x,y,w,h"` 或 `target`（文字 / 资源 id 子串，自动取控件框），逐像素比对给每帧变了多大、变在哪、抖了几下、多久稳住。圈定区域时用「外缘半径」衡量变大变小（桌宠大小动画就量这个），全屏时只认最大连通块并说明判不准；变化帧少于 4 帧或幅度太小时拒绝下抖动/回弹结论 |
