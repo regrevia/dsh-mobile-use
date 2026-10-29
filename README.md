@@ -132,18 +132,18 @@ cd dsh-mobile-use
 
 | 工具 | 作用 |
 | --- | --- |
-| `adb_ui` | 读界面文本树：`ref`、控件类型、文字、`#资源id`、`@中心坐标`，尾部 `*` 可点击 / `~` 可滚动 / `[x]` 勾选 / `[off]` 不可用。支持 `filter`、`full`、`depth`（只列到第 N 层）、`max_nodes`（默认 400，打满会明说「已截断」并给收窄办法）、`wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`（替代 sleep + 反复截图） |
+| `adb_ui` | 读界面文本树：`ref`、控件类型、文字、`#资源id`、`@中心坐标`，尾部 `*` 可点击 / `~` 可滚动 / `[x]` 勾选 / `[off]` 不可用。支持 `filter`、`full`、`depth`（只列到第 N 层）、`max_nodes`（默认 400，打满会明说「已截断」并给收窄办法）、`wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`（替代 sleep + 反复截图）；等待也能用 `wait_for_xpath` / `wait_xpath_gone` |
 | `adb_wait` | 只等条件、不返回整棵树，省 token：`text` / `id` / `desc` / `gone` / `texts`（全出现）/ `any_texts`（任一出现）/ `activity` / `stable`（界面静止）。超时会说清停在哪个页面、能点什么；`until` 等同一个控件进入某状态（`enabled` / `clickable` / `checked` / `focused`）才返回，灰按钮不会误判成等到；`dismiss: true` 被权限/升级/评分弹窗挡住时自动点掉确认按钮（最多 2 次）再接着等，回执列 `dismissed`；没等到会自动留一张截图（`shot.path`，只失败才抓）；也能等 `xpath` 命中 / `xpath_gone` 消失 |
-| `adb_tap` | 按 `ref` / `text` / `id` / `desc` / `point="x,y"` 点击，`long: true` 长按；可带 `wait_for_text` / `wait_for_id` / `wait_until_gone` 点完直接等结果，或 `wait_stable` 等界面静止再回执「变了没变」；回执里 `changed` 说变没变，`reason` 给原因码（`keyboard-covered` / `obscured` / `unclickable` / `gone` / `page-switched` / `no-response` / `same-screen`），`delta` 直接列出这次多/少了哪几行；没生效还会自动留一张截图（`shot.path`） |
+| `adb_tap` | 按 `ref` / `text` / `id` / `desc` / `point="x,y"` 点击，`long: true` 长按；可带 `wait_for_text` / `wait_for_id` / `wait_until_gone` 点完直接等结果，或 `wait_stable` 等界面静止再回执「变了没变」；回执里 `changed` 说变没变，`reason` 给原因码（`keyboard-covered` / `obscured` / `unclickable` / `gone` / `page-switched` / `no-response` / `same-screen`），`delta` 直接列出这次多/少了哪几行；没生效还会自动留一张截图（`shot.path`）；点后等待也吃得下 `wait_for_xpath` / `wait_xpath_gone` |
 | `adb_input` | `text`（ASCII，空格自动转义）、`key`（ENTER/BACK/DEL…）、`submit`（`enter` / `search`，输完直接提交）、`ime`（`auto` / `clipboard` / `adb`，ADBKeyboard 已装且是当前输入法时中文走广播更快）、`swipe`、`clear`；回执给 `method`（ime/paste/input）、`field`（输入框回读）、`verified`，`verify: true` 时 ASCII 直发也回读一次，不用再补 `adb_ui` |
-| `adb_gesture` | 真人轨迹：`points` 折线逐点 DOWN/MOVE/UP，`duration_ms`、`hold_ms`；曲线拖拽、按住再拖 |
+| `adb_gesture` | 真人轨迹：`points` 折线逐点 DOWN/MOVE/UP，`duration_ms`、`hold_ms`；曲线拖拽、按住再拖；滑完可等文字或 `wait_for_xpath` / `wait_xpath_gone` |
 | `adb_app` | `info`（versionCode/versionName + 前台）、`install`（`-r -d`）、`start`、`stop`、`clear`、`foreground` |
 | `adb_sh` | 设备端任意命令，输出截断到 20k 字符；日志、`dumpsys` |
 | `adb_shot` | 只在要看颜色/布局/相机画面时截图，默认缩到长边 900 px，返回路径给 `read_image`；`region="x,y,w,h"` 只回一块（看桌宠、小图标时体积降一个量级）；带 `ref` 只截那个控件（实测桌宠页一个图标 126×126 / 1.6 KB，整屏 600×900 / 39 KB） |
 | `adb_device` | 列设备、状态、型号、当前选中设备与分辨率 |
 | `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
 | `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步；每步可 `retry` 重来注入前的偶发失败；失败时自动留一张截图到 `~/.dsh/adb-evidence/<序列号>/`（只留最近 20 张）；步骤也能带 `until`（等同一控件进入某状态）与 `dismiss`（本步等待时自动点掉挡路弹窗）；步骤也能用 `xpath` 一次定位点掉 |
-| `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode`；可带 `wait_for_text` / `wait_until_gone`，动作和确认一次调用做完 |
+| `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode`；可带 `wait_for_text` / `wait_until_gone`，动作和确认一次调用做完；等待支持 `wait_for_xpath` / `wait_xpath_gone` |
 | `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 「刚才那几秒」的 6 帧拼图：动效比例/位移/卡顿这类单帧看不出的问题用它。优先用直播内存帧，没有就现场录一小段（约 +4.5 s），都不行才回落到磁盘段**并注明「不是刚刚」** |
 | `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |
