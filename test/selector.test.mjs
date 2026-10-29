@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, selectXPath, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -514,6 +514,36 @@ it('失败现场：一句话带页面、屏上内容、截图，已有的不重�
   )
   const already = '超时，截图 /tmp/a.jpg'
   assert.equal(failureSuffix({ message: already, activity: 'com.a/.Main' }), already, '已带现场就不重复拼')
+})
+
+it('xpath：Appium 写法在本地一遍算完，含子节点与谓词', () => {
+  // [0] 根 LinearLayout
+  //  ├ [1] 标题 TextView "订单"
+  //  └ [2] 行 LinearLayout  →  [3] 按钮 Button "确定"  [4] 按钮 Button "取消"
+  const mk = (over) => ({ index: 0, parent: -1, depth: 0, text: '', id: '', desc: '', cls: '', pkg: '', clickable: false, enabled: true, checked: false, focused: false, selected: false, scrollable: false, password: false, ...over })
+  const nodes = [
+    mk({ index: 0, cls: 'android.widget.LinearLayout', pkg: 'com.a' }),
+    mk({ index: 1, parent: 0, depth: 1, text: '订单', cls: 'android.widget.TextView' }),
+    mk({ index: 2, parent: 0, depth: 1, cls: 'android.widget.LinearLayout' }),
+    mk({ index: 3, parent: 2, depth: 2, text: '确定', id: 'com.a:id/ok', cls: 'android.widget.Button', clickable: true }),
+    mk({ index: 4, parent: 2, depth: 2, text: '取消', id: 'com.a:id/cancel', cls: 'android.widget.Button', clickable: true, enabled: false }),
+  ]
+  const texts = (pool) => pool.map((node) => node.text)
+  assert.deepEqual(texts(selectXPath(nodes, '//*[@text="确定"]')), ['确定'])
+  assert.deepEqual(texts(selectXPath(nodes, '//node[@resource-id="com.a:id/ok"]')), ['确定'])
+  assert.deepEqual(texts(selectXPath(nodes, '//*[contains(@text,"取")]')), ['取消'])
+  assert.deepEqual(texts(selectXPath(nodes, '//LinearLayout/node[2]/Button[1]')), ['确定'])
+  assert.deepEqual(texts(selectXPath(nodes, '//node[last()]')), ['取消'])
+  assert.deepEqual(texts(selectXPath(nodes, '//*[@clickable="true"]')), ['确定', '取消'])
+  assert.deepEqual(texts(selectXPath(nodes, '//*[@clickable="true"][@enabled="true"]')), ['确定'])
+  assert.deepEqual(texts(selectXPath(nodes, '//node[not(@text)]')), ['', ''])
+  assert.equal(selectXPath(nodes, '//*[@text="不存在"]').length, 0)
+  assert.throws(() => selectXPath(nodes, 'xpath'), /以 \/\/ 或 \//)
+  assert.throws(() => selectXPath(nodes, '//*[@text=确定]'), /谓词看不懂/)
+  assert.throws(() => selectXPath(nodes, '//*[contains(@text)]'), /谓词看不懂/)
+  // // 与 / 的差别：直接子 vs 任意后代
+  assert.equal(selectXPath(nodes, '//LinearLayout[1]/Button').length, 0, '/ 只走直接子节点')
+  assert.equal(selectXPath(nodes, '//LinearLayout[1]//Button').length, 2, '// 走全部后代')
 })
 
 console.log(`\n${pass} 项通过\n`)

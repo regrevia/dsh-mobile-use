@@ -3054,6 +3054,200 @@ async function uiInRect(serial, rect) {
  * @param {any} ctx - Cordis 上下文。
  * @param {any} config - bundle patch 里的 config。
  */
+/**
+ * 支持一小撮 XPath，覆盖 Appium 常用定位写法（一次遍历本地算完，不多跑一轮 adb）：
+ * `//*[@text="登录"]`、`//node[@resource-id="btn"]`、`//*[contains(@text,"登")]`、
+ * `//LinearLayout/node[2]`、`//*[@clickable="true"][1]`、`//node[last()]`。
+ * 轴只支持 / 与 //；属性名支持 text id/resource-id desc/content-desc cls/class pkg/package
+ * clickable enabled checked focused selected scrollable password long-clickable index。
+ * @param {any[]} nodes - parseNodes 的结果。
+ * @param {string} expr - XPath 表达式。
+ * @returns {any[]} 命中节点，文档顺序。
+ */
+function selectXPath(nodes, expr) {
+  const text = String(expr ?? '').trim()
+  if (!text.startsWith('/')) throw new Error('xpath 要以 // 或 / 开头，例如 //*[@text="登录"]')
+  const steps = []
+  let i = 0
+  while (i < text.length) {
+    let combinator = ''
+    if (text.startsWith('//', i)) { combinator = '//'; i += 2 } else if (text[i] === '/') { combinator = '/'; i += 1 } else {
+      throw new Error(`xpath 看不懂这一段：${text.slice(i, i + 20)}`)
+    }
+    const start = i
+    let depth = 0
+    let quote = ''
+    while (i < text.length) {
+      const ch = text[i]
+      if (quote) { if (ch === quote) quote = '' } else if (ch === '"' || ch === "'") quote = ch
+      else if (ch === '[') depth += 1
+      else if (ch === ']') depth -= 1
+      else if (ch === '/' && depth === 0) break
+      i += 1
+    }
+    const source = text.slice(start, i).trim()
+    if (source === '') throw new Error('xpath 里有空的步骤，检查 // 与 /')
+    steps.push({ combinator, step: compileXPathStep(source) })
+  }
+  if (steps.length === 0) throw new Error('xpath 是空的')
+  const children = new Map()
+  for (const node of nodes) {
+    const key = node.parent ?? -1
+    if (!children.has(key)) children.set(key, [])
+    children.get(key).push(node)
+  }
+  let current = null
+  for (let s = 0; s < steps.length; s += 1) {
+    const { combinator, step } = steps[s]
+    let pool
+    if (s === 0) pool = combinator === '//' ? nodes.slice() : (children.get(-1) ?? []).slice()
+    else pool = expandXPath(current, combinator, children)
+    current = applyXPathStep(pool, step)
+    if (current.length === 0) return []
+  }
+  return current
+}
+
+/**
+ * 按轴展开一层：/ 是直接子节点，// 是全部后代。
+ * @param {any[]} pool - 上一层命中。
+ * @param {string} combinator - `/` 或 `//`。
+ * @param {Map<number, any[]>} children - parent → 子节点。
+ * @returns {any[]} 候选节点，文档顺序去重。
+ */
+function expandXPath(pool, combinator, children) {
+  const out = []
+  const seen = new Set()
+  const push = (node) => {
+    if (seen.has(node.index)) return
+    seen.add(node.index)
+    out.push(node)
+  }
+  for (const node of pool) {
+    if (combinator === '/') {
+      for (const kid of children.get(node.index) ?? []) push(kid)
+      continue
+    }
+    const stack = (children.get(node.index) ?? []).slice().reverse()
+    while (stack.length > 0) {
+      const kid = stack.pop()
+      push(kid)
+      const grand = children.get(kid.index) ?? []
+      for (let g = grand.length - 1; g >= 0; g -= 1) stack.push(grand[g])
+    }
+  }
+  return out.sort((a, b) => a.index - b.index)
+}
+
+/**
+ * 解析一个步骤：tag（或 *）+ 若干谓词。
+ * @param {string} source - 步骤原文。
+ * @returns {{tag: string, preds: any[]}} 编译结果。
+ */
+function compileXPathStep(source) {
+  const match = /^([A-Za-z_][\w.:-]*|\*)((?:\[[^\]]*\])*)$/.exec(source)
+  if (!match) throw new Error(`xpath 步骤看不懂：${source}`)
+  const preds = []
+  const scan = /\[([^\]]*)\]/g
+  let piece
+  while ((piece = scan.exec(match[2] ?? '')) !== null) preds.push(compileXPathPredicate(piece[1].trim()))
+  return { tag: match[1], preds }
+}
+
+const XPATH_ATTRS = {
+  text: 'text',
+  id: 'id',
+  'resource-id': 'id',
+  desc: 'desc',
+  'content-desc': 'desc',
+  cls: 'cls',
+  class: 'cls',
+  pkg: 'pkg',
+  package: 'pkg',
+  clickable: 'clickable',
+  'long-clickable': 'longClickable',
+  longClickable: 'longClickable',
+  enabled: 'enabled',
+  checked: 'checked',
+  focused: 'focused',
+  selected: 'selected',
+  scrollable: 'scrollable',
+  password: 'password',
+  index: 'index',
+}
+
+/**
+ * 取节点上的属性值（布尔属性给 'true'/'false'）。
+ * @param {any} node - 节点。
+ * @param {string} raw - 表达式里的属性名。
+ * @returns {string} 属性值。
+ */
+function xpathAttr(node, raw) {
+  const key = XPATH_ATTRS[raw] ?? raw
+  const value = node[key]
+  if (value === undefined || value === null) return ''
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  return String(value)
+}
+
+/**
+ * 解析一个谓词：数字序号、last()、@attr、@attr=值、contains(@attr,值)、not(@attr)。
+ * @param {string} source - 方括号里的内容。
+ * @returns {{kind: string, test?: (node: any) => boolean, n?: number}} 编译结果。
+ */
+function compileXPathPredicate(source) {
+  if (source === '') throw new Error('xpath 里有空的 []')
+  if (/^last\(\)$/.test(source)) return { kind: 'last' }
+  if (/^\d+$/.test(source)) return { kind: 'index', n: Number(source) }
+  let match = /^contains\(\s*@([\w-]+)\s*,\s*(['"])(.*?)\2\s*\)$/.exec(source)
+  if (match) {
+    const name = match[1]
+    const needle = match[3]
+    return { kind: 'contains', test: (node) => xpathAttr(node, name).includes(needle) }
+  }
+  match = /^@([\w-]+)\s*=\s*(['"])(.*?)\2$/.exec(source)
+  if (match) {
+    const name = match[1]
+    const want = match[3]
+    return { kind: 'eq', test: (node) => xpathAttr(node, name) === want }
+  }
+  match = /^not\(\s*@([\w-]+)\s*\)$/.exec(source)
+  if (match) {
+    const name = match[1]
+    return { kind: 'not', test: (node) => xpathAttr(node, name) === '' || xpathAttr(node, name) === 'false' }
+  }
+  match = /^@([\w-]+)$/.exec(source)
+  if (match) {
+    const name = match[1]
+    return { kind: 'exists', test: (node) => {
+      const value = xpathAttr(node, name)
+      return value !== '' && value !== 'false'
+    } }
+  }
+  throw new Error(`xpath 谓词看不懂：[${source}]，支持 @属性、@属性="值"、contains(@属性,"值")、[序号]、[last()]、not(@属性)`)
+}
+
+/**
+ * 一个步骤套到候选集上：先看标签/类名，再按顺序应用谓词。
+ * @param {any[]} pool - 候选节点。
+ * @param {{tag: string, preds: any[]}} step - 编译好的步骤。
+ * @returns {any[]} 命中节点。
+ */
+function applyXPathStep(pool, step) {
+  let left = pool.filter((node) => {
+    if (step.tag === '*' || step.tag === 'node') return true
+    const cls = String(node.cls || '')
+    return cls === step.tag || cls.endsWith(`.${step.tag}`)
+  })
+  for (const pred of step.preds) {
+    if (pred.kind === 'index') left = left[pred.n - 1] === undefined ? [] : [left[pred.n - 1]]
+    else if (pred.kind === 'last') left = left.length === 0 ? [] : [left[left.length - 1]]
+    else left = left.filter((node) => pred.test(node))
+    if (left.length === 0) return left
+  }
+  return left
+}
+
 export function apply(ctx, config) {
   const serial = async () => resolveSerial(config)
 
@@ -4673,6 +4867,7 @@ ctx.effect(() => ctx.tools.register({
     type: 'object',
     properties: {
       text: { type: 'string', description: '文字或描述，默认包含匹配' },
+      xpath: { type: 'string', description: 'XPath 定位（Appium 写法：//*[@text="登录"]、//LinearLayout/node[2]、//*[contains(@text,"登")]）；给了它就忽略其他选择器' },
       text_matches: { type: 'string', description: '文字正则（等于 regex=true 时的 text）' },
       id: { type: 'string', description: '资源 id，可只写后半段' },
       desc: { type: 'string', description: 'content-desc' },
@@ -4730,7 +4925,9 @@ ctx.effect(() => ctx.tools.register({
       : await snapshotForSelector(device, args.snapshot_id)
     const refOf = new Map()
     for (const entry of (state.refs ?? state.tree?.refs) || []) if (entry && entry.node) refOf.set(entry.node, entry.ref)
-    const hits = selectNodes(state, {
+    const hits = args.xpath !== undefined
+      ? selectXPath(state.nodes, args.xpath)
+      : selectNodes(state, {
       text: args.text,
       text_matches: args.text_matches,
       id: args.id,
@@ -4750,7 +4947,7 @@ ctx.effect(() => ctx.tools.register({
       within_ref: args.within_ref,
       all: args.all,
       index: args.index,
-    })
+      })
     const max = Math.min(Math.max(Number(args.max) || 20, 1), 50)
     const matches = hits.slice(0, max).map((node, offset) => {
       const w = Math.max(0, node.x2 - node.x1)
@@ -5916,6 +6113,7 @@ export const __internals = {
   waitFor,
   findBlocker,
   failureSuffix,
+  selectXPath,
   annotateFailure,
   tapPointFast,
   awaitStable,

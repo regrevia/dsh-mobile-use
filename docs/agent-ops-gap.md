@@ -41,7 +41,7 @@
 
 **已有（公开工具面）**：
 
-- 定位：`adb_find` 支持多字段 AND（`text`/`id`/`desc`/`cls`/`pkg`）+ `exact`/`regex`/`text_matches` + `index` + `within_ref` + `clickable`/`enabled`/`visible` + 同处去重。
+- 定位：`adb_find` 支持多字段 AND（`text`/`id`/`desc`/`cls`/`pkg`）+ `exact`/`regex`/`text_matches` + `index` + `within_ref` + `clickable`/`enabled`/`visible` + 同处去重。 也支持 Appium 写法 `xpath`：`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`。
 - 防误点：`adb_ui` 给 `snapshot_id`，`adb_tap` 带 `snapshot_id` 校验，快照过期直接报错不拿旧 ref 点；`dry_run` 只算落点。
 - 等待：`adb_ui`/`adb_tap` 内建 `wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`，`adb_do` 每步可带 `wait_text` / `wait_gone`。
 - 观测：整树 96–129 ms（25.7 KB XML 量级 → 59 行文本）【实测】；`changed_only` 增量 diff；`adb_window` 按窗口 dump；`adb_web` 读 WebView DOM；`adb_anim`/`adb_motion` 把动效变成数字；OCR 仅在树近空时兜底。
@@ -132,6 +132,7 @@
 | --- | --- |
 | XPath 兜底 | 仅当选择器表达不了时用；Appium 自评最慢一档，且要额外 dump+解析，作为「逃生舱」而非主路径 |
 | toast / 系统弹窗文本进树 | Appium `enableNotificationListener`（保留 3 500 ms）；本插件可用 `adb_events` 补，但文本进树更省一次调用 |
+| XPath 定位 | Appium 的 XPath 要多一次服务端往返；uiautomator2 没有 XPath | `adb_find xpath=` 支持 `/` `//`、tag/`*`、`@attr`、`@attr="v"`、`contains(@attr,"v")`、`[n]`、`[last()]`、`not(@attr)`，在已 dump 的节点上本地求值 | 本轮（单测 44 项 + 真机 94 节点 19–266 µs） |
 | 失败自动取证 | 竞品都要模型自己再调一次截图/树 | 本插件把 `failureSuffix` 收成统一一句：页面 + 屏上前几行 + 截图路径，`adb_do` / `adb_tap` / `adb_wait` / `adb_find` / `adb_gesture` / `adb_input` / `adb_app` / `adb_sh` / `adb_scroll_to` / `adb_action` 全走它 | 本轮（单测覆盖拼装与去重） |
 | 元素级截图 | u2 元素 `.screenshot()`；用于「这张卡片长什么样」这类必须看图的问题，避免整屏 612–665 ms【实测】 |
 | 组合动作链（W3C 风格） | 长按拖动、双击后滑，一次提交多段轨迹；scrcpy 的 `INJECT_TOUCH_EVENT` 连续帧是参考实现 |
