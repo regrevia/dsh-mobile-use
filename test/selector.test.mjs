@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, dezero, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, dezero, pollGap, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -558,6 +558,23 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 3, y1: 0, x2: 40, y2: 20 }, 8), { x: 0, y: 0, w: 53, h: 36 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 10, y2: 10 }, 0), { x: 10, y: 10, w: 2, h: 2 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
+})
+
+it('等待轮询间隔：刚动完抓得紧，一直没变越等越松', () => {
+  assert.equal(pollGap(0, 0), 120)
+  assert.equal(pollGap(1, 900), 120, '只变过一次还是紧抓')
+  assert.equal(pollGap(2, 500), 120, '前 600ms 内一律 120ms')
+  assert.equal(pollGap(2, 700), 240)
+  assert.equal(pollGap(4, 2000), 360)
+  assert.equal(pollGap(6, 3000), 480)
+  assert.equal(pollGap(9, 4000), 600, '连续不变 8 次以上就顶到 600ms')
+  assert.equal(pollGap(30, 15000), 600, '上限 600ms')
+  /* 10 秒超时：全紧抓约 83 次 dump，退避后应在 45 次以内。 */
+  let at = 0
+  let unchanged = 0
+  let dumps = 0
+  while (at < 10000) { dumps += 1; unchanged += 1; at += pollGap(unchanged, at) + 190 }
+  assert.ok(dumps <= 45, `10 秒里 dump 次数 ${dumps} 应 ≤ 45`)
 })
 
 it('xpath 的文字属性同样去掉零宽字符', () => {

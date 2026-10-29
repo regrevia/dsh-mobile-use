@@ -1919,11 +1919,26 @@ async function tapPointFast(serial, x, y) {
  * @param {{dismiss?: boolean}} [options] - dismiss 允许等到一半时点掉挡路弹窗（最多 2 次）。
  * @returns {Promise<{matched: boolean, elapsedMs: number, state: any, dismissed: string[]}>} 结果。
  */
+/**
+ * 等待时下一次轮询隔多久：刚操作完的几百毫秒里界面可能在动，120ms 一次抓得紧；
+ * 一直没变多半是在等网络/加载，越等越松——10 秒的超时下最多省掉一多半 dump（每次约 0.19s 设备时间）。
+ * @param {number} unchanged - 连续几次 dump 的树签名没变。
+ * @param {number} elapsedMs - 已经等了多久。
+ * @returns {number} 下一次轮询前等多少毫秒。
+ */
+function pollGap(unchanged, elapsedMs) {
+  if (elapsedMs < 600 || unchanged < 2) return 120
+  const step = Math.min(5, Math.floor(unchanged / 2))
+  return Math.min(600, 120 + step * 120)
+}
+
 async function waitFor(serial, want, timeoutMs, options = {}) {
   const started = Date.now()
   const dismissed = []
   const wanted = [want.text, want.id, want.desc, ...(normalList(want.texts)), ...(normalList(want.any_texts))]
   let state = await pollDump(serial)
+  let previous = state.tree.lines.join('\n')
+  let unchanged = 0
   while (!matches(state, want)) {
     if (options.dismiss === true && dismissed.length < 2) {
       const blocker = findBlocker(state, wanted)
@@ -1946,8 +1961,11 @@ async function waitFor(serial, want, timeoutMs, options = {}) {
       }
       return { matched: false, elapsedMs: Date.now() - started, state: lastChance ?? state, dismissed }
     }
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await new Promise((resolve) => setTimeout(resolve, pollGap(unchanged, Date.now() - started)))
     state = await pollDump(serial)
+    const line = state.tree.lines.join('\n')
+    unchanged = line === previous ? unchanged + 1 : 0
+    previous = line
   }
   return { matched: true, elapsedMs: Date.now() - started, state, dismissed }
 }
@@ -7104,6 +7122,7 @@ export const __internals = {
   compactTree,
   crashHint,
   dezero,
+  pollGap,
   shortId,
   displaySizeFrom,
   decodeEntities,
