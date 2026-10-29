@@ -473,7 +473,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'xpath', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'wait_activity_gone', 'wait_for_xpath', 'wait_xpath_gone', 'assert_text', 'assert_gone', 'assert_xpath', 'assert_xpath_gone', 'assert_count_min', 'assert_no_crash', 'sleep_ms', 'until', 'dismiss']
+  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'wait_activity_gone', 'wait_for_xpath', 'wait_xpath_gone', 'assert_text', 'assert_gone', 'assert_xpath', 'assert_xpath_gone', 'assert_count_min', 'assert_activity', 'assert_activity_gone', 'assert_no_crash', 'sleep_ms', 'until', 'dismiss']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -599,6 +599,20 @@ function validateSteps(steps) {
         problems.push(`第 ${at} 步 wait_activity 要写页面正则，例如 "MainActivity"。`)
       } else {
         try { new RegExp(step.wait_activity, 'i') } catch { problems.push(`第 ${at} 步 wait_activity 不是合法正则：${step.wait_activity}`) }
+      }
+    }
+    if (step.assert_activity !== undefined) {
+      if (typeof step.assert_activity !== 'string' || step.assert_activity.trim() === '') {
+        problems.push(`第 ${at} 步 assert_activity 要写页面正则，例如 "MainActivity"。`)
+      } else {
+        try { new RegExp(step.assert_activity, 'i') } catch { problems.push(`第 ${at} 步 assert_activity 不是合法正则：${step.assert_activity}`) }
+      }
+    }
+    if (step.assert_activity_gone !== undefined) {
+      if (typeof step.assert_activity_gone !== 'string' || step.assert_activity_gone.trim() === '') {
+        problems.push(`第 ${at} 步 assert_activity_gone 要写页面正则，例如 "SplashActivity"。`)
+      } else {
+        try { new RegExp(step.assert_activity_gone, 'i') } catch { problems.push(`第 ${at} 步 assert_activity_gone 不是合法正则：${step.assert_activity_gone}`) }
       }
     }
     if (step.wait_activity_gone !== undefined) {
@@ -5018,6 +5032,8 @@ export function apply(ctx, config) {
               assert_xpath_gone: { type: 'string', description: '这一步做完核对这个 XPath 必须不再命中' },
               count_xpath: { type: 'string', description: '配 assert_count_min：数这个 XPath 命中几个；不写就用 text / id 数' },
               assert_count_min: { type: 'integer', description: '这一步做完核对命中数至少这么多个（列表真加载出来了，不是空壳）' },
+              assert_activity: { type: 'string', description: '这一步做完核对就在这个页面（正则）：不在就整段报错，别把错页面当成成功' },
+              assert_activity_gone: { type: 'string', description: '这一步做完核对已经离开这个页面（正则），例如确认启动页/登录页过去了' },
               assert_no_crash: { type: 'boolean', description: '整串动作跑完核对期间没有新的崩溃（读 crash 缓冲区跟开始时比）' },
               sleep_ms: { type: 'integer', description: '硬等多久（尽量用 wait_text 代替）' },
             },
@@ -5229,7 +5245,7 @@ export function apply(ctx, config) {
           done.push(`等 ${step.sleep_ms}ms`)
         }
 
-        if (step.assert_text !== undefined || step.assert_gone !== undefined || step.assert_xpath !== undefined || step.assert_xpath_gone !== undefined || step.assert_count_min !== undefined) {
+        if (step.assert_text !== undefined || step.assert_gone !== undefined || step.assert_xpath !== undefined || step.assert_xpath_gone !== undefined || step.assert_count_min !== undefined || step.assert_activity !== undefined || step.assert_activity_gone !== undefined) {
           const countSel = step.count_xpath ?? step.assert_xpath
           const checked = await waitFor(device, {
             text: step.assert_count_min === undefined ? step.assert_text : (step.text ?? step.assert_text),
@@ -5238,6 +5254,8 @@ export function apply(ctx, config) {
             xpath: countSel,
             xpath_gone: step.assert_xpath_gone,
             count_min: step.assert_count_min,
+            activity: step.assert_activity,
+            activity_gone: step.assert_activity_gone,
             until: step.until,
             within_ref: step.within_ref,
             within_rect: step.within_rect,
@@ -5251,12 +5269,21 @@ export function apply(ctx, config) {
               ? `命中的控件不到 ${step.assert_count_min} 个（当前 ${counted} 个）`
               : step.assert_xpath !== undefined ? `界面上没有匹配 \`${oneLine(step.assert_xpath, 60)}\` 的控件`
                 : step.assert_xpath_gone !== undefined ? `\`${oneLine(step.assert_xpath_gone, 60)}\` 还有命中`
-                  : step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`
+                  : step.assert_activity !== undefined ? `不在 /${step.assert_activity}/ 页面（当前 ${checked.state.activity || '未知'}）`
+                    : step.assert_activity_gone !== undefined ? `还停在 /${step.assert_activity_gone}/ 页面`
+                      : step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`
             throw new Error(`第 ${at} 步核对失败：${what}${nearMiss(checked.state, { text: step.assert_text })}`)
           }
           const stateNote = step.until === undefined ? '' : `（处于 ${step.until}）`
           const popNote = checked.dismissed.length === 0 ? '' : `，先点掉了 ${checked.dismissed.join('/')}`
-          done.push(step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」${stateNote}${popNote}` : `✓「${oneLine(String(step.assert_gone), 16)}」已消失${popNote}`)
+          const verified = step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」`
+            : step.assert_gone ? `✓「${oneLine(step.assert_gone, 16)}」已消失`
+              : step.assert_activity !== undefined ? `✓ 在 /${step.assert_activity}/`
+                : step.assert_activity_gone !== undefined ? `✓ 已离开 /${step.assert_activity_gone}/`
+                  : step.assert_xpath !== undefined ? `✓ 有 \`${oneLine(step.assert_xpath, 40)}\``
+                    : step.assert_xpath_gone !== undefined ? `✓ \`${oneLine(step.assert_xpath_gone, 40)}\` 不再命中`
+                      : `✓ 命中 ${step.assert_count_min} 个以上`
+          done.push(`${verified}${stateNote}${popNote}`)
         }
         }
       break stepLoop

@@ -560,6 +560,15 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：assert_activity 能核对页面', () => {
+  assert.equal(validateSteps([{ tap: '下一步', assert_activity: 'MainActivity' }]).ok, true)
+  assert.equal(validateSteps([{ assert_activity: 'MainActivity' }]).ok, true, '只核对不动作也要能跑')
+  assert.equal(validateSteps([{ assert_activity_gone: 'SplashActivity' }]).ok, true)
+  assert.equal(validateSteps([{ assert_activity: '[' }]).ok, false, '非法正则要被拦')
+  assert.equal(validateSteps([{ assert_activity: '' }]).ok, false)
+  assert.equal(validateSteps([{ assert_activity: 42 }]).ok, false)
+})
+
 it('adb_do 步骤：long_ms 控长按时长（默认 700，越界被拦）', () => {
   assert.equal(validateSteps([{ tap: '按住说话', long_ms: 1200 }]).ok, true)
   assert.equal(validateSteps([{ tap: '按住说话', long: true, long_ms: 300 }]).ok, true)
