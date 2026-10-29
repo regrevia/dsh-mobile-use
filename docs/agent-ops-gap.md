@@ -41,6 +41,7 @@
 
 **已有（公开工具面）**：
 
+- 组合动作：`adb_do` 每步可带 `wait_for_xpath` / `wait_xpath_gone` / `assert_xpath` / `assert_xpath_gone` / `assert_count_min`（配 `count_xpath` 或 `text`/`id`），收尾 `assert_no_crash` 对比 crash 缓冲区起始计数（实测读一次 80ms）。
 - 定位：`adb_find` 支持多字段 AND（`text`/`id`/`desc`/`cls`/`pkg`）+ `exact`/`regex`/`text_matches` + `index` + `within_ref` + `clickable`/`enabled`/`visible` + 同处去重。 也支持 Appium 写法 `xpath`：`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`、`@attr!="值"`、`starts-with(@attr,"值")`、`and` / `or` 连接（位置序号不能进 and/or，会当场报错）。
 - 防误点：`adb_ui` 给 `snapshot_id`，`adb_tap` 带 `snapshot_id` 校验，快照过期直接报错不拿旧 ref 点；`dry_run` 只算落点。
 - 等待：`adb_ui`/`adb_tap` 内建 `wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`，`adb_do` 每步可带 `wait_text` / `wait_gone`。
