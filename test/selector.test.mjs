@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -448,6 +448,31 @@ it('depth 只列到第 N 层：深树先看骨架，别让容器吃满行数', (
   assert.equal(shallow.kept, 2)
   assert.ok(!shallow.lines.join('\n').includes('很深的说明'))
   assert.equal(compactTree(nodes, { depth: 0 }).kept, 0)
+})
+
+it('回执原因码：模型按码分支，不用解析中文；点生效时不该给码', () => {
+  const node = (over) => ({ x1: 0, y1: 0, x2: 1080, y2: 200, text: '', desc: '', cls: 'android.view.View', pkg: 'com.demo', clickable: false, enabled: true, ...over })
+  const tap = { x: 540, y: 1200 }
+  const keyboard = { nodes: [node({ pkg: 'com.sohu.inputmethod.sogou', cls: 'android.inputmethodservice.KeyboardView', y1: 800, y2: 3000 })], activity: '.Main' }
+  assert.equal(describeTapMiss(keyboard, tap, null, null).code, 'keyboard-covered')
+  const dialog = { nodes: [node({ pkg: 'com.android.systemui', cls: 'android.widget.FrameLayout', y2: 3000 })], activity: '.Main' }
+  assert.equal(describeTapMiss(dialog, tap, null, null).code, 'obscured')
+  const plain = { nodes: [node({ pkg: 'com.demo', cls: 'android.widget.FrameLayout', y2: 3000 })], activity: '.Main' }
+  assert.equal(describeTapMiss(plain, tap, { text: '已消失', clickable: true, desc: '' }, null).code, 'gone')
+  assert.equal(describeTapMiss(plain, tap, null, { activity: '.Other' }).code, 'page-switched')
+  assert.equal(describeTapMiss({ nodes: [], activity: '' }, tap, null, null).code, 'unknown-tree')
+  const label = { nodes: [node({ pkg: 'com.demo', cls: 'android.widget.FrameLayout', y2: 3000 }), node({ text: '确定', clickable: false })], activity: '.Main' }
+  assert.equal(describeTapMiss(label, tap, { text: '确定', clickable: false, desc: '' }, null).code, 'unclickable')
+})
+
+it('点后差异：多出/少了哪几行分开列，limit 只截总数', () => {
+  const before = [' 1 TextView "A" @1,1 *', ' 2 TextView "B" @1,2 *']
+  const after = [' 1 TextView "A" @1,1 *', ' 3 TextView "C" @1,3 *']
+  assert.deepEqual(diffLines(before, after), ['-  2 TextView "B" @1,2 *', '+  3 TextView "C" @1,3 *'])
+  assert.equal(diffLines(before, after, 1).length, 1)
+  assert.deepEqual(diffLines([], after), after.map((line) => `+ ${line}`))
+  assert.deepEqual(diffLines(before, before), [])
+  assert.deepEqual(diffLines(undefined, []), [])
 })
 
 console.log(`\n${pass} 项通过\n`)

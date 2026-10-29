@@ -2479,34 +2479,68 @@ async function awaitStable(dump, options = {}) {
 }
 
 /**
+ * 两份控件行做差：返回 `+ 新增` / `- 消失`，调用方按需截断。
+ * @param {string[]} before - 旧行。
+ * @param {string[]} after - 新行。
+ * @param {number} [limit] - 最多几条，0 表示不限。
+ * @returns {string[]} 差异行。
+ */
+function diffLines(before, after, limit = 6) {
+  const counts = new Map()
+  for (const line of before ?? []) counts.set(line, (counts.get(line) ?? 0) + 1)
+  const added = []
+  const removed = []
+  for (const line of after ?? []) {
+    const left = counts.get(line) ?? 0
+    if (left > 0) counts.set(line, left - 1)
+    else added.push(`+ ${line}`)
+  }
+  for (const [line, left] of counts) for (let i = 0; i < left; i += 1) removed.push(`- ${line}`)
+  const all = [...removed, ...added]
+  return limit > 0 ? all.slice(0, limit) : all
+}
+
+/**
  * 点了没反应时，从新快照里当场找出原因，省掉模型再读一遍树的回合。
  * @param {any} state - awaitChange / dumpState 的结果。
  * @param {{x: number, y: number}} point - 点下去的位置。
  * @param {any} [target] - 原本要点的节点（按坐标点时为空）。
  * @param {any} [before] - 操作前的快照（用来比对包名/页面）。
- * @returns {string} 一句话原因。
+ * @returns {{code: string, text: string}} 机器可判的原因码 + 一句话原因。
  */
-function tapMissReason(state, point, target, before) {
+function describeTapMiss(state, point, target, before) {
   const nodes = Array.isArray(state?.nodes) ? state.nodes : []
   const x = Number(point?.x ?? 0)
   const y = Number(point?.y ?? 0)
-  if (nodes.length === 0) return '一个控件都读不到，可能还在加载，或者这屏是自己画的'
+  if (nodes.length === 0) return { code: 'unknown-tree', text: '一个控件都读不到，可能还在加载，或者这屏是自己画的' }
   const area = (node) => Math.max(1, (node.x2 - node.x1) * (node.y2 - node.y1))
   const covers = (node) => node.x2 > node.x1 && node.y2 > node.y1 && node.x1 <= x && x <= node.x2 && node.y1 <= y && y <= node.y2
   const hits = nodes.filter(covers)
   const ime = hits.find((node) => /InputMethod|KeyboardView/i.test(node.cls) || /inputmethod|keyboard/i.test(node.pkg))
-  if (ime) return '键盘挡住了这一点；先 adb_input {"key":"back"} 收起键盘再点'
+  if (ime) return { code: 'keyboard-covered', text: '键盘挡住了这一点；先 adb_input {"key":"back"} 收起键盘再点' }
   const sys = hits.find((node) => /^com\.android\.systemui$/.test(node.pkg) || /Dialog|PopupWindow|Toast/i.test(node.cls))
-  if (sys) return `这一点被 ${oneLine(sys.text || sys.desc || shortClass(sys.cls), 16)} 挡住（${sys.pkg || '系统窗口'}），先关掉它`
-  if (before?.activity && state?.activity && before.activity !== state.activity) return '页面已经切换了，按旧位置点不到目标'
+  if (sys) return { code: 'obscured', text: `这一点被 ${oneLine(sys.text || sys.desc || shortClass(sys.cls), 16)} 挡住（${sys.pkg || '系统窗口'}），先关掉它` }
+  if (before?.activity && state?.activity && before.activity !== state.activity) return { code: 'page-switched', text: '页面已经切换了，按旧位置点不到目标' }
   const wanted = String(target?.text || target?.desc || '')
-  if (wanted && !nodes.some((node) => (node.text || node.desc) === wanted)) return '目标已经不在这屏了：页面变了或列表滚走了，重新 adb_ui 取 ref'
+  if (wanted && !nodes.some((node) => (node.text || node.desc) === wanted)) return { code: 'gone', text: '目标已经不在这屏了：页面变了或列表滚走了，重新 adb_ui 取 ref' }
   if (target && target.clickable === false && !nodes.some((node) => node.clickable && covers(node))) {
-    return '目标不可点，也没有可点的祖先容器：它只是文字/装饰，点它不会触发任何操作'
+    return { code: 'unclickable', text: '目标不可点，也没有可点的祖先容器：它只是文字/装饰，点它不会触发任何操作' }
   }
   const deep = hits.length > 0 ? hits.reduce((a, b) => (area(a) <= area(b) ? a : b)) : null
-  if (deep) return `命中的是 ${oneLine(deep.text || deep.desc || shortClass(deep.cls), 18)}，但它没响应：可能只是容器，或动画还没结束`
-  return '界面没变化：可能没点中，或还在动画；用 adb_shot 看画面'
+  if (deep) return { code: 'no-response', text: `命中的是 ${oneLine(deep.text || deep.desc || shortClass(deep.cls), 18)}，但它没响应：可能只是容器，或动画还没结束` }
+  return { code: 'same-screen', text: '界面没变化：可能没点中，或还在动画；用 adb_shot 看画面' }
+}
+
+/**
+ * 只要一句话版本的没点中原因（老的调用点/测试用）。
+ * @param {any} state - 当前快照。
+ * @param {{x: number, y: number}} point - 点下去的位置。
+ * @param {any} [target] - 原本要点的节点。
+ * @param {any} [before] - 操作前的快照。
+ * @returns {string} 一句话原因。
+ */
+function tapMissReason(state, point, target, before) {
+  return describeTapMiss(state, point, target, before).text
 }
 
 /**
@@ -3002,17 +3036,7 @@ export function apply(ctx, config) {
       let shown = filtered.slice(0, MAX_NODES.max)
       if (args.changed_only === true) {
         const before = lastUiLines.get(device)
-        const counts = new Map()
-        for (const line of before ?? []) counts.set(line, (counts.get(line) ?? 0) + 1)
-        const added = []
-        const removed = []
-        for (const line of filtered) {
-          const left = counts.get(line) ?? 0
-          if (left > 0) counts.set(line, left - 1)
-          else added.push(`+ ${line}`)
-        }
-        for (const [line, left] of counts) for (let i = 0; i < left; i += 1) removed.push(`- ${line}`)
-        shown = before === undefined ? filtered.slice(0, MAX_NODES.max) : [...removed, ...added]
+        shown = before === undefined ? filtered.slice(0, MAX_NODES.max) : diffLines(before, filtered, 0)
         lastUiLines.set(device, filtered)
         if (shown.length === 0) shown = ['（界面没有变化）']
       } else {
@@ -3210,14 +3234,16 @@ export function apply(ctx, config) {
           target: { type: 'string' },
           activity: { type: 'string' },
           matched: { type: 'boolean' },
-          changed: { type: 'boolean', description: '点后界面树是否变了；没变大概率没点中或动画未结束' },
+          changed: { type: ['boolean', 'null'], description: '点后界面树是否变了；没变大概率没点中或动画未结束' },
+          reason: { type: ['string', 'null'], description: '没生效时的原因码：keyboard-covered / obscured / unclickable / gone / page-switched / no-response / same-screen / unknown-tree；生效时为 null' },
+          delta: { type: 'array', items: { type: 'string' }, description: '这次点了之后具体多/少了哪几行（`+` 新增 / `-` 消失，最多 6 条）' },
           stable: { type: ['boolean', 'null'], description: 'wait_stable 时：是否等到了静止' },
           quiet_ms: { type: ['integer', 'null'] },
           scrolled: { type: 'integer', description: '为了找到目标滑了几次；没滑就不出现' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'target', 'activity', 'matched', 'message', 'elapsed_ms'],
+        required: ['ok', 'target', 'activity', 'matched', 'changed', 'reason', 'delta', 'message', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.message),
@@ -3330,9 +3356,11 @@ export function apply(ctx, config) {
       let changed = null
       let stable = null
       let quietMs = null
+      let after = null
       if (shouldWait) {
         const waited = await waitFor(device, want, args.timeout_ms ?? 10_000)
         matched = waited.matched
+        after = waited.state
         activity = waited.state.activity
         detail = matched
           ? `，等待命中 ${waited.elapsedMs}ms · 当前 ${activity || '未知页面'}`
@@ -3343,7 +3371,7 @@ export function apply(ctx, config) {
           quietMs: args.quiet_ms ?? 400,
           timeoutMs: args.timeout_ms ?? 10_000,
         })
-        const after = calmed.state
+        after = calmed.state
         stable = calmed.stable
         quietMs = calmed.quietMs
         activity = after.activity
@@ -3357,7 +3385,7 @@ export function apply(ctx, config) {
         && Date.now() - prior.at < 15_000) {
         /* 没给等待条件时给一次回执：界面没变化就是可疑信号，别让模型再去读一遍树才发现。 */
         try {
-          const after = await awaitChange(device, prior.signature)
+          after = await awaitChange(device, prior.signature)
           changed = after.tree.lines.join('\n') !== prior.signature
           activity = after.activity
           detail = changed
@@ -3367,11 +3395,20 @@ export function apply(ctx, config) {
           detail = `，点已发出，但读不到界面确认（${oneLine(error?.message ?? error, 60)}）`
         }
       }
+      /* 回执留给机器读：reason 是稳定原因码，delta 是这次点了之后具体多/少了哪几行，
+         模型不用再 adb_ui changed_only 追一次。 */
+      let reason = null
+      let delta = []
+      if (after !== null && prior && typeof prior.signature === 'string') {
+        const beforeLines = prior.signature === '' ? [] : prior.signature.split('\n')
+        delta = diffLines(beforeLines, after.tree.lines, 6)
+        if (changed === false) reason = describeTapMiss(after, { x, y }, missTarget, prior).code
+      }
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
       const slid = scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''
       const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
       return {
-        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs,
+        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs, reason, delta,
         ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started,
       }
     },
@@ -5672,4 +5709,6 @@ export const __internals = {
   guardOutput,
   awaitChange,
   tapMissReason,
+  describeTapMiss,
+  diffLines,
 }
