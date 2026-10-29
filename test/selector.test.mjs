@@ -560,6 +560,17 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('adb_do 步骤：等待与核对也能只看一块（within_ref / within_rect）', () => {
+  assert.equal(validateSteps([{ wait_text: '已关注', within_ref: 3 }]).ok, true)
+  assert.equal(validateSteps([{ assert_text: '已关注', within_ref: 3 }]).ok, true)
+  assert.equal(validateSteps([{ assert_count_min: 2, text: '已关注', within_rect: [0, 100, 600, 120] }]).ok, true)
+  assert.equal(validateSteps([{ tap: '关注', within_rect: [0, 100, 600, 120] }]).ok, true)
+  assert.equal(validateSteps([{ wait_text: '已关注', within_ref: 0 }]).ok, false)
+  assert.equal(validateSteps([{ wait_text: '已关注', within_ref: 1.5 }]).ok, false)
+  assert.equal(validateSteps([{ assert_text: 'x', within_rect: [1, 2, 3] }]).ok, false)
+  assert.equal(validateSteps([{ assert_text: 'x', within_rect: [1, 2, 3, 'a'] }]).ok, false)
+})
+
 it('等待轮询间隔：刚动完抓得紧，一直没变越等越松', () => {
   assert.equal(pollGap(0, 0), 120)
   assert.equal(pollGap(1, 900), 120, '只变过一次还是紧抓')

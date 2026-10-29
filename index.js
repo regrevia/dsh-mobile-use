@@ -502,6 +502,14 @@ function validateSteps(steps) {
     if (step.ref !== undefined && !(Number.isInteger(step.ref) && step.ref >= 1)) {
       problems.push(`第 ${at} 步 ref 要从 1 开始的整数。`)
     }
+    if (step.within_ref !== undefined && !(Number.isInteger(step.within_ref) && step.within_ref >= 1)) {
+      problems.push(`第 ${at} 步 within_ref 要是从 1 开始的整数（ref 来自 adb_ui / adb_find）。`)
+    }
+    if (step.within_rect !== undefined) {
+      const box = step.within_rect
+      const ok = Array.isArray(box) && box.length === 4 && box.every((item) => Number.isFinite(Number(item)))
+      if (!ok) problems.push(`第 ${at} 步 within_rect 要写 [x,y,w,h] 四个数。`)
+    }
     if (step.xpath !== undefined) {
       const expr = String(step.xpath).trim()
       if (!expr.startsWith('/')) problems.push(`第 ${at} 步 xpath 要以 // 或 / 开头，例如 //*[@text="登录"]。`)
@@ -4899,7 +4907,8 @@ export function apply(ctx, config) {
               xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
-              within_ref: { type: 'integer', description: '配 tap/id：只在这个 ref 的矩形范围内找目标（点列表某一行里的按钮/开关，先 adb_find 拿那一行的 ref）' },
+              within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找目标或核对：点列表某一行里的按钮，或只在这一行里等/断言「已关注」（先 adb_find 拿那一行的 ref）' },
+              within_rect: { type: 'array', items: { type: 'integer' }, minItems: 4, maxItems: 4, description: '同上，但直接给坐标框 [x,y,w,h]；不先取 ref 的场合用' },
               scroll_to: {
                 description: '先边滑边找目标再动作：给文字，或给 {text|id|desc|cls|xpath, direction, until, dismiss, max_swipes} 说清找什么、往哪滑',
                 oneOf: [
@@ -5128,6 +5137,8 @@ export function apply(ctx, config) {
             xpath: step.wait_for_xpath,
             xpath_gone: step.wait_xpath_gone,
             until: step.until,
+            within_ref: step.within_ref,
+            within_rect: step.within_rect,
           }, limit, { dismiss: step.dismiss === true })
           activity = waited.state.activity
           if (!waited.matched) {
@@ -5157,12 +5168,14 @@ export function apply(ctx, config) {
             xpath_gone: step.assert_xpath_gone,
             count_min: step.assert_count_min,
             until: step.until,
+            within_ref: step.within_ref,
+            within_rect: step.within_rect,
           }, Math.min(limit, 3000), { dismiss: step.dismiss === true })
           activity = checked.state.activity
           if (!checked.matched) {
             const counted = String(countSel ?? '').trim() !== ''
               ? selectXPath(checked.state.nodes, String(countSel)).length
-              : selectNodes(checked.state, { text: step.text ?? step.assert_text, id: step.id }).length
+              : selectNodes(checked.state, { text: step.text ?? step.assert_text, id: step.id, within_ref: step.within_ref, within_rect: step.within_rect }).length
             const what = step.assert_count_min !== undefined
               ? `命中的控件不到 ${step.assert_count_min} 个（当前 ${counted} 个）`
               : step.assert_xpath !== undefined ? `界面上没有匹配 \`${oneLine(step.assert_xpath, 60)}\` 的控件`
