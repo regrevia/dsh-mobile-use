@@ -4519,7 +4519,7 @@ export function apply(ctx, config) {
                 : wantXpath !== ''
                   ? `XPath ${wantXpath} 命中`
                   : `XPath ${xpathGone} 消失`
-        const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}`
+        const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms${waited.polls ? ` / ${waited.polls} 次轮询` : ''}）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}${waited.polls ? `，已轮询 ${waited.polls} 次` : ''}`
         return { ok: true, message: `${base}${tail}。`, elapsed_ms: Date.now() - started }
       }
       return { ok: true, message: base, elapsed_ms: Date.now() - started }
@@ -6421,7 +6421,7 @@ ctx.effect(() => ctx.tools.register({
                 : wantXpath !== ''
                   ? `XPath ${wantXpath} 命中`
                   : `XPath ${xpathGone} 消失`
-        const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}`
+        const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms${waited.polls ? ` / ${waited.polls} 次轮询` : ''}）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}${waited.polls ? `，已轮询 ${waited.polls} 次` : ''}`
         return { ok: true, summary: `${label}完成（${r.ms}ms）；${tail}。`, elapsed_ms: Date.now() - began }
       }
       return { ok: true, summary: `${label}完成（${r.ms}ms）。界面变化用 adb_ui 确认。`, elapsed_ms: Date.now() - began }
