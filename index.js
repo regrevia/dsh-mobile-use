@@ -1808,9 +1808,10 @@ function matches(state, want) {
   /* within_ref / within_rect：所有「有没有这段文字」的判断都只看框里的控件。 */
   const box = withinBox(state, want)
   const inBox = (node) => inWithinBox(node, box)
+  /* 两边都先去掉零宽字符再比：屏上写着「设置」但标题里夹了零宽空格时，等文字不会再空等到超时。 */
   const hit = (needle) => {
-    const lower = String(needle).toLowerCase()
-    return state.nodes.some((node) => inBox(node) && `${node.text} ${node.desc} ${node.id}`.toLowerCase().includes(lower))
+    const lower = dezero(needle).toLowerCase()
+    return state.nodes.some((node) => inBox(node) && dezero(`${node.text} ${node.desc} ${node.id}`).toLowerCase().includes(lower))
   }
   const present = (needle) => (needle ? hit(needle) : true)
   const absent = (needle) => (needle ? !hit(needle) : true)
@@ -1848,10 +1849,10 @@ function matches(state, want) {
   /* 带状态条件时，要求「同一个控件」既命中文字/id 又处于该状态：
      按钮出现在屏上但还 disabled 时不该算等到，否则点下去是空动作。 */
   if (want.until) {
-    const needle = String(want.text ?? want.id ?? want.desc ?? '').toLowerCase()
+    const needle = dezero(want.text ?? want.id ?? want.desc).toLowerCase()
     const qualified = state.nodes.some((node) => {
       if (!inBox(node)) return false
-      const hay = `${node.text} ${node.desc} ${node.id}`.toLowerCase()
+      const hay = dezero(`${node.text} ${node.desc} ${node.id}`).toLowerCase()
       return (needle === '' || hay.includes(needle)) && nodeStateOk(node, want.until)
     })
     if (!qualified) return false
@@ -2419,6 +2420,16 @@ function inWithinBox(node, box) {
  * @param {any} sel - 选择器。
  * @returns {any[]} 命中节点（默认按同一处归并；index 指定时只返回那一个）。
  */
+/**
+ * 把控件文字里看不见的东西去掉：零宽空格、BOM、方向标记、多余空白都归成一个空格。
+ * 真机上的标题常带这些字符，直接 includes 会「明明在屏上却找不到」。
+ * @param {any} value - 原始文字。
+ * @returns {string} 干净文字。
+ */
+function dezero(value) {
+  return String(value ?? '').replace(/[\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '').replace(/\s+/g, ' ').trim()
+}
+
 function selectNodes(state, sel) {
   const want = sel || {}
   const nodes = state && Array.isArray(state.nodes) ? state.nodes : []
@@ -2431,9 +2442,9 @@ function selectNodes(state, sel) {
   const reText = want.regex ? new RegExp(text, 'i') : null
   const reId = want.regex && id ? new RegExp(id, 'i') : null
   const reDesc = want.regex && desc ? new RegExp(desc, 'i') : null
-  const lowText = text.toLowerCase()
+  const lowText = dezero(text).toLowerCase()
   const lowId = id.toLowerCase()
-  const lowDesc = desc.toLowerCase()
+  const lowDesc = dezero(desc).toLowerCase()
   const lowCls = cls.toLowerCase()
   const lowPkg = pkg.toLowerCase()
   const box = withinBox(state, want)
@@ -2443,8 +2454,8 @@ function selectNodes(state, sel) {
       if (reText) {
         if (!reText.test(node.text || '') && !reText.test(node.desc || '')) return false
       } else {
-        const nt = String(node.text || '').toLowerCase()
-        const nd = String(node.desc || '').toLowerCase()
+        const nt = dezero(node.text).toLowerCase()
+        const nd = dezero(node.desc).toLowerCase()
         if (exact ? nt !== lowText && nd !== lowText : !nt.includes(lowText) && !nd.includes(lowText)) return false
       }
     }
@@ -2453,7 +2464,7 @@ function selectNodes(state, sel) {
       if (reId ? !reId.test(node.id || '') : exact ? full !== lowId && shortId(full) !== shortId(lowId) : !full.includes(lowId)) return false
     }
     if (desc) {
-      const nd = String(node.desc || '').toLowerCase()
+      const nd = dezero(node.desc).toLowerCase()
       if (reDesc ? !reDesc.test(node.desc || '') : exact ? nd !== lowDesc : !nd.includes(lowDesc)) return false
     }
     if (cls && !String(node.cls || '').toLowerCase().includes(lowCls)) return false
@@ -7050,6 +7061,7 @@ export const __internals = {
   parseNodes,
   compactTree,
   crashHint,
+  dezero,
   shortId,
   displaySizeFrom,
   decodeEntities,

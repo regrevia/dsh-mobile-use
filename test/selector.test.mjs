@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, dezero, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -558,6 +558,23 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 3, y1: 0, x2: 40, y2: 20 }, 8), { x: 0, y: 0, w: 53, h: 36 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 10, y2: 10 }, 0), { x: 10, y: 10, w: 2, h: 2 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
+})
+
+it('零宽字符与多余空白不会让「屏上有却找不到」', () => {
+  assert.equal(dezero('\u200b设置\u200b'), '设置')
+  assert.equal(dezero('  A \n B  '), 'A B')
+  const nodes = [
+    { text: '\ufeff设置', desc: '', id: 'com.android.settings:id/title', cls: 'TextView', pkg: 'com.android.settings', x1: 0, y1: 0, x2: 100, y2: 40, depth: 0 },
+    { text: '', desc: '通知\u200b栏', id: '', cls: 'TextView', pkg: 'com.android.systemui', x1: 0, y1: 60, x2: 100, y2: 100, depth: 0 },
+  ]
+  const state = { nodes, activity: 'com.android.settings/.Main', refs: [], tree: { lines: [], refs: [] } }
+  assert.equal(selectNodes(state, { text: '设置' }).length, 1)
+  assert.equal(selectNodes(state, { text: '设置', exact: true }).length, 1)
+  assert.equal(selectNodes(state, { desc: '通知栏' }).length, 1, 'desc 里的零宽也要去掉')
+  assert.equal(selectNodes(state, { text: '通知栏' }).length, 1, 'desc 参与文字匹配')
+  assert.equal(matches(state, { text: '通知栏' }), true)
+  assert.equal(matches(state, { text: '设置' }), true)
+  assert.equal(matches(state, { text: '通知栏', until: 'clickable' }), false, 'desc 命中的节点不可点，状态条件不该过')
 })
 
 it('adb_do 步骤：repeat 只认会重复注入的动作，范围 1–20', () => {
