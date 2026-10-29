@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-use",
-  "version": "1.4.1",
+  "version": "1.4.3",
   "private": false,
   "description": "真机调试插件：界面文本树、动效数据、实时画面侧栏与圈选标注",
   "type": "module",
@@ -30,6 +30,9 @@
     "client.js",
     "client.rev",
     "stream.js",
+    "page.js",
+    "scrcpy.js",
+    "tsmux.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
@@ -63,6 +66,6 @@
     "debugging"
   ],
   "scripts": {
-    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs && node test/selector.test.mjs && node test/tools.test.mjs && node test/params.test.mjs"
+    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs && node test/selector.test.mjs && node test/tools.test.mjs && node test/params.test.mjs && node test/shellchannel.test.mjs && node test/pack.test.mjs"
   }
 }

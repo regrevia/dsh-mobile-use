@@ -12,6 +12,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -22,7 +23,26 @@ const IDLE_MS = 45_000
 const CALL_TIMEOUT_MS = 15_000
 /** 启动 worker 的单独上限：worker 卡在 import Vision 时要尽快放弃。 */
 const START_TIMEOUT_MS = 8_000
-const PYTHON = '/usr/bin/python3'
+/**
+ * 能跑 Vision 的 python 按优先级排：显式环境变量、本机 OCR venv、系统 python。
+ * 系统 python 常常被 Xcode 许可协议挡住，venv 里的 pyobjc 才是这台机器实际能用的那个。
+ */
+const PYTHON_CANDIDATES = [
+  process.env.DSH_OCR_PYTHON,
+  join(homedir(), '.local/opt/ocr-venv/bin/python3'),
+  '/usr/bin/python3',
+].filter(Boolean)
+let PYTHON = PYTHON_CANDIDATES[0]
+
+/** 挑第一个真正能 import Vision 的解释器，找不到就返回空串。 @returns {string} python 路径。 */
+function pickPython() {
+  for (const candidate of PYTHON_CANDIDATES) {
+    if (!existsSync(candidate)) continue
+    const check = spawnSync(candidate, ['-c', 'import Vision, Quartz, Foundation'], { timeout: 5000, stdio: 'ignore' })
+    if (!check.error && check.status === 0) return candidate
+  }
+  return ''
+}
 
 let worker = null
 let ready = null
@@ -39,13 +59,12 @@ let buffer = ''
 function probe() {
   if (process.platform !== 'darwin') return { available: false, reason: `本机是 ${process.platform}，Vision OCR 只有 macOS 有` }
   if (!existsSync(WORKER)) return { available: false, reason: `缺少 ${WORKER}` }
-  if (!existsSync(PYTHON)) return { available: false, reason: `缺少 ${PYTHON}` }
   /* 只探 import：worker 真正用到的 Vision/Quartz 都在这里，缺 pyobjc 会在启动后立刻崩。 */
-  const check = spawnSync(PYTHON, ['-c', 'import Vision, Quartz, Foundation'], { timeout: 5000, stdio: 'ignore' })
-  if (check.error) {
-    return { available: false, reason: `${PYTHON} 起不来：${String(check.error.message ?? check.error).slice(0, 120)}` }
+  const picked = pickPython()
+  if (!picked) {
+    return { available: false, reason: `没找到带 Vision/Quartz 的 python，装一份：python3 -m venv ~/.local/opt/ocr-venv && ~/.local/opt/ocr-venv/bin/pip install pyobjc-framework-Vision pyobjc-framework-Quartz` }
   }
-  if (check.status !== 0) return { available: false, reason: `${PYTHON} 缺 Vision/Quartz（pyobjc-framework-Vision）` }
+  PYTHON = picked
   return { available: true, reason: '' }
 }
 

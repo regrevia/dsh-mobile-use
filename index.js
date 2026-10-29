@@ -768,10 +768,15 @@ async function webTarget(device, packageName) {
   if (!pid) throw new Error(`设备上没有在跑的 ${packageName} 进程：先把 App 打开。`)
   const sockets = await adb(['-s', device, 'shell', 'cat /proc/net/unix'], { timeout: 8000 })
   const names = [...new Set((sockets.out || '').match(/webview_devtools_remote_\d+/g) ?? [])]
-  const socketName = names.find((name) => name.endsWith(`_${pid}`)) ?? names[0]
-  if (!socketName) {
-    throw new Error(`${packageName} 没有 WebView 调试口：App 没内嵌 WebView，或者没开调试（WebView.setWebContentsDebuggingEnabled(true)）。设备上现在一个 WebView 调试口都没有。`)
+  const match = names.find((name) => name.endsWith(`_${pid}`))
+  /* 只认这个 PID 的调试口：随便挑一个 socket 会把别的 App 的 WebView 当成目标，抓错页面还看不出来。 */
+  if (!match) {
+    const others = names.join(', ')
+    throw new Error(names.length === 0
+      ? `${packageName} 没有 WebView 调试口：App 没内嵌 WebView，或者没开调试（WebView.setWebContentsDebuggingEnabled(true)）。设备上现在一个 WebView 调试口都没有。`
+      : `${packageName}（pid ${pid}）没有自己的 WebView 调试口，不去猜别的进程。设备上现有的：${others}。如果你要调试的确实是其中一个，先确认那是不是同一个 App 的进程。`)
   }
+  const socketName = match
   const socketPid = socketName.slice('webview_devtools_remote_'.length)
   const key = `${device}/${socketPid}`
   const remote = `localabstract:${socketName}`
@@ -859,7 +864,9 @@ function killShell(serial) {
  * @returns {any} 通道。
  */
 function openShell(serial) {
-  const child = execFile(ADB, ['-s', serial, 'shell'], { timeout: 0 })
+  /* 用 spawn 而不是 execFile：execFile 会给 stdout 另攒一份内部缓冲（默认上限 1 MiB），
+     攒满就把整条 shell 判死；我们自己按 MAX_SHELL_BUF 截尾，不需要它再存一份。 */
+  const child = spawn(ADB, ['-s', serial, 'shell'], { stdio: ['pipe', 'pipe', 'pipe'] })
   const channel = { child, buf: '', onChunk: null, dead: false }
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk) => {
@@ -868,14 +875,16 @@ function openShell(serial) {
     if (channel.buf.length > MAX_SHELL_BUF) channel.buf = channel.buf.slice(-MAX_SHELL_BUF)
     if (channel.onChunk !== null) channel.onChunk(channel.buf)
   })
-  child.on('error', () => {
-    channel.dead = true
-    shellChannels.delete(serial)
-  })
-  child.on('exit', () => {
+  /* 常驻 shell 的 stderr 不进解析（命令自己 `2>&1`），但必须排掉，否则管道写满会把设备端卡住。 */
+  child.stderr.resume()
+  /* adb 断掉时写 stdin 会报 EPIPE：这里吞掉，让上层按「通道已死、下次重建」处理。 */
+  child.stdin.on('error', () => {})
+  const shutdown = () => {
     channel.dead = true
     if (shellChannels.get(serial) === channel) shellChannels.delete(serial)
-  })
+  }
+  child.on('error', shutdown)
+  child.on('exit', shutdown)
   shellChannels.set(serial, channel)
   return channel
 }
@@ -883,9 +892,11 @@ function openShell(serial) {
 /** 只读命令的首词：只读设备状态，失败后重跑一遍不会改设备，可以安全重试。 */
 const READ_ONLY_HEADS = new Set([
   'cat', 'ls', 'getprop', 'dumpsys', 'pidof', 'ps', 'top', 'stat', 'wc', 'head', 'tail',
-  'grep', 'sed', 'awk', 'echo', 'printf', 'date', 'id', 'whoami', 'uname', 'uptime',
+  'grep', 'echo', 'printf', 'date', 'id', 'whoami', 'uname', 'uptime',
   'df', 'du', 'logcat', 'uiautomator', 'screencap', 'test', '[', 'true', 'false',
-  'sleep', 'which', 'find', 'getevent', 'netstat', 'ip', 'lsusb', 'dmesg',
+  'sleep', 'which', 'find', 'getevent', 'netstat', 'lsusb', 'dmesg',
+  /* sed / awk / ip 故意不在白名单：`awk 'BEGIN{system(…)}'`、`sed -i`、`ip link set … down`
+     都能顶着只读首词改设备，脚本里还能再调任意命令。不认识的命令按写命令算，宁可不重试。 */
 ])
 
 /** 明确会改设备状态的首词：超时后一律不重放（点一次再点一次就是两下）。 */
@@ -903,6 +914,8 @@ const WRITE_PATTERNS = [
   /\bfind\b[^|]*\s-(delete|exec|execdir)\b/,
   /\bsed\b[^|]*\s-i(\s|$)/,
   /\bchmod\b[^|]*\s[0-7]{3,4}\b/,
+  /\bdumpsys\b[^|]*\bbattery\b[^|]*\b(reset|set|unplug)\b/, /* dumpsys battery reset 会清掉电池模拟状态 */
+  /\bdumpsys\b[^|]*\b(deviceidle|netpolicy|wifi)\b[^|]*\b(force|set|enable|disable)\b/,
 ]
 
 /**
@@ -2203,13 +2216,15 @@ function nodeForRef(serial, ref, snapshotId) {
  * 找不到、匹配多个、或位置挪得太多，都报错让人重读界面，不拿旧坐标乱点。
  * @param {string} serial - 设备。
  * @param {any} node - 目标节点。
- * @param {string} [snapshotId] - 调用方带的快照编号；带了说明它认这次快照，不重读。
+ * @param {string} [snapshotId] - 调用方带的快照编号；它只证明 ref 来自哪次观察，不证明界面没变。
  * @returns {Promise<any>} 可以点的节点（可能是新快照里的同一个）。
  */
 async function freshNodeFor(serial, node, snapshotId) {
-  if (snapshotId !== undefined && snapshotId !== null && String(snapshotId) !== '') return node
   const cached = lastTrees.get(serial)
-  if (!cached || Date.now() - cached.at <= REF_SOFT_TTL_MS) return node
+  /* 快照编号不是免检通行证：过了软 TTL 一样回读一次树。旧坐标点下去比多一次 dump 贵得多。 */
+  const fresh = cached !== undefined && cached !== null && Date.now() - cached.at <= REF_SOFT_TTL_MS
+  if (fresh) return node
+  if (!cached) return node
   const label = oneLine(node.text || node.desc || shortId(node.id) || shortClass(node.cls), 20)
   const next = await pollDump(serial)
   const ox = (node.x1 + node.x2) / 2
@@ -3086,7 +3101,7 @@ async function clearFocusedField(serial) {
  */
 async function activeIme(serial) {
   const result = await sh(serial, 'settings get secure default_input_method', 6000).catch(() => null)
-  return result !== null && result.ok ? String(result.stdout ?? '').trim() : ''
+  return result !== null && result.ok ? String(result.out ?? '').trim() : ''
 }
 
 /**
@@ -3097,7 +3112,7 @@ async function activeIme(serial) {
 async function adbImeComponent(serial) {
   const listed = await sh(serial, 'ime list -a -s', 8000).catch(() => null)
   if (listed === null || !listed.ok) return ''
-  const lines = String(listed.stdout ?? '').split('\n').map((line) => line.trim()).filter(Boolean)
+  const lines = String(listed.out ?? '').split('\n').map((line) => line.trim()).filter(Boolean)
   return lines.find((line) => /adbkeyboard/i.test(line)) ?? ''
 }
 
@@ -3228,13 +3243,16 @@ function failureSuffix(info) {
  * 失败时补现场：读一次当前页面 + 屏上前几行，再留一张截图（约 0.5s，只在失败路径付）。
  * @param {any} error - 原始错误。
  * @param {string} label - 证据文件名前缀，用工具名。
+ * @param {string} [known] - 调用方已经解析好的设备号；没有就自己解析一次。
  * @returns {Promise<Error>} 带现场的错误对象。
  */
-async function annotateFailure(error, label) {
+async function annotateFailure(error, label, known = '') {
   const message = String((error && error.message) || error)
   if (/截图 \//.test(message)) return error
-  let device = ''
-  try { device = await serial() } catch { return error }
+  let device = String(known ?? '')
+  if (device === '') {
+    try { device = await resolveSerial() } catch { return error }
+  }
   let activity = ''
   let digest = ''
   try {
@@ -3264,7 +3282,7 @@ function withEvidence(definition, label) {
       try {
         return await run(args, ctx)
       } catch (error) {
-        throw await annotateFailure(error, label)
+        throw await annotateFailure(error, label, typeof args?.serial === 'string' ? args.serial : '')
       }
     },
   }
@@ -4240,6 +4258,8 @@ export function apply(ctx, config) {
       let engine = 'adb'
       let fastDone = fastInput.tap !== null
       let took = 0
+      /* 快通道点出去几次就记几次：半路失效时绝不能用 input 把整段重放一遍（连点、下一步、确认会多做一次）。 */
+      let delivered = 0
       if (fastDone) {
         const fastBegan = Date.now()
         for (let i = 0; i < times; i += 1) {
@@ -4248,6 +4268,7 @@ export function apply(ctx, config) {
             fastDone = false
             break
           }
+          delivered += 1
           if (i + 1 < times && gap > 0) await new Promise((resolve) => setTimeout(resolve, gap))
         }
         if (fastDone) {
@@ -4255,11 +4276,13 @@ export function apply(ctx, config) {
           took = Date.now() - fastBegan
         }
       }
-      if (!fastDone) {
+      /* 只剩没送出去的那几次才补发；已经发出去的一律不重试。 */
+      const rest = times - delivered
+      if (!fastDone && rest > 0) {
         /* 连点（连招、双击缩放）串在同一次 shell 里：每次仍是一条约 35ms 的 input，中间按间隔等待。 */
         const one = args.long ? `input swipe ${x} ${y} ${x} ${y} 600` : `input tap ${x} ${y}`
-        const cmd = times === 1 ? one : Array.from({ length: times }, () => one).join(`; sleep ${(gap / 1000).toFixed(3)}; `)
-        const r = await sh(device, cmd, 10_000 + times * (gap + 900))
+        const cmd = rest === 1 ? one : Array.from({ length: rest }, () => one).join(`; sleep ${(gap / 1000).toFixed(3)}; `)
+        const r = await sh(device, cmd, 10_000 + rest * (gap + 900))
         if (!r.ok) throw new Error(failureNote(args.long ? '长按' : '点击', r))
         took = r.ms
       }
@@ -7278,4 +7301,6 @@ export const __internals = {
   tapMissReason,
   describeTapMiss,
   diffLines,
+  shellOnce,
+  killShell,
 }

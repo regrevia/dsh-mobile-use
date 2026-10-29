@@ -59,6 +59,15 @@ check('sh -c "pm clear com.android.settings"', true)
 check('unknown-tool --flag', true)
 check('cat /sdcard/x 2>&1', false)
 
+/* 顶着只读首词做写操作：awk 能 system()、sed 能 -i、ip 能改网卡，一律按写算。 */
+check('awk \'BEGIN {system("input tap 1 2")}\'', true)
+check('ip link set lo down', true)
+check('ip addr show', true)
+check('sed s/a/b/ /sdcard/x', true)
+check('dumpsys battery', false)
+check('dumpsys battery reset', true)
+check('dumpsys battery set level 10', true)
+
 if (failed > 0) {
   console.error(`=== ${failed} 条不符合预期 ===`)
   process.exit(1)
