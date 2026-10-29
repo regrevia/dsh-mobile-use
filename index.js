@@ -492,6 +492,12 @@ function validateSteps(steps) {
     if (step.long !== undefined && !['tap', 'id', 'ref', 'xpath'].includes(used[0] ?? '')) {
       problems.push(`第 ${at} 步 long 只能配 tap / id / ref 用。`)
     }
+    if ((step.desc !== undefined || step.cls !== undefined) && !['tap', 'id', 'scroll_to'].includes(used[0] ?? '')) {
+      problems.push(`第 ${at} 步 desc / cls 是找目标的写法，要配 tap / id / scroll_to 用。`)
+    }
+    if ((step.exact !== undefined || step.regex !== undefined) && used[0] !== 'tap' && used[0] !== 'id') {
+      problems.push(`第 ${at} 步 exact / regex 只能配 tap / id 用。`)
+    }
     if (step.repeat !== undefined) {
       const times = Number(step.repeat)
       if (!(Number.isInteger(times) && times >= 1 && times <= 20)) problems.push(`第 ${at} 步 repeat 要写 1–20 的整数。`)
@@ -4904,6 +4910,10 @@ export function apply(ctx, config) {
             properties: {
               tap: { type: 'string', description: '点哪个：文字内容，或用 "x,y" 坐标' },
               id: { type: 'string', description: '按资源 id 点' },
+              desc: { type: 'string', description: '按 content-desc 点（图标按钮常只有描述没有文字）' },
+              cls: { type: 'string', description: '按类名点，可只写后半段（配 index 挑第几个）' },
+              exact: { type: 'boolean', description: '本步的文字/描述/类名要完全相等，默认包含匹配' },
+              regex: { type: 'boolean', description: '把本步的 tap/id/desc/cls 当正则用' },
               xpath: { type: 'string', description: '按 XPath 点（同 adb_find 写法），结构复杂时用' },
               ref: { type: 'integer', description: '按 adb_ui/adb_find 给的 ref 点（先读再点最准）' },
               long: { type: 'boolean', description: '本步是长按（配合 tap/id/ref）' },
@@ -5049,7 +5059,16 @@ export function apply(ctx, config) {
           } else {
             /* 按文字/id 点之前先确认快照还对应现在的界面，页面换了就重新 dump，不拿旧坐标点。 */
             await snapshotForSelector(device)
-            const want = { text: step.tap, id: step.id, within_ref: step.within_ref }
+            const want = {
+              text: step.tap,
+              id: step.id,
+              desc: step.desc,
+              cls: step.cls,
+              exact: step.exact === true,
+              regex: step.regex === true,
+              within_ref: step.within_ref,
+              within_rect: step.within_rect,
+            }
             try {
               node = await awaitNode(device, want, step.wait_ms)
             } catch (error) {
