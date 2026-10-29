@@ -140,6 +140,7 @@
 | 范围条件式等待 | Appium 只能把范围写进 `xpath` 再等 | `adb_wait` / `adb_do` 的条件判断走同一个 `within_ref` 框：等「第 3 行里的开关变可点」不用拼祖先轴 | 本轮（`matches` 单测覆盖框内/框外/计数） |
 | 滚动找目标的状态门槛 | 滑到看见就算到，灰着点不动还得再来一轮 | `adb_scroll_to` 加 `until`（要求真的 enabled/clickable 才算到位）与 `dismiss`（挡路弹窗自动点掉，回执说点了什么） | 本轮 |
 | 串流程里的滑动 | 先滑到目标再点要拆两步，目标还不一定真的能点 | `adb_do` 的 `scroll_to` 可写对象：选择器 + 方向 + `until` 状态 + `dismiss` + 滑动次数，一步滑到并点掉 | 本轮（单测覆盖写法校验） |
+| XPath 轴 | UiAutomator 的 `..` / `following-sibling::` | Appium 支持 XPath 1.0 全部轴 | 无 | `..`、`parent::`、`following-sibling::`、`preceding-sibling::` 在已 dump 的节点上求值（利用 `parent` 索引，0 设备开销），结构定位不再只能靠 `within_ref` | 本轮 |
 | 文字归一 | uiautomator2 直接比字符串 | Appium 直接比字符串 | 无 | 选择器与等待比对前去掉零宽字符/BOM/方向标记并归一空白，真机标题里夹不可见字符时不会空等到超时 | 本轮 |
 | 重复动作 | uiautomator2 的 `d.click(...)` 在 Python 循环里写 | Appium 的 `mobile: shell` 循环 | 无 | 步骤级 `repeat`（1–20）：一步连点/连滑，仍走同一条注入与失败处理，`retry` 语义不变 | 本轮 |
 | 可失败的步骤 | 竞品靠脚本里 try/catch 自己写 | `adb_do` 每步可写 `on_fail: "continue"`：失败记一笔跳过并继续，返回值带 `skipped` 计数——「有弹窗就点掉，没有就算了」不用拆成两次调用 | 本轮（单测覆盖取值校验） |

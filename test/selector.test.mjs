@@ -560,6 +560,27 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('xpath 认反向轴：.. 取父节点、following/preceding-sibling 取兄弟', () => {
+  const node = (index, parent, depth, cls, text) => ({ index, parent, depth, cls, text, desc: '', id: '', pkg: 'com.demo', x1: 0, y1: 0, x2: 10, y2: 10 })
+  const rows = [
+    node(0, -1, 0, 'LinearLayout', ''),
+    node(1, 0, 1, 'LinearLayout', ''),
+    node(2, 1, 2, 'TextView', '标题'),
+    node(3, 1, 2, 'TextView', '副标题'),
+    node(4, 0, 1, 'LinearLayout', ''),
+    node(5, 4, 2, 'Button', '删除'),
+  ]
+  const names = (hits) => hits.map((hit) => hit.text || hit.cls)
+  assert.deepEqual(names(selectXPath(rows, '//*[@text="标题"]/..')), ['LinearLayout'])
+  assert.deepEqual(selectXPath(rows, '//*[@text="标题"]/..').map((hit) => hit.index), [1])
+  assert.deepEqual(names(selectXPath(rows, '//*[@text="标题"]/parent::LinearLayout')), ['LinearLayout'])
+  assert.deepEqual(names(selectXPath(rows, '//*[@text="标题"]/following-sibling::TextView')), ['副标题'])
+  assert.deepEqual(names(selectXPath(rows, '//*[@text="副标题"]/preceding-sibling::TextView')), ['标题'])
+  assert.deepEqual(names(selectXPath(rows, '//*[@text="标题"]/following-sibling::*[1]')), ['副标题'])
+  assert.deepEqual(names(selectXPath(rows, '//*[@text="副标题"]/../*[@text="标题"]')), ['标题'])
+  assert.deepEqual(selectXPath(rows, '//*[@text="不存在"]/..'), [])
+})
+
 it('零宽字符与多余空白不会让「屏上有却找不到」', () => {
   assert.equal(dezero('\u200b设置\u200b'), '设置')
   assert.equal(dezero('  A \n B  '), 'A B')

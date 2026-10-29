@@ -3413,7 +3413,9 @@ function selectXPath(nodes, expr) {
   }
   if (steps.length === 0) throw new Error('xpath 是空的')
   const children = new Map()
+  const byIndex = new Map()
   for (const node of nodes) {
+    byIndex.set(node.index, node)
     const key = node.parent ?? -1
     if (!children.has(key)) children.set(key, [])
     children.get(key).push(node)
@@ -3423,7 +3425,7 @@ function selectXPath(nodes, expr) {
     const { combinator, step } = steps[s]
     let pool
     if (s === 0) pool = combinator === '//' ? nodes.slice() : (children.get(-1) ?? []).slice()
-    else pool = expandXPath(current, combinator, children)
+    else pool = expandXPath(current, combinator, step, { children, byIndex })
     current = applyXPathStep(pool, step)
     if (current.length === 0) return []
   }
@@ -3437,7 +3439,37 @@ function selectXPath(nodes, expr) {
  * @param {Map<number, any[]>} children - parent → 子节点。
  * @returns {any[]} 候选节点，文档顺序去重。
  */
-function expandXPath(pool, combinator, children) {
+function expandXPath(pool, combinator, step, maps) {
+  const children = maps.children
+  const byIndex = maps.byIndex
+  /* 反向轴先算，返回的都是「上一层命中节点」的父/兄弟，与 / 还是 // 无关。 */
+  if (step.axis === 'parent') {
+    const out = []
+    const seen = new Set()
+    for (const node of pool) {
+      const up = byIndex.get(node.parent)
+      if (!up || seen.has(up.index)) continue
+      seen.add(up.index)
+      out.push(up)
+    }
+    return out.sort((a, b) => a.index - b.index)
+  }
+  if (step.axis === 'following-sibling' || step.axis === 'preceding-sibling') {
+    const out = []
+    const seen = new Set()
+    for (const node of pool) {
+      const siblings = children.get(node.parent ?? -1) ?? []
+      const at = siblings.findIndex((kid) => kid.index === node.index)
+      if (at < 0) continue
+      const picked = step.axis === 'following-sibling' ? siblings.slice(at + 1) : siblings.slice(0, at)
+      for (const kid of picked) {
+        if (seen.has(kid.index)) continue
+        seen.add(kid.index)
+        out.push(kid)
+      }
+    }
+    return out.sort((a, b) => a.index - b.index)
+  }
   const out = []
   const seen = new Set()
   const push = (node) => {
@@ -3467,6 +3499,14 @@ function expandXPath(pool, combinator, children) {
  * @returns {{tag: string, preds: any[]}} 编译结果。
  */
 function compileXPathStep(source) {
+  /* 反向轴：Appium/UiAutomator 的 xpath 支持「..」和「following-sibling::」，列表里
+     「取这一行的删除按钮」全靠它；不认的话只能靠 adb_find 的 within_ref 绕。 */
+  if (source === '..' || source === 'parent::*') return { tag: '*', axis: 'parent', preds: [] }
+  const sideways = /^(following-sibling|preceding-sibling|parent)::(.+)$/.exec(source)
+  if (sideways) {
+    const inner = compileXPathStep(sideways[2])
+    return { tag: inner.tag, axis: sideways[1], preds: inner.preds }
+  }
   const match = /^([A-Za-z_][\w.:-]*|\*)((?:\[[^\]]*\])*)$/.exec(source)
   if (!match) throw new Error(`xpath 步骤看不懂：${source}`)
   const preds = []
