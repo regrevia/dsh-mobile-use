@@ -5221,7 +5221,7 @@ export function apply(ctx, config) {
             throw new Error(`第 ${at} 步等界面超时 ${limit}ms：${wanted}`)
           }
           const what = step.wait_text ?? step.wait_for_xpath ?? step.wait_xpath_gone ?? (step.wait_activity_gone ? `离开页面 ${step.wait_activity_gone}` : step.wait_activity ? `页面切到 ${step.wait_activity}` : step.wait_all ? normalList(step.wait_all).join('+') : step.wait_any ? `任一 ${normalList(step.wait_any).join('/')}` : '界面变化')
-          done.push(`等 ${what} ${waited.elapsedMs}ms`)
+          done.push(`等 ${what} ${waited.elapsedMs}ms${waited.polls ? `（${waited.polls} 次轮询）` : ''}`)
         } else if (step.sleep_ms !== undefined) {
           await new Promise((resolve) => setTimeout(resolve, Math.min(Number(step.sleep_ms) || 0, 15_000)))
           done.push(`等 ${step.sleep_ms}ms`)
