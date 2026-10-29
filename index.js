@@ -284,7 +284,7 @@ function validateSteps(steps) {
   const list = Array.isArray(steps) ? steps : []
   if (list.length === 0) return { ok: false, problems: ['steps 是空的：至少要写一步。'] }
   const actions = ['tap', 'id', 'ref', 'swipe', 'key', 'text', 'action', 'scroll_to']
-  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms']
+  const preconditions = ['wait_idle', 'wait_stable', 'wait_text', 'wait_gone', 'wait_all', 'wait_any', 'wait_activity', 'assert_text', 'assert_gone', 'sleep_ms', 'until', 'dismiss']
   const directions = ['up', 'down', 'left', 'right']
   for (const [index, step] of list.entries()) {
     const at = index + 1
@@ -4122,6 +4122,8 @@ export function apply(ctx, config) {
               wait_activity: { type: 'string', description: '等前台页面切到这个正则再做下一步，例如 "ScanActivity"' },
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
+              until: { type: 'string', enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'], description: '配 wait_text / assert_text：等同一个控件进入这个状态才算过（灰按钮不会误判成可点）' },
+              dismiss: { type: 'boolean', description: '本步等待被权限/升级弹窗挡住时自动点掉确认按钮（最多 2 次）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
               ime: { type: 'string', enum: ['auto', 'clipboard', 'adb'], description: '输入文字怎么上屏，同 adb_input 的 ime' },
               retry: { type: 'integer', minimum: 0, maximum: 3, description: '这一步在「还没点/还没打字」阶段失败时重来几次（默认 0）：查询超时、快照失效这类偶发失败用得上；已经注入过动作再失败就直接报错，不重复点' },
@@ -4268,7 +4270,8 @@ export function apply(ctx, config) {
             texts: step.wait_all,
             any_texts: step.wait_any,
             activity: step.wait_activity,
-          }, limit)
+            until: step.until,
+          }, limit, { dismiss: step.dismiss === true })
           activity = waited.state.activity
           if (!waited.matched) {
             const wanted = step.wait_text ? `没等到「${step.wait_text}」`
@@ -4286,12 +4289,14 @@ export function apply(ctx, config) {
         }
 
         if (step.assert_text !== undefined || step.assert_gone !== undefined) {
-          const checked = await waitFor(device, { text: step.assert_text, gone: step.assert_gone }, Math.min(limit, 3000))
+          const checked = await waitFor(device, { text: step.assert_text, gone: step.assert_gone, until: step.until }, Math.min(limit, 3000), { dismiss: step.dismiss === true })
           activity = checked.state.activity
           if (!checked.matched) {
             throw new Error(`第 ${at} 步核对失败：${step.assert_text ? `界面上没有「${step.assert_text}」` : `「${step.assert_gone}」还在`}${nearMiss(checked.state, { text: step.assert_text })}`)
           }
-          done.push(step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」` : `✓「${oneLine(String(step.assert_gone), 16)}」已消失`)
+          const stateNote = step.until === undefined ? '' : `（处于 ${step.until}）`
+          const popNote = checked.dismissed.length === 0 ? '' : `，先点掉了 ${checked.dismissed.join('/')}`
+          done.push(step.assert_text ? `✓ 有「${oneLine(step.assert_text, 16)}」${stateNote}${popNote}` : `✓「${oneLine(String(step.assert_gone), 16)}」已消失${popNote}`)
         }
       break
         } catch (retryable) {
