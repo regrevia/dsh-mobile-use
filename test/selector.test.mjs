@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -558,6 +558,25 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 3, y1: 0, x2: 40, y2: 20 }, 8), { x: 0, y: 0, w: 53, h: 36 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 10, y2: 10 }, 0), { x: 10, y: 10, w: 2, h: 2 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
+})
+
+it('within_ref / within_rect 解析成同一个框：xpath 也能按框裁', () => {
+  const state = { nodes: [], refs: [{ ref: 3, node: { x1: 100, y1: 200, x2: 300, y2: 400 } }] }
+  assert.deepEqual(withinBox(state, { within_ref: 3 }), [100, 200, 200, 200])
+  assert.deepEqual(withinBox(state, { within_rect: ['10', '20', '30', '40'] }), [10, 20, 30, 40])
+  assert.equal(withinBox(state, {}), null)
+  assert.throws(() => withinBox({ nodes: [] }, { within_ref: 9 }), /不在当前快照里/, '快照里没有这个 ref 要报错，不能静默当成全屏')
+  const box = withinBox(state, { within_ref: 3 })
+  assert.equal(inWithinBox({ x1: 150, y1: 250, x2: 160, y2: 260 }, box), true)
+  assert.equal(inWithinBox({ x1: 350, y1: 250, x2: 360, y2: 260 }, box), false, '按中心判，框外的子节点不算')
+  assert.equal(inWithinBox({ x1: 350, y1: 250, x2: 360, y2: 260 }, null), true)
+  const rows = [
+    { text: '行一', x1: 110, y1: 210, x2: 200, y2: 240, clickable: true, enabled: true },
+    { text: '行一', x1: 600, y1: 1200, x2: 700, y2: 1240, clickable: true, enabled: true },
+  ]
+  const kept = selectNodes({ nodes: rows, refs: state.refs }, { text: '行一', within_ref: 3 })
+  assert.equal(kept.length, 1, 'within_ref 应把框外那条同名行裁掉')
+  assert.equal(kept[0].x1, 110)
 })
 
 it('adb_do 步骤：scroll_to 能写对象，说清找什么、往哪滑', () => {

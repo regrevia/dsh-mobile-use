@@ -2351,6 +2351,37 @@ function spotList(nodes) {
 }
 
 /**
+ * 把 within_ref / within_rect 解析成一个矩形框（x, y, w, h）。
+ * 两种写法共用一个实现，免得「按 ref 限定范围」在不同工具里语义不一致。
+ * @param {any} state - 一次 dump 的状态（需要 refs）。
+ * @param {any} want - 选择器，可带 within_ref 或 within_rect。
+ * @returns {number[]|null} 矩形；没限定就 null。
+ */
+function withinBox(state, want) {
+  if (Array.isArray(want?.within_rect) && want.within_rect.length === 4) {
+    return want.within_rect.map((value) => Number(value))
+  }
+  if (want?.within_ref === undefined || want?.within_ref === null) return null
+  const refs = state?.refs ?? state?.tree?.refs ?? []
+  const entry = refs.find((item) => item.ref === Number(want.within_ref))
+  if (!entry || !entry.node) throw new Error(`within_ref ${want.within_ref} 不在当前快照里：先 adb_ui 或 adb_find 拿最新 ref。`)
+  return [entry.node.x1, entry.node.y1, entry.node.x2 - entry.node.x1, entry.node.y2 - entry.node.y1]
+}
+
+/**
+ * 节点中心点是否落在框里：按中心判，避免大容器把自己算进子范围。
+ * @param {any} node - 节点。
+ * @param {number[]|null} box - 矩形；null 表示不限。
+ * @returns {boolean} 是否在内。
+ */
+function inWithinBox(node, box) {
+  if (!box) return true
+  const cx = (node.x1 + node.x2) / 2
+  const cy = (node.y1 + node.y2) / 2
+  return cx >= box[0] && cx <= box[0] + box[2] && cy >= box[1] && cy <= box[1] + box[3]
+}
+
+/**
  * 统一选择器引擎：字段之间 AND，字段内多值 OR；默认包含匹配，exact 精确，regex 正则。
  * 对齐 uiautomator2 的 text/textContains/textMatches/id/description/instance 语义。
  * @param {any} state - 一次 dump 的状态（需要 nodes 与 refs）。
@@ -2360,7 +2391,6 @@ function spotList(nodes) {
 function selectNodes(state, sel) {
   const want = sel || {}
   const nodes = state && Array.isArray(state.nodes) ? state.nodes : []
-  const refs = state && Array.isArray(state.refs) ? state.refs : (state?.tree?.refs ?? [])
   const text = String(want.text ?? want.textContains ?? want.text_matches ?? want.textMatches ?? '')
   const id = want.id == null ? '' : String(want.id)
   const desc = want.desc == null ? '' : String(want.desc)
@@ -2375,20 +2405,8 @@ function selectNodes(state, sel) {
   const lowDesc = desc.toLowerCase()
   const lowCls = cls.toLowerCase()
   const lowPkg = pkg.toLowerCase()
-  let box = null
-  if (Array.isArray(want.within_rect) && want.within_rect.length === 4) box = want.within_rect.map((value) => Number(value))
-  else if (want.within_ref !== undefined && want.within_ref !== null) {
-    const entry = refs.find((item) => item.ref === Number(want.within_ref))
-    if (!entry || !entry.node) throw new Error(`within_ref ${want.within_ref} 不在当前快照里：先 adb_ui 或 adb_find 拿最新 ref。`)
-    box = [entry.node.x1, entry.node.y1, entry.node.x2 - entry.node.x1, entry.node.y2 - entry.node.y1]
-  }
-  const inBox = (node) => {
-    if (!box) return true
-    const [bx, by, bw, bh] = box
-    const cx = (node.x1 + node.x2) / 2
-    const cy = (node.y1 + node.y2) / 2
-    return cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh
-  }
+  const box = withinBox(state, want)
+  const inBox = (node) => inWithinBox(node, box)
   const pass = (node) => {
     if (text) {
       if (reText) {
@@ -5338,7 +5356,7 @@ ctx.effect(() => ctx.tools.register(withEvidence({
     type: 'object',
     properties: {
       text: { type: 'string', description: '文字或描述，默认包含匹配' },
-      xpath: { type: 'string', description: 'XPath 定位（Appium 写法：//*[@text="登录"]、//LinearLayout/node[2]、//*[contains(@text,"登")]）；给了它就忽略其他选择器' },
+      xpath: { type: 'string', description: 'XPath 定位（Appium 写法：//*[@text="登录"]、//LinearLayout/node[2]、//*[contains(@text,"登")]）；给了它就忽略其他选择器，只有 within_ref 还能一起用' },
       text_matches: { type: 'string', description: '文字正则（等于 regex=true 时的 text）' },
       id: { type: 'string', description: '资源 id，可只写后半段' },
       desc: { type: 'string', description: 'content-desc' },
@@ -5354,7 +5372,7 @@ ctx.effect(() => ctx.tools.register(withEvidence({
       scrollable: { type: 'boolean', description: '按可滚动挑（找列表容器时用 true）' },
       focused: { type: 'boolean', description: '按焦点挑（找当前输入框时用 true）' },
       editable: { type: 'boolean', description: '按能不能输入挑（EditText 一类）' },
-      within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找' },
+      within_ref: { type: 'integer', description: '只在这个 ref 的矩形范围内找（xpath 也认：先全树选中，再按这个框裁）' },
       all: { type: 'boolean', description: '保留同一处的所有层（默认按落点归并，只留最精确那层）' },
       index: { type: 'integer', description: '只返回第几个匹配，从 0 开始' },
       max: { type: 'integer', description: '最多返回几条，默认 20，上限 50' },
@@ -5421,8 +5439,9 @@ ctx.effect(() => ctx.tools.register(withEvidence({
       : await snapshotForSelector(device, args.snapshot_id)
     const refOf = new Map()
     for (const entry of (state.refs ?? state.tree?.refs) || []) if (entry && entry.node) refOf.set(entry.node, entry.ref)
+    const xpathBox = args.xpath !== undefined ? withinBox(state, args) : null
     const hits = args.xpath !== undefined
-      ? selectXPath(state.nodes, args.xpath)
+      ? selectXPath(state.nodes, args.xpath).filter((node) => inWithinBox(node, xpathBox))
       : selectNodes(state, {
       text: args.text,
       text_matches: args.text_matches,
@@ -6924,6 +6943,8 @@ export const __internals = {
   spotList,
   matches,
   nodeStateOk,
+  withinBox,
+  inWithinBox,
   parseNodes,
   compactTree,
   shortId,
