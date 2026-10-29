@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=205'
-import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION } from './scrcpy.js?v=14'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
 import { PLAYER_HTML } from './page.js?v=36'
 
 /** 客户端与宿主共用的路由前缀。 */
@@ -1115,7 +1115,7 @@ export class Mirror {
 /**
  * 装好镜像能力：HTTP 路由、直播、录制、标注回传。
  * @param {any} ctx - Cordis 上下文。
- * @param {{ adb: any, resolveSerial: () => Promise<string>, uiInRect?: (serial: string, rect: any) => Promise<string[]> }} tools - 宿主已有的能力。
+ * @param {{ adb: any, resolveSerial: () => Promise<string>, screenSize?: (serial: string) => Promise<{ width: number, height: number }>, uiInRect?: (serial: string, rect: any) => Promise<string[]> }} tools - 宿主已有的能力。
  * @returns {{ open: () => number, status: (serial?: string) => Promise<object>, stopAll: () => void }} 给工具层用的入口。
  */
 export function setupMirror(ctx, tools) {
@@ -1177,6 +1177,8 @@ export function setupMirror(ctx, tools) {
           log: (note) => ctx.logger?.debug?.(`[scrcpy] ${String(note)}`),
         })
         entry.channel = channel
+        /* 分辨率变了 = 转过屏或编码器重协商，触控坐标空间跟着变，设备尺寸缓存立刻作废。 */
+        channel.on?.('video-session', () => deviceScreens.delete(serial))
         /* 通道是一次性的：stop()/对端断开之后再 start() 只会立刻失败，而这个 entry 会一直
            缓存着那个死对象，于是「等采集源」永远等不到，只能退回 screenrecord 那条死路。
            断开就把它扔掉，下一次 channelFor 重新 new 一条（新端口、新 scid）。 */
@@ -1199,6 +1201,8 @@ export function setupMirror(ctx, tools) {
     }
     if (autoStart && entry.failed !== true && entry.ready === null && entry.starting !== true && entry.channel !== null) {
       entry.starting = true
+      /* 触控要设备尺寸：开通道时顺手读一次，别让第一下点击替它付两次 adb 往返。 */
+      void deviceScreen(serial).catch(() => null)
       void Promise.resolve()
         .then(() => entry.channel.start())
         .then((ok) => {
@@ -1259,13 +1263,76 @@ export function setupMirror(ctx, tools) {
     return null
   }
 
-  /** 触控消息的公共字段：坐标空间 = 视频尺寸 = 设备像素。 @returns {any | null} 尺寸没读到给 null。 */
-  function touchBase(channel) {
-    const info = channel?.info ?? null
-    const width = Number(info?.width) || 0
-    const height = Number(info?.height) || 0
+  /** 每台设备的真实屏幕尺寸（转屏后要重算），60 秒缓存。 */
+  const deviceScreens = new Map()
+
+  /**
+   * 设备屏幕尺寸：换算分母。60 秒缓存，转屏由 video-session 事件作废。
+   * @param {string} serial - 设备。
+   * @param {{ fresh?: boolean }} [options] - fresh 跳过缓存（方向对不上时用）。
+   * @returns {Promise<{ width: number, height: number } | null>} 读不到给 null。
+   */
+  async function deviceScreen(serial, options = {}) {
+    const cached = deviceScreens.get(serial)
+    if (options.fresh !== true && cached !== undefined && Date.now() - cached.at < 60_000) return cached
+    if (typeof tools.screenSize !== 'function') return null
+    const size = await tools.screenSize(serial, { fresh: options.fresh === true }).catch(() => null)
+    const width = Number(size?.width) || 0
+    const height = Number(size?.height) || 0
     if (!(width > 0) || !(height > 0)) return null
-    return { screenWidth: width, screenHeight: height, pressure: 1, buttons: 1 }
+    const fresh = { width, height, at: Date.now() }
+    deviceScreens.set(serial, fresh)
+    return fresh
+  }
+
+  /**
+   * 编码尺寸（视频像素）。channel.info 是活的：session 包到了才有宽高。
+   * @param {any} channel - scrcpy 通道。
+   * @returns {Promise<{ width: number, height: number } | null>} 400 ms 内还没读到给 null。
+   */
+  async function videoInfo(channel) {
+    const read = () => ({
+      width: Number(channel?.info?.width) || 0,
+      height: Number(channel?.info?.height) || 0,
+    })
+    let video = read()
+    if (video.width > 0 && video.height > 0) return video
+    const deadline = Date.now() + 400
+    while (Date.now() < deadline) {
+      await tick(20)
+      video = read()
+      if (video.width > 0 && video.height > 0) return video
+    }
+    return null
+  }
+
+  /**
+   * 一次触控要的公共字段 + 坐标换算。
+   *
+   * scrcpy 的 PositionMapper 只认**视频像素**：`screenWidth/screenHeight` 必须等于编码尺寸，
+   * x/y 也必须是这个空间里的点，server 再按 video→device 矩阵放大回设备像素。我们手上的
+   * x/y 来自页面树和 `input tap`，都是设备像素，所以这里先缩一次（`deviceToVideoPoint`）。
+   * 编码被 `--max-size` 压过时（默认 1600），漏掉这一步就是整块画面按 1.34 倍偏移。
+   * @param {string} serial - 设备。
+   * @param {any} channel - 已就绪的 scrcpy 通道。
+   * @returns {Promise<{ base: any, at: (x: number, y: number) => { x: number, y: number } } | null>}
+   */
+  async function touchSpace(serial, channel) {
+    /* start() 只等到 socket 连通，编码尺寸要等第一个 session 包；冷启动第一下点击别急着退 adb。 */
+    const video = await videoInfo(channel)
+    if (video === null) return null
+    let device = await deviceScreen(serial)
+    /* 方向对不上：index 里那层 60 秒缓存可能还留着转屏前的尺寸，强制重读一次。 */
+    if (device !== null && Math.abs(device.width / device.height - video.width / video.height) > 0.02) {
+      device = await deviceScreen(serial, { fresh: true })
+    }
+    if (device === null) {
+      streamFor(serial).debug('设备尺寸没读到，触控按设备像素直发 ' + video.width + 'x' + video.height)
+    }
+    return {
+      base: { screenWidth: video.width, screenHeight: video.height, pressure: 1, buttons: 1 },
+      at: (x, y) => deviceToVideoPoint(x, y, device ?? { width: video.width, height: video.height }, video),
+    }
   }
 
   /** 微秒级等待。 @returns {Promise<void>} */
@@ -1280,13 +1347,14 @@ export function setupMirror(ctx, tools) {
   async function scrcpyTap(serial, x, y, options = {}) {
     const channel = channelFor(serial)
     if (channel === null) return null
-    const base = touchBase(channel)
-    if (base === null) return null
+    const space = await touchSpace(serial, channel)
+    if (space === null) return null
     const px = Math.round(Number(x) || 0)
     const py = Math.round(Number(y) || 0)
-    if (channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: px, y: py }) !== true) return null
+    const point = space.at(px, py)
+    if (channel.pushTouch({ ...space.base, action: TOUCH_ACTION.DOWN, x: point.x, y: point.y }) !== true) return null
     if (options.long === true) await tick(Math.max(120, Math.min(3000, Number(options.holdMs) || 620)))
-    const ok = channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: px, y: py, pressure: 0, buttons: 0 })
+    const ok = channel.pushTouch({ ...space.base, action: TOUCH_ACTION.UP, x: point.x, y: point.y, pressure: 0, buttons: 0 })
     return ok === true ? { ok: true, engine: 'scrcpy' } : null
   }
 
@@ -1294,8 +1362,8 @@ export function setupMirror(ctx, tools) {
   async function scrcpySwipe(serial, x1, y1, x2, y2, ms) {
     const channel = channelFor(serial)
     if (channel === null) return null
-    const base = touchBase(channel)
-    if (base === null) return null
+    const space = await touchSpace(serial, channel)
+    if (space === null) return null
     const total = Math.max(16, Math.min(4000, Math.round(Number(ms) || 300)))
     /* 一次注入的离散点：60 Hz 起步（16 ms 一步），上限 60 步；pushTouch 只要 0.28 ms，密一点不会拖慢。 */
     const steps = Math.max(3, Math.min(60, Math.round(total / 16)))
@@ -1303,18 +1371,16 @@ export function setupMirror(ctx, tools) {
     const fromY = Math.round(Number(y1) || 0)
     const toX = Math.round(Number(x2) || 0)
     const toY = Math.round(Number(y2) || 0)
-    if (channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: fromX, y: fromY }) !== true) return null
+    const from = space.at(fromX, fromY)
+    if (channel.pushTouch({ ...space.base, action: TOUCH_ACTION.DOWN, x: from.x, y: from.y }) !== true) return null
     for (let i = 1; i <= steps; i += 1) {
       const k = i / steps
-      channel.pushTouch({
-        ...base,
-        action: TOUCH_ACTION.MOVE,
-        x: Math.round(fromX + (toX - fromX) * k),
-        y: Math.round(fromY + (toY - fromY) * k),
-      })
+      const point = space.at(fromX + (toX - fromX) * k, fromY + (toY - fromY) * k)
+      channel.pushTouch({ ...space.base, action: TOUCH_ACTION.MOVE, x: point.x, y: point.y })
       await tick(total / steps)
     }
-    const ok = channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: toX, y: toY, pressure: 0, buttons: 0 })
+    const end = space.at(toX, toY)
+    const ok = channel.pushTouch({ ...space.base, action: TOUCH_ACTION.UP, x: end.x, y: end.y, pressure: 0, buttons: 0 })
     return ok === true ? { ok: true, engine: 'scrcpy' } : null
   }
 
@@ -1325,13 +1391,14 @@ export function setupMirror(ctx, tools) {
   async function scrcpyGesture(serial, tracks, ms) {
     const channel = channelFor(serial)
     if (channel === null) return null
-    const base = touchBase(channel)
-    if (base === null) return null
+    const space = await touchSpace(serial, channel)
+    if (space === null) return null
     if (!Array.isArray(tracks) || tracks.length === 0 || tracks.length > 5) return null
     if (!tracks.every((track) => Array.isArray(track) && track.length >= 2)) return null
     const total = Math.max(16, Math.min(4000, Math.round(Number(ms) || 300)))
     const steps = Math.max(3, Math.min(24, Math.round(total / 40)))
-    const at = (track, k) => {
+    /* 轨迹点先算设备像素，发出去之前统一缩到视频像素。 */
+    const spotAt = (track, k) => {
       const pos = k * (track.length - 1)
       const index = Math.min(track.length - 2, Math.floor(pos))
       const frac = pos - index
@@ -1341,28 +1408,29 @@ export function setupMirror(ctx, tools) {
       const by = Number(track[index + 1][1]) || 0
       return [Math.round(ax + (bx - ax) * frac), Math.round(ay + (by - ay) * frac)]
     }
+    const at = (track, k) => space.at(...spotAt(track, k))
     const pointers = tracks.map((track, index) => ({ track, pointerId: index }))
     /* 第一根手指就是普通 DOWN；后面的手指用 POINTER_DOWN 挂上去。 */
     const first = at(pointers[0].track, 0)
-    if (channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: first[0], y: first[1], pointerId: 0 }) !== true) return null
+    if (channel.pushTouch({ ...space.base, action: TOUCH_ACTION.DOWN, x: first.x, y: first.y, pointerId: 0 }) !== true) return null
     for (const pointer of pointers.slice(1)) {
       const spot = at(pointer.track, 0)
-      channel.pushTouch({ ...base, action: TOUCH_ACTION.POINTER_DOWN, x: spot[0], y: spot[1], pointerId: pointer.pointerId })
+      channel.pushTouch({ ...space.base, action: TOUCH_ACTION.POINTER_DOWN, x: spot.x, y: spot.y, pointerId: pointer.pointerId })
     }
     for (let i = 1; i <= steps; i += 1) {
       const k = i / steps
       for (const pointer of pointers) {
         const spot = at(pointer.track, k)
-        channel.pushTouch({ ...base, action: TOUCH_ACTION.MOVE, x: spot[0], y: spot[1], pointerId: pointer.pointerId })
+        channel.pushTouch({ ...space.base, action: TOUCH_ACTION.MOVE, x: spot.x, y: spot.y, pointerId: pointer.pointerId })
       }
       await tick(total / steps)
     }
     for (const pointer of pointers.slice(1).reverse()) {
       const spot = at(pointer.track, 1)
-      channel.pushTouch({ ...base, action: TOUCH_ACTION.POINTER_UP, x: spot[0], y: spot[1], pointerId: pointer.pointerId, pressure: 0, buttons: 0 })
+      channel.pushTouch({ ...space.base, action: TOUCH_ACTION.POINTER_UP, x: spot.x, y: spot.y, pointerId: pointer.pointerId, pressure: 0, buttons: 0 })
     }
     const last = at(pointers[0].track, 1)
-    const ok = channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: last[0], y: last[1], pointerId: 0, pressure: 0, buttons: 0 })
+    const ok = channel.pushTouch({ ...space.base, action: TOUCH_ACTION.UP, x: last.x, y: last.y, pointerId: 0, pressure: 0, buttons: 0 })
     return ok === true ? { ok: true, engine: 'scrcpy' } : null
   }
 
@@ -1385,13 +1453,22 @@ export function setupMirror(ctx, tools) {
   fastInput.raw = (serial) => {
     const channel = channelFor(serial)
     if (channel === null) return null
-    const base = touchBase(channel)
-    if (base === null) return null
+    const info = channel?.info ?? null
+    const video = { width: Number(info?.width) || 0, height: Number(info?.height) || 0 }
+    if (!(video.width > 0) || !(video.height > 0)) return null
+    /* 同步入口只能吃缓存里的设备尺寸；还没读到就按视频尺寸算（等价于不缩放）。 */
+    const device = deviceScreens.get(serial) ?? { width: video.width, height: video.height }
+    const base = { screenWidth: video.width, screenHeight: video.height, pressure: 1, buttons: 1 }
+    const at = (x, y) => deviceToVideoPoint(x, y, device, video)
+    const send = (action, x, y, pointerId, extra = {}) => {
+      const point = at(x, y)
+      return channel.pushTouch({ ...base, action, x: point.x, y: point.y, pointerId, ...extra })
+    }
     return {
       engine: 'scrcpy',
-      down: (x, y, pointerId = 0) => channel.pushTouch({ ...base, action: TOUCH_ACTION.DOWN, x: Math.round(x), y: Math.round(y), pointerId }),
-      move: (x, y, pointerId = 0) => channel.pushTouch({ ...base, action: TOUCH_ACTION.MOVE, x: Math.round(x), y: Math.round(y), pointerId }),
-      up: (x, y, pointerId = 0) => channel.pushTouch({ ...base, action: TOUCH_ACTION.UP, x: Math.round(x), y: Math.round(y), pointerId, pressure: 0, buttons: 0 }),
+      down: (x, y, pointerId = 0) => send(TOUCH_ACTION.DOWN, x, y, pointerId),
+      move: (x, y, pointerId = 0) => send(TOUCH_ACTION.MOVE, x, y, pointerId),
+      up: (x, y, pointerId = 0) => send(TOUCH_ACTION.UP, x, y, pointerId, { pressure: 0, buttons: 0 }),
     }
   }
 

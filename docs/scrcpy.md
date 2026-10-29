@@ -127,8 +127,11 @@ ffmpeg -flags low_delay -use_wallclock_as_timestamps 1 -f h264 -i pipe:0 \
 特殊 `pointerId`：鼠标 `0xFFFF_FFFF_FFFF_FFFF`、普通手指 `0xFFFF_FFFF_FFFF_FFFE`、
 虚拟手指 `0xFFFF_FFFF_FFFF_FFFD`。
 
-坐标必须是**设备屏幕坐标**（不是画面坐标）；侧栏缩放/旋转的换算仍归 `client.js`，
-本模块只负责“给定设备坐标 → 字节”。
+坐标必须是**视频像素**（编码后的画面坐标）：`screenWidth/screenHeight` 等于视频尺寸，
+x/y 也在同一空间。server 侧 `PositionMapper` 是按编码尺寸建的
+（`PositionMapper.create(videoSize, transform, deviceSize)`）：尺寸对不上直接丢弃事件，
+对得上再按 video→device 矩阵放大回设备像素。所以 `--max-size` 压过分辨率时必须先缩一次，
+dev 坐标 → 视频坐标用 `deviceToVideoPoint(x, y, device, video)`；侧栏缩放/旋转的换算归 `client.js`。
 
 ## 5. 实测延迟（本机 adb，2026-10，7 次取 min/中位/均值）
 
@@ -252,21 +255,22 @@ new ScrcpyChannel({ serial, adbPath, serverPath, deviceServerPath, serverVersion
 
 - 音频（`audio=true`）、H.265/AV1/VP8/VP9 码流。
 - 多指并发（多个 pointerId 同时按下）。
-- 开流之后再转屏：坐标空间会失效，目前不自动重算。
+- 开流之后再转屏：`video-session` 事件会作废设备尺寸缓存，下一帧起按新尺寸重新换算；
+  转屏瞬间已经在路上的那一下触控可能被 server 丢弃（尺寸不匹配），属预期。
 - 真手指触摸的坐标：`/dev/input` 的 `getevent` 需要 root，本机虽已 root，但没有真人示范数据，
   所以只记录了「面板动作 + 系统事件」，物理屏触摸仍不可还原。
 
 ## 8. 后续可做
 
 1. 手势流式下发（`/touch` 单连接持续喂 DOWN/MOVE/UP），替代每次 `adb shell input` 的进程启动开销。
-2. 转屏后自动重建坐标映射（监听 `wm_size` 再算一次缩放）。
+2. 物理屏触摸的坐标还原（缺真人示范数据；root 下 `getevent` 能读到原始事件但无法区分手指身份）。
 3. UHID / 剪贴板 / 旋转控制消息。
 
 ## 9. 回归测试
 
 ```sh
 node test/scrcpy.test.mjs      # 纯内存，不连设备、不 spawn 进程
-# === 全部通过 ===（54 项），exit 0
+# === 全部通过 ===（56 项），exit 0
 ```
 
 覆盖：包头位布局（v5 媒体/session、v3 config）、逐字节重组、半包缓冲、oversize 拒绝、

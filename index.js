@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=224'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=225'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -2776,9 +2776,15 @@ function displaySizeFrom(text, physical) {
   return { width: pick.w, height: pick.h }
 }
 
-async function screenSize(device) {
+/**
+ * 屏幕分辨率（转屏后是转过来的宽高），60 秒缓存。
+ * @param {string} device - 设备。
+ * @param {{ fresh?: boolean }} [options] - fresh 跳过缓存重读（方向对不上时用）。
+ * @returns {Promise<{ width: number, height: number }>} 尺寸。
+ */
+async function screenSize(device, options = {}) {
   const cached = screenSizes.get(device)
-  if (cached && Date.now() - cached.at < 60_000) return cached
+  if (options.fresh !== true && cached && Date.now() - cached.at < 60_000) return cached
   let physical = null
   try {
     const w = await adb(['-s', device, 'shell', 'wm size'], { timeout: 8000 })
@@ -3777,6 +3783,8 @@ export function apply(ctx, config) {
   const mirror = setupMirror(ctx, {
     adb: Object.assign(adb, { path: ADB }),
     resolveSerial: serial,
+    /* 镜像里的触控要按设备坐标发：编码分辨率被压到 1600 时视频尺寸 ≠ 设备尺寸。 */
+    screenSize,
     uiInRect,
     recentActions,
     /* 人手在侧栏点/滑/打字也要进同一条时间线：否则 agent 只看得到自己做过什么，

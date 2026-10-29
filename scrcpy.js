@@ -503,6 +503,35 @@ export class VideoStreamParser {
  * 控制消息编码（纯函数，全部返回 Buffer）
  * ==========================================================*/
 
+/**
+ * 设备像素 → 视频像素（触控消息的坐标空间）。
+ *
+ * server 侧的 PositionMapper 是按**编码尺寸**建的：`PositionMapper.create(videoSize, transform, deviceSize)`，
+ * 客户端消息里的 `screenWidth/screenHeight` 必须等于 videoSize，点位也必须是 videoSize 空间里的坐标；
+ * 尺寸对不上 server 直接丢弃事件（"Ignore positional event generated for size …"），对得上就按 video→device
+ * 矩阵再放大。所以设备尺寸 ≠ 视频尺寸时（`--max-size` 压缩）必须先缩一次，不能直接发设备坐标——
+ * 否则每个点都被再放大 deviceW/videoW 倍，越高越偏右、越往下越偏下。
+ * @param {number} x - 设备像素 x。
+ * @param {number} y - 设备像素 y。
+ * @param {{ width?: number, height?: number }} device - 设备屏幕尺寸。
+ * @param {{ width?: number, height?: number }} video - 编码尺寸。
+ * @returns {{ x: number, y: number }} 视频像素坐标（已夹到画面内）。
+ */
+export function deviceToVideoPoint(x, y, device, video) {
+  const dw = Number(device?.width) || 0
+  const dh = Number(device?.height) || 0
+  const vw = Number(video?.width) || 0
+  const vh = Number(video?.height) || 0
+  const rawX = Math.round(Number(x) || 0)
+  const rawY = Math.round(Number(y) || 0)
+  if (!(dw > 0) || !(dh > 0) || !(vw > 0) || !(vh > 0)) return { x: rawX, y: rawY }
+  const clamp = (value, max) => Math.max(0, Math.min(max, value))
+  return {
+    x: clamp(Math.round((rawX * vw) / dw), vw - 1),
+    y: clamp(Math.round((rawY * vh) / dh), vh - 1),
+  }
+}
+
 function writeUInt64(value, buffer, offset) {
   const bigint = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value) || 0))
   buffer.writeBigUInt64BE(BigInt.asUintN(64, bigint), offset)
@@ -689,6 +718,8 @@ const DEFAULT_OPTIONS = {
  *
  * 事件（监听器里抛异常不会传播出来）：
  *  'video-header'  { deviceName, codec, codecId, width, height, protocol }
+ *    注意：协议 v5 的宽高在第一个 session 包里才确定，这个事件可能是 null；要尺寸读
+ *    `channel.info`（活对象）或等 'video-session'。
  *  'video-session' { width, height, clientResized }
  *  'video-packet'  { data, size, pts, keyFrame, config }
  *  'ready' | 'closed'

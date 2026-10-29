@@ -36,6 +36,7 @@ import {
   encodeBackOrScreenOn,
   encodeKeycode,
   encodeText,
+  deviceToVideoPoint,
   encodeTouch,
   floatToU16Fp,
   keycodeFor,
@@ -331,6 +332,22 @@ it('触控包坐标是 i32（负数用补码），压力夹紧，缺省全 0', (
   const blank = encodeTouch()
   assert.equal(blank.length, 32)
   assert.equal(blank.toString('hex'), '0200' + '0'.repeat(60))
+})
+
+it('设备像素 → 视频像素：按编码尺寸缩，夹在画面内', () => {
+  const device = { width: 2136, height: 3200 }
+  const video = { width: 1600, height: 2397 }
+  assert.deepEqual(deviceToVideoPoint(0, 0, device, video), { x: 0, y: 0 })
+  assert.deepEqual(deviceToVideoPoint(2136, 3200, device, video), { x: 1599, y: 2396 })
+  // 画面正中、四角：不能漏缩，也不能越界
+  assert.deepEqual(deviceToVideoPoint(1068, 1600, device, video), { x: 800, y: 1199 })
+  assert.deepEqual(deviceToVideoPoint(2136, 0, device, video), { x: 1599, y: 0 })
+  assert.deepEqual(deviceToVideoPoint(-40, 3800, device, video), { x: 0, y: 2396 })
+  // 视频尺寸 = 设备尺寸时是恒等变换（没开 --max-size 的设备）
+  assert.deepEqual(deviceToVideoPoint(700, 900, device, device), { x: 700, y: 900 })
+  // 尺寸未知：原样下发，别把坐标算成 NaN
+  assert.deepEqual(deviceToVideoPoint(700, 900, null, video), { x: 700, y: 900 })
+  assert.deepEqual(deviceToVideoPoint(700, 900, device, {}), { x: 700, y: 900 })
 })
 
 it('按键包 14 字节，字段偏移与 control_msg.c 一致', () => {
