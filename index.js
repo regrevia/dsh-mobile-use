@@ -3955,6 +3955,7 @@ export function apply(ctx, config) {
         wait_until_gone: { type: 'string', description: '点完等这段文字消失（关弹窗、等加载完）' },
         wait_for_xpath: { type: 'string', description: '点完等这个 XPath 命中（列表行、结构化结果）' },
         wait_xpath_gone: { type: 'string', description: '点完等这个 XPath 不再命中（弹层收起）' },
+        shot: { type: 'boolean', description: '点完留一张截图（返回绝对路径）：要看颜色、自绘界面、弹窗样式时用，省一次 adb_shot' },
         scroll: { type: 'integer', description: '目标不在当前屏时最多滑几次（1–15）：滑到就点，滑不到报错。只在按文字/id/描述/类名找时有效' },
         scroll_direction: { type: 'string', description: '边滑边找的手指方向：up/down/left/right，默认 up（把下面的内容拉上来）' },
         wait_ms: { type: 'integer', description: '目标还没出现时先等它出现多久（毫秒，默认 900，上限 5000）：点早了不用再来一轮' },
@@ -4161,6 +4162,7 @@ export function apply(ctx, config) {
          这点额外开销只在判失败的那一次花（实测 ~0.5s / 28KB），成功了不花。 */
       let shot = null
       if (changed === false) shot = await captureEvidence(device, 'tap-miss')
+      else if (args.shot === true) shot = await captureEvidence(device, 'adb_tap')
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
       const slid = scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''
       const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}${shot === null ? '' : ` · 截图 ${shot.path}`}`
@@ -4816,6 +4818,7 @@ export function apply(ctx, config) {
               swipe: { type: 'array', items: { type: 'integer' }, description: '滑动 [x1,y1,x2,y2,毫秒]' },
               key: { type: 'string', description: '按键名：BACK / HOME / ENTER，或 keycode 数字' },
               text: { type: 'string', description: '往焦点输入框输入文字（ASCII 直发，中文走剪贴板粘贴；先点中输入框让它获得焦点）' },
+              clear: { type: 'boolean', description: '配 text：输入前先清空当前聚焦输入框（END + 多次 DEL，默认关）' },
               action: { type: 'string', description: '系统动作：home / back / recents / lock / wake / notifications / quick_settings' },
               wait_text: { type: 'string', description: '等这段文字出现再做下一步' },
               wait_gone: { type: 'string', description: '等这段文字消失再做下一步' },
@@ -4842,6 +4845,7 @@ export function apply(ctx, config) {
           },
         },
         timeout_ms: { type: 'integer', description: '每步等待上限，默认 8000' },
+        shot: { type: 'boolean', description: '整串跑完留一张截图（返回绝对路径）：要看颜色、自绘界面、弹窗样式时用，省一次 adb_shot' },
       },
       required: ['steps'],
       additionalProperties: false,
@@ -4854,6 +4858,7 @@ export function apply(ctx, config) {
           steps: { type: 'integer' },
           skipped: { type: 'integer', description: 'on_fail=continue 的步骤里失败跳过了几步' },
           activity: { type: 'string' },
+          shot: { type: ['object', 'null'], description: 'shot=true 时的截图（含绝对路径）' },
           summary: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
@@ -4963,6 +4968,10 @@ export function apply(ctx, config) {
         } else if (step.text !== undefined) {
           /* 与 adb_input 共用一条路径：ASCII 走 input text，中文走剪贴板粘贴。 */
           injected = true
+          if (step.clear === true) {
+            const cleared = await clearFocusedField(device)
+            done.push(cleared.note)
+          }
           const typed = await inputTextVia(device, String(step.text), { ime: step.ime })
           lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${String(step.text).length} 字` : `输入文字 ${String(step.text).length} 字` })
           done.push(`输入 ${oneLine(String(step.text), 20)}`)
@@ -5085,8 +5094,9 @@ export function apply(ctx, config) {
         done.push(after.ok && crashBefore >= 0 ? '✓ 期间没崩' : '崩溃核对跳过（crash 缓冲区读不到）')
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
-      const summary = [`${done.length} 步跑完${skipped > 0 ? `（跳过 ${skipped} 步）` : ''}（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
-      return { ok: true, steps: done.length, skipped, activity, summary, elapsed_ms: Date.now() - began }
+      const shot = args.shot === true ? await captureEvidence(device, 'adb_do') : null
+      const summary = [`${done.length} 步跑完${skipped > 0 ? `（跳过 ${skipped} 步）` : ''}（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`), ...(shot === null ? [] : ['', `截图 ${shot.path}`])].join('\n')
+      return { ok: true, steps: done.length, skipped, activity, shot, summary, elapsed_ms: Date.now() - began }
     },
   }, 'adb: adb_do')), 'adb_do')
 
