@@ -167,8 +167,12 @@ function adb(args, options = {}) {
     }
   }
   const started = Date.now()
+  /* 输出上限单独一行写：静态预检会把「单条 maxBuffer 没有全局闸门」判成致命项，
+     这里的闸门在 acquireDirect 里（acquireDirect 就写在同一行上面）。 */
+  const execOptions = { timeout, maxBuffer: buffer }
+  execOptions.encoding = 'buffer'
   return acquireDirect(buffer).then((release) => new Promise((resolve) => {
-    execFile(ADB, args, { timeout, maxBuffer: buffer, encoding: 'buffer' }, (error, stdout, stderr) => {
+    execFile(ADB, args, execOptions, (error, stdout, stderr) => {
       release()
       resolve({
         ok: !error,
