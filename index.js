@@ -2584,15 +2584,97 @@ async function clearFocusedField(serial) {
   return { note: `清空后输入框还有「${oneLine(after, 20)}」：它可能不是普通输入框，先点中输入框再 clear，或手动 selectAll。`, ms: Date.now() - began }
 }
 
-async function inputTextVia(serial, text) {
+/**
+ * 当前系统输入法组件（如 `com.github.uiautomator/.AdbKeyboard`）；读不到就返回空串。
+ * @param {string} serial - 设备。
+ * @returns {Promise<string>} 组件名。
+ */
+async function activeIme(serial) {
+  const result = await sh(serial, 'settings get secure default_input_method', 6000).catch(() => null)
+  return result !== null && result.ok ? String(result.stdout ?? '').trim() : ''
+}
+
+/**
+ * 设备上有没有装收 ADB 广播的输入法（ADBKeyboard 系，uiautomator2 的机器一般自带）。
+ * @param {string} serial - 设备。
+ * @returns {Promise<string>} 组件名，没有就是空串。
+ */
+async function adbImeComponent(serial) {
+  const listed = await sh(serial, 'ime list -a -s', 8000).catch(() => null)
+  if (listed === null || !listed.ok) return ''
+  const lines = String(listed.stdout ?? '').split('\n').map((line) => line.trim()).filter(Boolean)
+  return lines.find((line) => /adbkeyboard/i.test(line)) ?? ''
+}
+
+/**
+ * 走输入法广播整段上屏：一次 am broadcast 顶掉「写剪贴板 + 长按 + 点粘贴」三步。
+ * 只在这个输入法已经是当前输入法时才自动用；要切输入法必须调用方明确要（switch），用完切回去。
+ * @param {string} serial - 设备。
+ * @param {string} text - 要输入的文字。
+ * @param {{switch?: boolean}} options - switch 允许临时切输入法。
+ * @returns {Promise<{how: string, steps: string[], field: string, note: string}|null>} 成功返回结果，不行返回 null 让调用方退回剪贴板。
+ */
+async function typeViaAdbIme(serial, text, options = {}) {
+  const wanted = String(text)
+  const count = [...wanted].length
+  const component = await adbImeComponent(serial)
+  if (component === '') return null
+  const previous = await activeIme(serial)
+  const already = previous !== '' && previous.toLowerCase() === component.toLowerCase()
+  if (!already && options.switch !== true) return null
+  const steps = []
+  if (!already) {
+    const enabled = await sh(serial, `ime enable ${component}`, 8000)
+    if (!enabled.ok) return null
+    const picked = await sh(serial, `ime set ${component}`, 8000)
+    if (!picked.ok) return null
+    steps.push(`切到 ${component}`)
+  }
+  const restore = async () => {
+    if (already || previous === '') return
+    steps.push(`切回 ${previous}`)
+    await sh(serial, `ime set ${previous}`, 8000).catch(() => null)
+  }
+  const before = await focusedFieldText(serial)
+  const payload = Buffer.from(wanted, 'utf8').toString('base64')
+  const sent = await sh(serial, `am broadcast -a ADB_INPUT_B64 --es msg ${payload}`, 12_000)
+  if (!sent.ok) {
+    await restore()
+    return null
+  }
+  steps.push('ADB_INPUT_B64')
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  const after = await focusedFieldText(serial)
+  /* 密码框显示的是圆点：字符数变了也算上屏，别死等文字相等。 */
+  const landed = after.includes(wanted) || after.length >= before.length + count
+  if (!landed) {
+    await restore()
+    /* 广播已发出去，输没输进去说不清：这时候再补一次粘贴可能变成两份，直接报错让人看一眼。 */
+    throw new Error(`文字已经发给输入法，但输入框里没读到（现在「${oneLine(after, 20)}」）：先用 adb_ui 看一眼，或改用 ime:"clipboard"`)
+  }
+  await restore()
+  return { how: 'ime', steps, field: after, note: `已输入 ${count} 个字符` }
+}
+
+async function inputTextVia(serial, text, options = {}) {
   const wanted = String(text)
   const count = [...wanted].length
   if (wanted === '') throw new Error('要输入的文字是空的。')
   const encoded = shellInputText(wanted)
+  if (options.ime === 'adb') {
+    /* 明确要走输入法广播：允许临时切过去，输完切回来。 */
+    const forced = await typeViaAdbIme(serial, wanted, { switch: true }).catch(() => null)
+    if (forced !== null) return { how: 'ime', steps: forced.steps, field: forced.field, note: `已输入 ${count} 个字符（${forced.steps.join(' → ')}）` }
+  }
   if (encoded.ok) {
     const result = await sh(serial, `input text ${encoded.value}`, 15_000)
     if (!result.ok) throw new Error(failureNote('输入', result))
     return { how: 'input', steps: ['input text'], field: '', note: `已输入 ${count} 个字符` }
+  }
+  if (options.ime !== 'clipboard') {
+    /* 中文走输入法广播最快，但只在它已经是当前输入法时自动用，不悄悄改用户输入法。 */
+    const viaIme = await typeViaAdbIme(serial, wanted, { switch: false }).catch(() => null)
+    if (viaIme !== null) return { how: 'ime', steps: viaIme.steps, field: viaIme.field, note: `已输入 ${count} 个字符（${viaIme.steps.join(' → ')}）` }
   }
   /* 中文没有 input text 可用：写剪贴板再长按粘贴，走的是系统输入法自己的通道。 */
   const pasted = await typeViaClipboard(serial, wanted)
@@ -3417,7 +3499,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_input',
-    description: '往 Android 设备输入：text 输入文字（ASCII 直发，中文走剪贴板粘贴约 1.5 s）、key 按键（如 ENTER/BACK/DEL/HOME）、submit 输完直接回车/搜索、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文要求先点中输入框让它获得焦点。',
+    description: '往 Android 设备输入：text 输入文字（ASCII 直发；中文默认剪贴板粘贴，装了 ADBKeyboard 且它已是当前输入法时自动走广播更快，ime 可选）、key 按键（如 ENTER/BACK/DEL/HOME）、submit 输完直接回车/搜索、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文要求先点中输入框让它获得焦点。',
     parameters: {
       type: 'object',
       properties: {
@@ -3429,6 +3511,7 @@ export function apply(ctx, config) {
           description: '滑动 [x1,y1,x2,y2] 或 [x1,y1,x2,y2,毫秒]，例如 [1000,2000,1000,500,400]',
         },
         clear: { type: 'boolean', description: '输入前先清空当前聚焦输入框（END + 多次 DEL）' },
+        ime: { type: 'string', enum: ['auto', 'clipboard', 'adb'], description: '中文怎么上屏：auto 默认（已装 ADBKeyboard 且它是当前输入法时走广播，否则剪贴板粘贴）、clipboard 只用剪贴板、adb 明确切到 ADBKeyboard 输完切回' },
         submit: { type: 'string', enum: ['enter', 'search'], description: '输完直接提交：enter 回车（聊天框、表单），search 搜索键（搜索框）。省掉一次 adb_input {key} 往返' },
       },
       additionalProperties: false,
@@ -3456,7 +3539,7 @@ export function apply(ctx, config) {
       }
       if (args.text !== undefined) {
         const wanted = String(args.text)
-        const typed = await inputTextVia(device, wanted)
+        const typed = await inputTextVia(device, wanted, { ime: args.ime })
         lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${wanted.length} 字` : `输入文字 ${wanted.length} 字` })
         messages.push(typed.note)
         if (typed.field !== '') messages.push(`输入框现在是「${oneLine(typed.field, 40)}」`)
@@ -3824,6 +3907,7 @@ export function apply(ctx, config) {
               wait_all: { type: 'array', items: { type: 'string' }, description: '等这几段文字全部出现（一次等两个条件，比拆成两步快）' },
               wait_any: { type: 'array', items: { type: 'string' }, description: '这几段文字出现任意一个就算过（加载完或报错弹窗，两种结局都往下走）' },
               assert_text: { type: 'string', description: '这一步做完核对这段文字必须在（最多重试 3s），不在就算失败' },
+              ime: { type: 'string', enum: ['auto', 'clipboard', 'adb'], description: '输入文字怎么上屏，同 adb_input 的 ime' },
               retry: { type: 'integer', minimum: 0, maximum: 3, description: '这一步在「还没点/还没打字」阶段失败时重来几次（默认 0）：查询超时、快照失效这类偶发失败用得上；已经注入过动作再失败就直接报错，不重复点' },
               assert_gone: { type: 'string', description: '这一步做完核对这段文字必须消失' },
               sleep_ms: { type: 'integer', description: '硬等多久（尽量用 wait_text 代替）' },
@@ -3939,7 +4023,7 @@ export function apply(ctx, config) {
         } else if (step.text !== undefined) {
           /* 与 adb_input 共用一条路径：ASCII 走 input text，中文走剪贴板粘贴。 */
           injected = true
-          const typed = await inputTextVia(device, String(step.text))
+          const typed = await inputTextVia(device, String(step.text), { ime: step.ime })
           lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${String(step.text).length} 字` : `输入文字 ${String(step.text).length} 字` })
           done.push(`输入 ${oneLine(String(step.text), 20)}`)
         } else if (step.action !== undefined) {
