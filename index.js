@@ -3237,13 +3237,20 @@ export function apply(ctx, config) {
           changed: { type: ['boolean', 'null'], description: '点后界面树是否变了；没变大概率没点中或动画未结束' },
           reason: { type: ['string', 'null'], description: '没生效时的原因码：keyboard-covered / obscured / unclickable / gone / page-switched / no-response / same-screen / unknown-tree；生效时为 null' },
           delta: { type: 'array', items: { type: 'string' }, description: '这次点了之后具体多/少了哪几行（`+` 新增 / `-` 消失，最多 6 条）' },
+          shot: {
+            type: ['object', 'null'],
+            description: '没生效时自动留的截图（没生效才抓，约 0.5s）：{path, bytes}，可以直接 read_image 看',
+            properties: { path: { type: 'string' }, bytes: { type: 'integer' } },
+            required: ['path', 'bytes'],
+            additionalProperties: false,
+          },
           stable: { type: ['boolean', 'null'], description: 'wait_stable 时：是否等到了静止' },
           quiet_ms: { type: ['integer', 'null'] },
           scrolled: { type: 'integer', description: '为了找到目标滑了几次；没滑就不出现' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'target', 'activity', 'matched', 'changed', 'reason', 'delta', 'message', 'elapsed_ms'],
+        required: ['ok', 'target', 'activity', 'matched', 'changed', 'reason', 'delta', 'shot', 'message', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.message),
@@ -3404,11 +3411,15 @@ export function apply(ctx, config) {
         delta = diffLines(beforeLines, after.tree.lines, 6)
         if (changed === false) reason = describeTapMiss(after, { x, y }, missTarget, prior).code
       }
+      /* 没生效时顺手留一张图：光看文字树分不清「被键盘挡住」还是「弹了自绘遮罩」，
+         这点额外开销只在判失败的那一次花（实测 ~0.5s / 28KB），成功了不花。 */
+      let shot = null
+      if (changed === false) shot = await captureEvidence(device, 'tap-miss')
       const again = times > 1 ? `（连点 ${times} 次，间隔 ${gap}ms）` : ''
       const slid = scrolled > 0 ? `（滑了 ${scrolled} 次才找到）` : ''
-      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}`
+      const message = `${args.long ? '长按' : '点击'} ${target} 完成${again}${slid}（${took}ms · ${engine}）${detail || '。界面变化用 adb_ui 确认。'}${shot === null ? '' : ` · 截图 ${shot.path}`}`
       return {
-        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs, reason, delta,
+        ok: true, target, activity, matched, changed, stable, quiet_ms: quietMs, reason, delta, shot,
         ...(scrolled > 0 ? { scrolled } : {}), message, elapsed_ms: Date.now() - started,
       }
     },
