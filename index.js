@@ -3215,10 +3215,17 @@ export function apply(ctx, config) {
           quiet_ms: { type: ['integer', 'null'] },
           activity: { type: 'string' },
           dismissed: { type: 'array', items: { type: 'string' }, description: 'dismiss 时被点掉的弹窗按钮文字' },
+          shot: {
+            type: ['object', 'null'],
+            description: '没等到时自动留的截图（只失败才抓，约 0.5s）：{path, bytes}，可直接 read_image 看',
+            properties: { path: { type: 'string' }, bytes: { type: 'integer' } },
+            required: ['path', 'bytes'],
+            additionalProperties: false,
+          },
           summary: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'satisfied', 'stable', 'quiet_ms', 'activity', 'dismissed', 'summary', 'elapsed_ms'],
+        required: ['ok', 'satisfied', 'stable', 'quiet_ms', 'activity', 'dismissed', 'shot', 'summary', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.summary),
@@ -3240,14 +3247,14 @@ export function apply(ctx, config) {
       const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
       if (args.until !== undefined && !args.text && !args.id && !args.desc) {
         return {
-          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [],
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,
           summary: 'until 要配合 text / id / desc 用：先说要等哪个控件，再说等到它处于什么状态。',
           elapsed_ms: Date.now() - started,
         }
       }
       if (!askedCondition && args.stable !== true) {
         return {
-          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [],
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [], shot: null,
           summary: '什么都没等：给 text / id / desc / gone / texts / any_texts / activity，或者 stable=true。',
           elapsed_ms: Date.now() - started,
         }
@@ -3284,6 +3291,9 @@ export function apply(ctx, config) {
           : calm.empty ? '一直读不到控件（还在加载或自己画的界面）' : `${calm.ms}ms 内画面还在变`)
       }
       if (dismissed.length > 0) pieces.push(`先点掉了弹窗：${dismissed.join(' / ')}`)
+      const failed = satisfied === false || (calm !== null && calm.stable === false)
+      const shot = failed ? await captureEvidence(device, 'adb_wait') : null
+      if (shot !== null) pieces.push(`截图 ${shot.path}`)
       pieces.push(here)
       return {
         ok: satisfied,
@@ -3292,6 +3302,7 @@ export function apply(ctx, config) {
         quiet_ms: calm === null ? null : calm.quietMs,
         activity: state.activity || '',
         dismissed,
+        shot,
         summary: pieces.join(' · '),
         elapsed_ms: Date.now() - started,
       }
