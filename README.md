@@ -139,7 +139,7 @@ cd dsh-mobile-use
 | `adb_gesture` | 真人轨迹：`points` 折线逐点 DOWN/MOVE/UP，`duration_ms`、`hold_ms`；曲线拖拽、按住再拖 |
 | `adb_app` | `info`（versionCode/versionName + 前台）、`install`（`-r -d`）、`start`、`stop`、`clear`、`foreground` |
 | `adb_sh` | 设备端任意命令，输出截断到 20k 字符；日志、`dumpsys` |
-| `adb_shot` | 只在要看颜色/布局/相机画面时截图，默认缩到长边 900 px，返回路径给 `read_image`；`region="x,y,w,h"` 只回一块（看桌宠、小图标时体积降一个量级） |
+| `adb_shot` | 只在要看颜色/布局/相机画面时截图，默认缩到长边 900 px，返回路径给 `read_image`；`region="x,y,w,h"` 只回一块（看桌宠、小图标时体积降一个量级）；带 `ref` 只截那个控件（实测桌宠页一个图标 126×126 / 1.6 KB，整屏 600×900 / 39 KB） |
 | `adb_device` | 列设备、状态、型号、当前选中设备与分辨率 |
 | `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
 | `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步；每步可 `retry` 重来注入前的偶发失败；失败时自动留一张截图到 `~/.dsh/adb-evidence/<序列号>/`（只留最近 20 张）；步骤也能带 `until`（等同一控件进入某状态）与 `dismiss`（本步等待时自动点掉挡路弹窗） |

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, selectXPath, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -544,6 +544,13 @@ it('xpath：Appium 写法在本地一遍算完，含子节点与谓词', () => {
   // // 与 / 的差别：直接子 vs 任意后代
   assert.equal(selectXPath(nodes, '//LinearLayout[1]/Button').length, 0, '/ 只走直接子节点')
   assert.equal(selectXPath(nodes, '//LinearLayout[1]//Button').length, 2, '// 走全部后代')
+})
+
+it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 像素', () => {
+  assert.deepEqual(elementRegion({ x1: 100, y1: 200, x2: 300, y2: 260 }, 8), { x: 92, y: 192, w: 216, h: 76 })
+  assert.deepEqual(elementRegion({ x1: 3, y1: 0, x2: 40, y2: 20 }, 8), { x: 0, y: 0, w: 53, h: 36 })
+  assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 10, y2: 10 }, 0), { x: 10, y: 10, w: 2, h: 2 })
+  assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
 console.log(`\n${pass} 项通过\n`)

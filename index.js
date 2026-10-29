@@ -2925,6 +2925,21 @@ async function pngSize(path) {
  * @returns {Promise<Buffer>} 裁切后的 JPEG。
  */
 /**
+ * 把控件矩形扩一点边、夹到画面内，给 adb_shot 当 region：看单个按钮/一行卡片用。
+ * @param {any} node - 快照里的节点。
+ * @param {number} [pad] - 四周留白像素，默认 8，最多 64。
+ * @returns {{x: number, y: number, w: number, h: number}} 区域。
+ */
+function elementRegion(node, pad = 8) {
+  const p = Math.min(Math.max(Math.round(Number(pad) || 0), 0), 64)
+  const x = Math.max(0, Math.round(node.x1) - p)
+  const y = Math.max(0, Math.round(node.y1) - p)
+  const w = Math.max(2, Math.round(node.x2 - node.x1) + p * 2)
+  const h = Math.max(2, Math.round(node.y2 - node.y1) + p * 2)
+  return { x, y, w, h }
+}
+
+/**
  * 解析 "x,y,w,h"，格式不对就当没给。
  * @param {unknown} text - 参数字符串。
  * @returns {{x: number, y: number, w: number, h: number}|null} 矩形或 null。
@@ -5623,12 +5638,15 @@ ctx.effect(() => ctx.tools.register({
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_shot',
-    description: '截一张设备屏幕，缩到长边 900px 后返回文件路径，用 read_image 看。只在确实需要看颜色、布局、相机/扫码画面时用；「页面对不对、按钮在不在、有没有报错」用 adb_ui 文本树，快十倍且不花图片 token。scale=0 保留原图。',
+    description: '截一张设备屏幕，缩到长边 900px 后返回文件路径，用 read_image 看。给 `ref` 就只截那个控件（按最近一次 adb_ui 的编号自动裁），给 `region` 截任意一块。只在确实需要看颜色、布局、相机/扫码画面时用；「页面对不对、按钮在不在、有没有报错」用 adb_ui 文本树，快十倍且不花图片 token。scale=0 保留原图。',
     parameters: {
       type: 'object',
       properties: {
         scale: { type: 'integer', description: '长边像素，默认 900；传 0 保留原图（2136x3200 的平板原图约 9MB）' },
         region: { type: 'string', description: '只截这块区域，格式 "x,y,w,h"（设备像素，左上角原点）。看桌宠、小图标这类局部细节用，比整屏快也省 token' },
+        ref: { type: 'integer', description: '只截这个 ref 的控件（用最近一次 adb_ui 给的编号），自动按它的矩形裁一块，比给 region 省心' },
+        snapshot_id: { type: 'string', description: '可选：校验快照还是不是那次，对不上直接报错' },
+        pad: { type: 'integer', description: 'ref 截图时四周留白像素，默认 8，最多 64' },
         path: { type: 'string', description: '保存路径（绝对路径），不写就放临时目录' },
       },
       additionalProperties: false,
@@ -5652,7 +5670,11 @@ ctx.effect(() => ctx.tools.register({
       const device = await serial()
       const began = Date.now()
       /* 侧栏正在直播时，最新一帧就是现在这张屏：0ms，不必再 screencap。 */
-      const region = parseRegion(args.region)
+      let region = parseRegion(args.region)
+      if (args.ref !== undefined) {
+        const node = nodeForRef(device, args.ref, args.snapshot_id)
+        region = elementRegion(node, args.pad ?? 8)
+      }
       /* 直播帧是 960x640 缩过的，按它裁会错位：有 region 就老老实实抓整屏。 */
       const live = args.scale === 0 || region !== null ? null : mirror.liveFrame(device)
       if (live !== null) {
@@ -6127,6 +6149,9 @@ export const __internals = {
   acquireDirect,
   DIRECT_GATE,
   captureEvidence,
+  screenshot,
+  nodeForRef,
+  elementRegion,
   guardOutput,
   awaitChange,
   tapMissReason,
