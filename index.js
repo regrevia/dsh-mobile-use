@@ -4093,6 +4093,8 @@ export function apply(ctx, config) {
         wait_for_text: { type: 'string', description: '点完等这段文字出现再返回，省掉一次 adb_ui 往返' },
         wait_for_id: { type: 'string', description: '点完等这个资源 id 出现' },
         wait_until_gone: { type: 'string', description: '点完等这段文字消失（关弹窗、等加载完）' },
+        wait_for_activity: { type: 'string', description: '点完等前台 Activity 匹配这个正则（跳到某页再回执）' },
+        wait_activity_gone: { type: 'string', description: '点完等前台不再是这个正则（点「跳过」离开引导页）' },
         wait_for_xpath: { type: 'string', description: '点完等这个 XPath 命中（列表行、结构化结果）' },
         wait_xpath_gone: { type: 'string', description: '点完等这个 XPath 不再命中（弹层收起）' },
         shot: { type: 'boolean', description: '点完留一张截图（返回绝对路径）：要看颜色、自绘界面、弹窗样式时用，省一次 adb_shot' },
@@ -4242,11 +4244,12 @@ export function apply(ctx, config) {
         text: args.wait_for_text,
         id: args.wait_for_id,
         gone: args.wait_until_gone,
-        activity: undefined,
+        activity: args.wait_for_activity,
+        activity_gone: args.wait_activity_gone,
         xpath: args.wait_for_xpath,
         xpath_gone: args.wait_xpath_gone,
       }
-      const shouldWait = Boolean(want.text || want.id || want.gone || want.xpath || want.xpath_gone)
+      const shouldWait = Boolean(want.text || want.id || want.gone || want.xpath || want.xpath_gone || want.activity || want.activity_gone)
       let activity = ''
       let matched = true
       let detail = ''
