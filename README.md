@@ -147,6 +147,7 @@ cd dsh-mobile-use
 | `adb_file` | 设备 ↔ 宿主文件：`action` 给 `ls` / `pull` / `push`，只放开 Download/Pictures/DCIM/Documents/Movies/Music/Android\ media 与 `/data/local/tmp`；`pull` 默认落 `~/.dsh/adb-files/<设备>/`，两次都比对 md5，回执写字节数与是否一致 |
 | `adb_pinch` | 双指缩放：`mode` 给 `in` / `out`，`percent` 给幅度、`steps` 给步数；走设备端 u2 的 `pinchIn` / `pinchOut`，可带 `wait_for_text` / `wait_for_xpath` 等一次等到位 |
 | `adb_record` | 录一段屏幕并取回宿主：`seconds` 给 2–30 秒（默认 5），阻塞到录完，返回 mp4 绝对路径与字节数，设备上的临时文件自动删；只观察不注入 |
+| `adb_clipboard` | `action=read` 取剪贴板原文（复制不上屏的内容也拿得到），`action=write` 写入 `text` 并自动回读确认；长文本走粘帖比逐字输入快几十倍 |
 | `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 「刚才那几秒」的 6 帧拼图：动效比例/位移/卡顿这类单帧看不出的问题用它。优先用直播内存帧，没有就现场录一小段（约 +4.5 s），都不行才回落到磁盘段**并注明「不是刚刚」** |
 | `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |

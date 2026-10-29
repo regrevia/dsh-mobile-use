@@ -140,6 +140,7 @@
 | 数量型等待 | 列表加载只能等一段固定文字，项文字每次不同 | `adb_wait` 加 `count_min`：同一批选择器命中 ≥N 个才算过，xpath 按命中数算 | 本轮 |
 | 双指缩放 | 单指 `input` 注入做不出 pinch，地图/相册放大看不了 | `adb_pinch` 走设备端 u2 的 `pinchIn` / `pinchOut`，一次调用带参数校验和结果等待 | 本轮（参数顺序照 u2 客户端，待设备空闲实测） |
 | 录屏交付 | 只能截单帧，动效/复现路径给不出 | `adb_record` 录完自动取回宿主并清设备副本，返回 mp4 绝对路径 | 本轮 |
+| 剪贴板 | 页面「复制」的结果不上屏，读不回来；长文本也只能逐字输入 | `adb_clipboard` 读原文 / 写入后回读自证，参数顺序 `(label, text)` 已实测 | 本轮 |
 | 动作后确认 | 按返回/回桌面后还要再调一次 `adb_ui` 或 `adb_wait` | `adb_action` 带 `wait_for_text` / `wait_until_gone` / `timeout_ms`，动作+确认一次调用；超时会说清当前页面 | 本轮 |
 | 失败自动取证 | 竞品都要模型自己再调一次截图/树 | 本插件把 `failureSuffix` 收成统一一句：页面 + 屏上前几行 + 截图路径，`adb_do` / `adb_tap` / `adb_wait` / `adb_find` / `adb_gesture` / `adb_input` / `adb_app` / `adb_sh` / `adb_scroll_to` / `adb_action` 全走它 | 本轮（单测覆盖拼装与去重） |
 | 元素级截图 | u2 元素 `.screenshot()`；用于「这张卡片长什么样」这类必须看图的问题，避免整屏 612–665 ms【实测】 |

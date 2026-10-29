@@ -311,6 +311,47 @@ async function recordScreen(serial, seconds, bitRateMbps = 8) {
   return { ok: true, path, bytes, seconds: limit }
 }
 
+
+/**
+ * 读设备剪贴板：u2 的 `getClipboard` 不带参数，返回纯文本（空剪贴板是空串）。
+ * 有些页面把结果「复制」进剪贴板而不上屏，读这里能拿到原文。
+ * @param {string} serial - 设备序列号。
+ * @returns {Promise<string>} 剪贴板文本。
+ */
+async function clipboardGet(serial) {
+  const port = await u2Port(serial)
+  const reply = await u2Fetch(port, '/jsonrpc/0', { jsonrpc: '2.0', id: 1, method: 'getClipboard', params: [] }, 6000)
+  let data
+  try {
+    data = JSON.parse(reply.text)
+  } catch {
+    throw new Error(`getClipboard 返回异常：${oneLine(reply.text, 120)}`)
+  }
+  if (data.error) throw new Error(`getClipboard 失败：${oneLine(data.error.message, 120)}`)
+  return typeof data.result === 'string' ? data.result : ''
+}
+
+/**
+ * 写设备剪贴板并回读自证：参数顺序是 (label, text)，写反了粘出来是 label。
+ * @param {string} serial - 设备序列号。
+ * @param {string} text - 要放进剪贴板的文本。
+ * @param {string} [label] - 剪贴板条目标签，默认 dsh。
+ * @returns {Promise<{ok: boolean, readBack: string}>} 回读结果。
+ */
+async function clipboardPut(serial, text, label = 'dsh') {
+  const port = await u2Port(serial)
+  const reply = await u2Fetch(port, '/jsonrpc/0', { jsonrpc: '2.0', id: 1, method: 'setClipboard', params: [String(label), String(text)] }, 6000)
+  let data
+  try {
+    data = JSON.parse(reply.text)
+  } catch {
+    throw new Error(`setClipboard 返回异常：${oneLine(reply.text, 120)}`)
+  }
+  if (data.error) throw new Error(`setClipboard 失败：${oneLine(data.error.message, 120)}`)
+  const readBack = await clipboardGet(serial)
+  return { ok: readBack === text, readBack }
+}
+
 /**
  * 设备列表。`adb devices -l` 顺带给出型号，便于在错误信息里说清是哪台。
  * @returns {Promise<Array<{serial: string, state: string, model: string}>>} 设备。
@@ -6119,6 +6160,76 @@ ctx.effect(() => ctx.tools.register({
     },
   }), 'adb_record')
 
+  /* 剪贴板：读得到「复制但不上屏」的内容，写得进长文本（粘一次比逐字输入快几十倍）。
+     写入后立刻回读自证，写反参数会当场露出来，而不是等到粘贴时才发现。 */
+  ctx.effect(() => ctx.tools.register(withEvidence({
+    name: 'adb_clipboard',
+    description: '读写设备剪贴板：`action=read` 取当前剪贴板文本（页面把结果「复制」而不上屏时用），`action=write` 把 `text` 放进剪贴板（`label` 可选），写完自动回读确认。想把长文本塞进输入框时，写完用 adb_input 的粘帖路径或长按 → 粘贴。',
+    parameters: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string', description: '设备序列号，只有一台可省略' },
+        action: { type: 'string', enum: ['read', 'write'], description: 'read 读当前剪贴板，write 写入 text' },
+        text: { type: 'string', description: 'action=write 时要写进剪贴板的文本' },
+        label: { type: 'string', description: 'action=write 的剪贴板条目标签，默认 dsh' },
+        max_chars: { type: 'integer', description: 'read 最多返回多少字，默认 2000，防止把整篇文档灌进对话' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          text: { type: 'string', description: 'read 读到的内容，write 时是回读结果' },
+          chars: { type: 'integer', description: '剪贴板全文长度' },
+          truncated: { type: 'boolean', description: '是否因为 max_chars 被截断' },
+          message: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'text', 'chars', 'truncated', 'message', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const started = Date.now()
+      if (args.action === 'read') {
+        const whole = await clipboardGet(device)
+        const cap = Math.min(20_000, Math.max(1, Number(args.max_chars ?? 2000)))
+        const shown = whole.slice(0, cap)
+        const truncated = shown.length < whole.length
+        return {
+          ok: true,
+          text: shown,
+          chars: whole.length,
+          truncated,
+          message: whole === ''
+            ? `剪贴板是空的；${Date.now() - started}ms。`
+            : `剪贴板 ${whole.length} 字${truncated ? `，只回了前 ${shown.length} 字` : ''}；${Date.now() - started}ms。`,
+          elapsed_ms: Date.now() - started,
+        }
+      }
+      const text = args.text === undefined ? '' : String(args.text)
+      if (text === '') {
+        return { ok: false, text: '', chars: 0, truncated: false, message: 'action=write 要给 text：空字符串等于清空剪贴板，说清楚再写。', elapsed_ms: Date.now() - started }
+      }
+      const put = await clipboardPut(device, text, args.label ?? 'dsh')
+      return {
+        ok: put.ok,
+        text: put.readBack,
+        chars: put.readBack.length,
+        truncated: false,
+        message: put.ok
+          ? `已写入剪贴板 ${text.length} 字，回读一致；${Date.now() - started}ms。`
+          : `写进去了但回读不一致（期望 ${text.length} 字，实得 ${put.readBack.length} 字）：先别粘，重写一次。；${Date.now() - started}ms。`,
+        elapsed_ms: Date.now() - started,
+      }
+    },
+  }, 'adb: adb_clipboard')), 'adb_clipboard')
+
   ctx.effect(() => ctx.tools.register({
     name: 'adb_shot',
     description: '截一张设备屏幕，缩到长边 900px 后返回文件路径，用 read_image 看。给 `ref` 就只截那个控件（按最近一次 adb_ui 的编号自动裁），给 `region` 截任意一块。只在确实需要看颜色、布局、相机/扫码画面时用；「页面对不对、按钮在不在、有没有报错」用 adb_ui 文本树，快十倍且不花图片 token。scale=0 保留原图。',
@@ -6601,6 +6712,8 @@ export const __internals = {
   selectNodes,
   pinchArgs,
   recordScreen,
+  clipboardGet,
+  clipboardPut,
   nearMiss,
   collapseSameSpot,
   spotList,
