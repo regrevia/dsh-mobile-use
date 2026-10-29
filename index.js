@@ -259,6 +259,27 @@ function md5Local(path) {
   })
 }
 
+
+/** 设备端 u2 的两个缩放方法；参数顺序按 uiautomator2 客户端（percent, steps）。 */
+const PINCH_METHODS = { in: 'pinchIn', out: 'pinchOut' }
+
+/**
+ * 校验缩放参数，给出 RPC 方法和参数。
+ * @param {unknown} mode - in 或 out。
+ * @param {unknown} percent - 缩放百分比，1–100。
+ * @param {unknown} steps - 分几步走，2–40。
+ * @returns {{method: string, params: number[]}} 调用参数。
+ */
+function pinchArgs(mode, percent, steps) {
+  const method = PINCH_METHODS[String(mode)]
+  if (method === undefined) throw new Error('mode 只认 in（双指收拢）或 out（双指张开）。')
+  const rawPercent = Number(percent ?? 100)
+  const rawSteps = Number(steps ?? 10)
+  if (!Number.isFinite(rawPercent) || rawPercent < 1 || rawPercent > 100) throw new Error('percent 要写 1–100 的整数百分比，默认 100。')
+  if (!Number.isFinite(rawSteps) || rawSteps < 2 || rawSteps > 40) throw new Error('steps 要写 2–40，默认 10；步数越多越顺，也越慢。')
+  return { method, params: [Math.round(rawPercent), Math.round(rawSteps)] }
+}
+
 /**
  * 设备列表。`adb devices -l` 顺带给出型号，便于在错误信息里说清是哪台。
  * @returns {Promise<Array<{serial: string, state: string, model: string}>>} 设备。
@@ -5952,6 +5973,78 @@ ctx.effect(() => ctx.tools.register({
     },
   }), 'adb_file')
 
+  /* 双指缩放：单指 input motionevent 做不出来，走常驻 u2 设备端（pinchIn / pinchOut）。
+     走一次 RPC 拿到设备执行结果，再按需等界面文字，失败信息带上 RPC 原话。 */
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_pinch',
+    description: '双指缩放：`mode` 给 in 收拢（放大看图）、out 张开（缩小回全图）。走设备端 uiautomator2 的 `pinchIn` / `pinchOut`，一次调用完成；`percent` 是缩放幅度、`steps` 是分几步。只在地图/相册/图片查看这类吃缩放的页面上用，普通列表翻页用 adb_gesture。',
+    parameters: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string', description: '设备序列号，只有一台可省略' },
+        mode: { type: 'string', enum: ['in', 'out'], description: 'in 双指收拢（内容放大），out 双指张开（内容缩小）' },
+        percent: { type: 'integer', description: '缩放百分比，1–100，默认 100（越大缩得越多）' },
+        steps: { type: 'integer', description: '分几步走，2–40，默认 10；步数多更顺但更慢' },
+        wait_for_text: { type: 'string', description: '缩完等这段文字出现再返回' },
+        wait_until_gone: { type: 'string', description: '缩完等这段文字消失再返回' },
+        wait_for_xpath: { type: 'string', description: '缩完等这个 XPath 命中' },
+        wait_xpath_gone: { type: 'string', description: '缩完等这个 XPath 不再命中' },
+        timeout_ms: { type: 'integer', description: '等文字的超时，默认 8000' },
+      },
+      required: ['mode'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          message: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'message', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const started = Date.now()
+      const { method, params } = pinchArgs(args.mode, args.percent, args.steps)
+      let note
+      try {
+        const port = await u2Port(device)
+        const reply = await u2Fetch(port, '/jsonrpc/0', { jsonrpc: '2.0', id: 0, method, params }, 15_000)
+        const failure = reply?.error
+        if (failure) {
+          throw new Error(failure.code === -32601
+            ? `设备端 u2 没有 ${method}：这版 u2 服务太旧，换新版 app-uiautomator.apk 再试。`
+            : `${method} 被设备端拒绝：${oneLine(failure.message, 160)}`)
+        }
+        note = `双指${args.mode === 'in' ? '收拢' : '张开'} ${params[0]}% ×${params[1]} 步（设备端 u2 执行）`
+      } catch (error) {
+        return { ok: false, message: `缩放没做成：${oneLine(error instanceof Error ? error.message : String(error), 200)}`, elapsed_ms: Date.now() - started }
+      }
+      const wantText = args.wait_for_text === undefined ? '' : String(args.wait_for_text)
+      const wantGone = args.wait_until_gone === undefined ? '' : String(args.wait_until_gone)
+      const wantXpath = args.wait_for_xpath === undefined ? '' : String(args.wait_for_xpath)
+      const xpathGone = args.wait_xpath_gone === undefined ? '' : String(args.wait_xpath_gone)
+      const carrying = wantText !== '' || wantGone !== '' || wantXpath !== '' || xpathGone !== ''
+      if (!carrying) return { ok: true, message: `${note}；${Date.now() - started}ms。`, elapsed_ms: Date.now() - started }
+      const limit = Math.min(60_000, Math.max(200, Number(args.timeout_ms) || 8000))
+      const waited = await waitFor(device, {
+        text: wantText === '' ? undefined : wantText,
+        gone: wantGone === '' ? undefined : wantGone,
+        xpath: wantXpath === '' ? undefined : wantXpath,
+        xpath_gone: xpathGone === '' ? undefined : xpathGone,
+      }, limit)
+      const what = wantText !== '' ? `「${wantText}」出现` : wantGone !== '' ? `「${wantGone}」消失` : wantXpath !== '' ? `XPath ${wantXpath} 命中` : `XPath ${xpathGone} 消失`
+      const tail = waited.matched ? `等到${what}` : `超时 ${limit}ms 没等到${what}`
+      const current = `当前 ${waited.state?.activity ?? '未知页面'}`
+      return { ok: waited.matched, message: `${note}，${tail}（${current}）；${Date.now() - started}ms。`, elapsed_ms: Date.now() - started }
+    },
+  }), 'adb_pinch')
+
   ctx.effect(() => ctx.tools.register({
     name: 'adb_shot',
     description: '截一张设备屏幕，缩到长边 900px 后返回文件路径，用 read_image 看。给 `ref` 就只截那个控件（按最近一次 adb_ui 的编号自动裁），给 `region` 截任意一块。只在确实需要看颜色、布局、相机/扫码画面时用；「页面对不对、按钮在不在、有没有报错」用 adb_ui 文本树，快十倍且不花图片 token。scale=0 保留原图。',
@@ -6432,6 +6525,7 @@ ctx.effect(() => ctx.tools.register({
  */
 export const __internals = {
   selectNodes,
+  pinchArgs,
   nearMiss,
   collapseSameSpot,
   spotList,

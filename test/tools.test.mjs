@@ -43,6 +43,7 @@ const EXPECTED = [
   'adb_crash', 'adb_events', 'adb_web', 'adb_action', 'adb_shot', 'adb_recent', 'adb_motion',
   'adb_state', 'adb_device', 'adb_mirror',
   'adb_file',
+  'adb_pinch',
 ]
 
 /** 递归查 schema：类型得认识、required 得真在 properties 里、不许有 undefined 描述。 */

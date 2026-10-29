@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -572,6 +572,17 @@ it('等待条件吃 XPath：命中才算过，gone 反过来，和文字条件�
   assert.equal(matches(state, { xpath_gone: '//*[@text="邮件一"]' }), false)
   assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', text: '邮件' }), true)
   assert.equal(matches(state, { xpath: '//*[@id="app:id/row"]', text: '草稿' }), false)
+})
+
+it('缩放参数：只认 in/out，percent 与 steps 夹在合法区间', () => {
+  assert.deepEqual(pinchArgs('in', undefined, undefined), { method: 'pinchIn', params: [100, 10] })
+  assert.deepEqual(pinchArgs('out', 60, 20), { method: 'pinchOut', params: [60, 20] })
+  assert.deepEqual(pinchArgs('in', 33.6, 7.4), { method: 'pinchIn', params: [34, 7] })
+  assert.throws(() => pinchArgs('zoom', 50, 10), /mode 只认/)
+  assert.throws(() => pinchArgs('in', 0, 10), /percent/)
+  assert.throws(() => pinchArgs('in', 101, 10), /percent/)
+  assert.throws(() => pinchArgs('out', 50, 1), /steps/)
+  assert.throws(() => pinchArgs('out', 50, 41), /steps/)
 })
 
 it('数量条件：命中数不到 count_min 就不算过，xpath 按命中数算', () => {
