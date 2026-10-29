@@ -1667,16 +1667,22 @@ function compactTree(nodes, options) {
   const maxNodes = Math.min(Math.max(options.maxNodes ?? MAX_NODES.default, 1), MAX_NODES.max)
   /* 只列到第 N 层：设置页那种「一层套一层」的树上，深处全是容器和图标，先看骨架再往里翻。 */
   const maxDepth = Number.isFinite(Number(options.depth)) ? Number(options.depth) : Infinity
+  /* 只看一块（一行、一个对话框）：框外的节点不占行。深度按框内最浅的节点重新算，
+     否则「只看这一行」读出来的东西全在十几层，depth 一给就一行都不剩。 */
+  const box = Array.isArray(options.box) && options.box.length === 4 ? options.box.map((value) => Number(value)) : null
+  const inside = box === null ? nodes : nodes.filter((node) => inWithinBox(node, box))
+  const baseDepth = box === null || inside.length === 0 ? 0 : Math.min(...inside.map((node) => Number(node.depth) || 0))
   const lines = []
   const refs = []
   /** 每个深度上正在打开的容器签名，用来消除父子重复文字。 */
   const ancestors = []
   let kept = 0
-  for (const node of nodes) {
+  for (const node of inside) {
+    const depth = (Number(node.depth) || 0) - baseDepth
     const signature = `${node.text}\u0000${node.desc}\u0000${node.id}`
-    ancestors.length = Math.min(ancestors.length, node.depth)
+    ancestors.length = Math.min(ancestors.length, depth)
     const duplicated = (node.text || node.desc) && ancestors.includes(signature)
-    if (!duplicated && node.depth <= maxDepth && interesting(node, full) && kept < maxNodes) {
+    if (!duplicated && depth <= maxDepth && interesting(node, full) && kept < maxNodes) {
       const text = oneLine(node.text, 42)
       const desc = oneLine(node.desc, 32)
       const id = node.id ? shortId(node.id) : ''
@@ -1703,9 +1709,9 @@ function compactTree(nodes, options) {
       lines.push(`${label} ${tail}`.replace(/\s+/g, ' ').trim())
       kept += 1
     }
-    if (node.text || node.desc || node.id) ancestors[node.depth] = signature
+    if (node.text || node.desc || node.id) ancestors[depth] = signature
   }
-  return { lines, refs, kept, total: nodes.length }
+  return { lines, refs, kept, total: inside.length }
 }
 
 /**
@@ -3649,6 +3655,8 @@ export function apply(ctx, config) {
         full: { type: 'boolean', description: '连没有文字的结构容器也返回，用于排查布局；默认只给有文字/可点击的节点' },
         max_nodes: { type: 'integer', description: `最多返回多少行，默认 ${MAX_NODES.default}` },
         depth: { type: 'integer', description: '只列到第 N 层：设置页那种深树先看骨架，深处容器和图标不占行' },
+        within_ref: { type: 'integer', description: '只看这个 ref 的范围（一行/一个对话框）：框外控件不占行，列表页逐行看时省一大截；ref 来自最近一次 adb_ui / adb_find' },
+        within_rect: { type: 'array', items: { type: 'integer' }, minItems: 4, maxItems: 4, description: '只看这个矩形 [x, y, w, h] 里的控件（同 within_ref 二选一）' },
         wait_for_text: { type: 'string', description: '等到界面上出现这段文字再返回（子串匹配），配合 timeout_ms' },
         wait_for_id: { type: 'string', description: '等到界面上出现这个资源 id（子串匹配）' },
         wait_for_activity: { type: 'string', description: '等到前台 Activity 匹配这个正则，例如 "ScanActivity"' },
@@ -3688,6 +3696,11 @@ export function apply(ctx, config) {
     execute: async (args) => {
       const device = await serial()
       const started = Date.now()
+      /* 只看一块：ref 还是「最近一次快照」的意思，这里提前解析成矩形，后面每次 dump 都按它裁。 */
+      const scoped = args.within_ref !== undefined || Array.isArray(args.within_rect)
+      const box = scoped
+        ? withinBox({ refs: lastTrees.get(device)?.refs ?? [] }, { within_ref: args.within_ref, within_rect: args.within_rect })
+        : null
       const want = {
         text: args.wait_for_text,
         id: args.wait_for_id,
@@ -3714,8 +3727,10 @@ export function apply(ctx, config) {
         state = calmed.state
         stability = calmed
       } else {
-        state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, depth: args.depth, ocr: args.ocr ?? 'auto' })
+        state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, depth: args.depth, ocr: args.ocr ?? 'auto', box })
       }
+      /* 等条件时轮询读的是整屏（省一次设备侧 dump），命中后再按框重新裁一次交给模型。 */
+      if (box !== null && shouldWait) state = await dumpState(device, { full: args.full === true, maxNodes: args.max_nodes, depth: args.depth, ocr: 'off', box })
       const lines = state.tree.lines
       const filtered = args.filter
         ? lines.filter((line) => line.toLowerCase().includes(String(args.filter).toLowerCase()))
@@ -3753,6 +3768,7 @@ export function apply(ctx, config) {
         digest,
         state.source === 'uiautomator2' ? '' : `· 来源 ${state.source}`,
         state.ocrNote ?? '',
+        box === null ? '' : `只看 ${args.within_ref !== undefined ? `ref ${args.within_ref}` : `[${box.join(',')}]`} 范围里的 ${state.tree.kept} 个控件`,
         depthNote,
         clipped,
         state.changed ? '' : '（与上一次读取相同）',

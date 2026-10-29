@@ -560,6 +560,30 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('compactTree：box 只留框里的控件，ref 从 1 连续，深度重定基', () => {
+  const mk = (depth, text, x1, y1, x2, y2) => ({ depth, text, desc: '', id: '', cls: 'TextView', clickable: false, scrollable: false, enabled: true, checked: false, selected: false, focused: false, x1, y1, x2, y2 })
+  const nodes = [
+    mk(0, '整屏', 0, 0, 1000, 2000),
+    mk(1, '上面的行', 0, 100, 1000, 200),
+    mk(2, '这一行', 0, 400, 1000, 500),
+    mk(3, '行里按钮', 900, 420, 980, 480),
+    mk(2, '别的行', 0, 700, 1000, 800),
+  ]
+  /* 框 == 第三行（x 0..1000, y 400..500）：只有它和它里面的按钮留得下。 */
+  const tree = compactTree(nodes, { box: [0, 400, 1000, 100] })
+  assert.equal(tree.total, 2)
+  assert.equal(tree.kept, 2)
+  assert.equal(tree.refs.length, 2)
+  assert.deepEqual(tree.refs.map((item) => item.ref), [1, 2])
+  assert.deepEqual(tree.refs.map((item) => item.node.text), ['这一行', '行里按钮'])
+  /* 深度从框内最浅的 2 重定基成 0，所以 depth:0 也还能看到这一行。 */
+  /* 不重定基的话，这一行在原树第 2 层，depth:0 会一行都不剩。 */
+  assert.equal(compactTree(nodes, { box: [0, 400, 1000, 100], depth: 0 }).refs.length, 1)
+  assert.equal(compactTree(nodes, { box: [0, 400, 1000, 100], depth: 1 }).refs.length, 2)
+  /* 不给 box 时行为不变。 */
+  assert.equal(compactTree(nodes, {}).total, 5)
+})
+
 it('adb_do 步骤：tap 可以配 within_ref 限定范围', () => {
   assert.equal(validateSteps([{ tap: '关注', within_ref: 12 }]).ok, true)
 })
