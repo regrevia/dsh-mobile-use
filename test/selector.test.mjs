@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, awaitStable, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -558,6 +558,16 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 3, y1: 0, x2: 40, y2: 20 }, 8), { x: 0, y: 0, w: 53, h: 36 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 10, y2: 10 }, 0), { x: 10, y: 10, w: 2, h: 2 })
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
+})
+
+it('crashHint：只有真崩过才在失败信息里提一句', () => {
+  assert.equal(crashHint({ ok: true, count: 0, last: '' }), '')
+  assert.equal(crashHint({ ok: false, count: -1, last: '' }), '')
+  assert.equal(crashHint(null), '')
+  const hit = crashHint({ ok: true, count: 3, last: 'Process: com.demo, PID: 1234' })
+  assert.match(hit, /3 条 FATAL EXCEPTION/)
+  assert.match(hit, /com\.demo/)
+  assert.match(hit, /adb_crash/)
 })
 
 it('compactTree：box 只留框里的控件，ref 从 1 连续，深度重定基', () => {

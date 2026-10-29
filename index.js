@@ -374,6 +374,17 @@ async function crashCount(serial) {
 }
 
 /**
+ * 失败时把崩溃缓冲翻成一句能行动的话：没崩就别提，崩了就说去哪看。
+ * @param {{ok: boolean, count: number, last: string}} crash - crashCount 的结果。
+ * @returns {string} 追加到错误信息后面的片段；没崩溃返回空串。
+ */
+function crashHint(crash) {
+  if (!crash || crash.ok !== true || !(crash.count > 0)) return ''
+  const last = oneLine(String(crash.last ?? ''), 90)
+  return ` · 设备 crash 缓冲里有 ${crash.count} 条 FATAL EXCEPTION${last ? `（最近：${last}）` : ''}：这步失败可能是应用崩了，用 adb_crash 看细节`
+}
+
+/**
  * 设备列表。`adb devices -l` 顺带给出型号，便于在错误信息里说清是哪台。
  * @returns {Promise<Array<{serial: string, state: string, model: string}>>} 设备。
  */
@@ -3147,8 +3158,10 @@ async function annotateFailure(error, label) {
   } catch {
     activity = await foregroundActivity(device).catch(() => '')
   }
+  /* 失败到底是因为「没找到控件」还是「应用崩了」，一句话能省掉一整轮排查。 */
+  const crash = await crashCount(device).catch(() => null)
   const evidence = await captureEvidence(device, label)
-  return new Error(failureSuffix({ message, activity, digest, shotPath: evidence?.path }))
+  return new Error(`${failureSuffix({ message, activity, digest, shotPath: evidence?.path })}${crashHint(crash)}`)
 }
 
 /**
@@ -7020,6 +7033,7 @@ export const __internals = {
   inWithinBox,
   parseNodes,
   compactTree,
+  crashHint,
   shortId,
   displaySizeFrom,
   decodeEntities,
