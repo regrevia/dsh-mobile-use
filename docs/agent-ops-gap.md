@@ -140,6 +140,7 @@
 | 范围条件式等待 | Appium 只能把范围写进 `xpath` 再等 | `adb_wait` / `adb_do` 的条件判断走同一个 `within_ref` 框：等「第 3 行里的开关变可点」不用拼祖先轴 | 本轮（`matches` 单测覆盖框内/框外/计数） |
 | 滚动找目标的状态门槛 | 滑到看见就算到，灰着点不动还得再来一轮 | `adb_scroll_to` 加 `until`（要求真的 enabled/clickable 才算到位）与 `dismiss`（挡路弹窗自动点掉，回执说点了什么） | 本轮 |
 | 串流程里的滑动 | 先滑到目标再点要拆两步，目标还不一定真的能点 | `adb_do` 的 `scroll_to` 可写对象：选择器 + 方向 + `until` 状态 + `dismiss` + 滑动次数，一步滑到并点掉 | 本轮（单测覆盖写法校验） |
+| 步骤级选择器 | Appium `MobileBy` / u2 的 `d(text|description|className)` | 无（步骤里只有 text/id/xpath） | `adb_do` 每步补 `desc` / `cls` / `exact` / `regex`，与 `adb_tap` 同一套匹配；只有 content-desc 的图标按钮不用先取 ref | 本轮 |
 | 步骤级局部核对 | Appium 有 `-android uiautomator` 的 `childSelector`/`instance`；u2 只能先拿元素再 `.child` 查 | 无 | `adb_do` 每步的 `within_ref` / `within_rect` 同时作用于点击、等待（`wait_text`/`wait_all`/`wait_any`/`wait_*xpath`）与核对（`assert_text`/`assert_count_min`）：一行里的「已关注」不会和别行混 | 本轮 |
 | 等待轮询退避 | u2 默认 0.5s 固定节拍（可调） | Appium implicit wait 固定 500ms 轮询 | 无（原先固定 120ms） | 变节奏轮询：前 600ms 120ms、之后按「连续不变次数」退到 240/360/480/600ms，超时前补一次 OCR 读；10 秒等待的 dump 次数从 ~83 降到 ≤45 | 本轮 |
 | XPath 轴 | UiAutomator 的 `..` / `following-sibling::` | Appium 支持 XPath 1.0 全部轴 | 无 | `..`、`parent::`、`following-sibling::`、`preceding-sibling::` 在已 dump 的节点上求值（利用 `parent` 索引，0 设备开销），结构定位不再只能靠 `within_ref` | 本轮 |
