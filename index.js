@@ -4543,6 +4543,8 @@ export function apply(ctx, config) {
         direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: '手指往哪个方向滑，默认 up（把下面的内容拉上来）' },
         max_swipes: { type: 'integer', description: '最多滑几次，默认 8，上限 20' },
         tap: { type: 'boolean', description: '找到后顺手点它' },
+        until: { type: 'string', enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'], description: '找到之后还要进入这个状态才算到位（灰着的按钮不算，继续滑）' },
+        dismiss: { type: 'boolean', description: '滑动时被权限/升级弹窗挡住就自动点掉（最多 2 次）再继续找' },
         timeout_ms: { type: 'integer', description: '总时长上限，默认 25000' },
       },
       additionalProperties: false,
@@ -4593,6 +4595,7 @@ export function apply(ctx, config) {
       let state = await pollDump(device)
       let swipes = 0
       let target = null
+      const dismissed = []
       for (;;) {
         const hits = args.xpath !== undefined ? selectXPath(state.nodes, args.xpath) : selectNodes(state, sel)
         const visible = hits.filter((node) => {
@@ -4601,9 +4604,19 @@ export function apply(ctx, config) {
           if (w <= 0 || h <= 0) return false
           const cx = (node.x1 + node.x2) / 2
           const cy = (node.y1 + node.y2) / 2
-          return cx >= 0 && cx <= size.width && cy >= 0 && cy <= size.height
+          /* 上屏了还不够：给了 until 就要求它真的能点/没灰，否则继续滑（列表里同名的灰占位）。 */
+          return cx >= 0 && cx <= size.width && cy >= 0 && cy <= size.height && nodeStateOk(node, args.until)
         })
         if (visible.length > 0) { target = visible[0]; break }
+        if (args.dismiss === true && dismissed.length < 2) {
+          const blocker = findBlocker(state, [args.text, args.id, args.desc].filter((item) => typeof item === 'string' && item !== ''))
+          if (blocker !== null && await tapPointFast(device, (blocker.x1 + blocker.x2) / 2, (blocker.y1 + blocker.y2) / 2)) {
+            dismissed.push(String(blocker.text).trim())
+            await new Promise((resolve) => setTimeout(resolve, 200))
+            state = await pollDump(device)
+            continue
+          }
+        }
         if (swipes >= maxSwipes || Date.now() - began > limit) break
         /* 滑动区域：给了容器就只在容器内滑，否则用屏幕中间一大块；方向按手指方向。 */
         const box = args.within_ref !== undefined && args.within_ref !== null
@@ -4648,14 +4661,14 @@ export function apply(ctx, config) {
           found: false,
           swipes,
           activity: state.activity || '',
-          message: `滑了 ${swipes} 次还没找到${args.text ? `「${args.text}」` : '目标'}：加 max_swipes 或换方向，也可能不在这个页面。${nearMiss(state, sel)}`,
+          message: `滑了 ${swipes} 次还没找到${args.text ? `「${args.text}」` : '目标'}${dismissed.length === 0 ? '' : `（中途点掉了 ${dismissed.join('/')}）`}：加 max_swipes 或换方向，也可能不在这个页面。${nearMiss(state, sel)}`,
           point: '',
           snapshot_id: state.snapshotId,
           elapsed_ms: Date.now() - began,
         }
       }
       const hit = describeHit(target, state)
-      let message = `滑 ${swipes} 次找到${args.text ? `「${args.text}」` : '目标'} @${hit.point}`
+      let message = `滑 ${swipes} 次找到${args.text ? `「${args.text}」` : '目标'}${args.until ? `（${args.until}）` : ''} @${hit.point}${dismissed.length === 0 ? '' : `，中途点掉了 ${dismissed.join('/')}`}`
       if (args.tap === true) {
         const node = target
         const clickable = clickTarget(state.nodes || [], node)
