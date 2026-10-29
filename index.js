@@ -3387,8 +3387,54 @@ function xpathAttr(node, raw) {
  * @param {string} source - 方括号里的内容。
  * @returns {{kind: string, test?: (node: any) => boolean, n?: number}} 编译结果。
  */
+/**
+ * 把谓词按顶层的 and / or 切成几段（引号和括号里的不算）。
+ * @param {string} source - 方括号里的内容。
+ * @returns {{op: string, parts: string[]} | null} 切分结果，没连接词给 null。
+ */
+function splitPredicate(source) {
+  const pieces = []
+  let depth = 0
+  let quote = ''
+  let last = 0
+  let op = ''
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (quote) {
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '(') { depth += 1; continue }
+    if (ch === ')') { depth -= 1; continue }
+    if (depth !== 0) continue
+    const rest = source.slice(i)
+    const hit = /^(and|or)(\s+|$)/.exec(rest)
+    if (hit === null) continue
+    if (i > 0 && !/\s/.test(source[i - 1])) continue
+    if (op !== '' && op !== hit[1]) throw new Error(`[${source}] 里混用了 and 和 or，拆成两条 xpath 或用括号`)
+    op = hit[1]
+    pieces.push(source.slice(last, i).trim())
+    i += hit[0].length - 1
+    last = i + 1
+  }
+  if (op === '') return null
+  pieces.push(source.slice(last).trim())
+  if (pieces.some((piece) => piece === '')) throw new Error(`[${source}] 的 ${op} 两边有空的，补上条件`)
+  return { op, parts: pieces }
+}
+
 function compileXPathPredicate(source) {
   if (source === '') throw new Error('xpath 里有空的 []')
+  const split = splitPredicate(source)
+  if (split !== null) {
+    const parts = split.parts.map((piece) => compileXPathPredicate(piece))
+    if (parts.some((pred) => pred.test === undefined)) throw new Error(`[${source}] 里的序号/last() 不能放进 ${split.op}`)
+    const tests = parts.map((pred) => pred.test)
+    return split.op === 'and'
+      ? { kind: 'and', test: (node) => tests.every((test) => test(node)) }
+      : { kind: 'or', test: (node) => tests.some((test) => test(node)) }
+  }
   if (/^last\(\)$/.test(source)) return { kind: 'last' }
   if (/^\d+$/.test(source)) return { kind: 'index', n: Number(source) }
   let match = /^contains\(\s*@([\w-]+)\s*,\s*(['"])(.*?)\2\s*\)$/.exec(source)
@@ -3403,6 +3449,18 @@ function compileXPathPredicate(source) {
     const want = match[3]
     return { kind: 'eq', test: (node) => xpathAttr(node, name) === want }
   }
+  match = /^starts-with\(\s*@([\w-]+)\s*,\s*(['"])(.*?)\2\s*\)$/.exec(source)
+  if (match) {
+    const name = match[1]
+    const want = match[3]
+    return { kind: 'starts-with', test: (node) => want !== '' && xpathAttr(node, name).startsWith(want) }
+  }
+  match = /^@([\w-]+)\s*!=\s*(['"])(.*?)\2$/.exec(source)
+  if (match) {
+    const name = match[1]
+    const want = match[3]
+    return { kind: 'neq', test: (node) => xpathAttr(node, name) !== want }
+  }
   match = /^not\(\s*@([\w-]+)\s*\)$/.exec(source)
   if (match) {
     const name = match[1]
@@ -3416,7 +3474,7 @@ function compileXPathPredicate(source) {
       return value !== '' && value !== 'false'
     } }
   }
-  throw new Error(`xpath 谓词看不懂：[${source}]，支持 @属性、@属性="值"、contains(@属性,"值")、[序号]、[last()]、not(@属性)`)
+  throw new Error(`xpath 谓词看不懂：[${source}]，支持 @属性、@属性="值"、@属性!="值"、contains(@属性,"值")、starts-with(@属性,"值")、[序号]、[last()]、not(@属性)，以及 and / or 连接`)
 }
 
 /**

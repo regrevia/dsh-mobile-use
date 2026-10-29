@@ -544,6 +544,13 @@ it('xpath：Appium 写法在本地一遍算完，含子节点与谓词', () => {
   // // 与 / 的差别：直接子 vs 任意后代
   assert.equal(selectXPath(nodes, '//LinearLayout[1]/Button').length, 0, '/ 只走直接子节点')
   assert.equal(selectXPath(nodes, '//LinearLayout[1]//Button').length, 2, '// 走全部后代')
+  assert.deepEqual(texts(selectXPath(nodes, '//*[@text="确定" and @clickable="true"]')), ['确定'], 'and 两个条件同时成立')
+  assert.deepEqual(texts(selectXPath(nodes, '//*[@text="订单" or @text="确定"]')), ['订单', '确定'], 'or 任一成立')
+  assert.deepEqual(texts(selectXPath(nodes, '//Button[@text!="确定"]')), ['取消'], '!= 排掉一个值')
+  assert.deepEqual(texts(selectXPath(nodes, '//*[starts-with(@text,"取")]')), ['取消'], 'starts-with 前缀')
+  assert.deepEqual(texts(selectXPath(nodes, '//*[contains(@text,"定") and not(@clickable)]')), [], 'and 能和 not 混用')
+  assert.throws(() => selectXPath(nodes, '//*[@text="a" and "b" or @text="c"]'), /混用了 and 和 or/)
+  assert.throws(() => selectXPath(nodes, '//*[@text="a" and ]'), /两边有空的/)
 })
 
 it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 像素', () => {

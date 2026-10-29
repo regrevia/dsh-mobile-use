@@ -41,7 +41,7 @@
 
 **已有（公开工具面）**：
 
-- 定位：`adb_find` 支持多字段 AND（`text`/`id`/`desc`/`cls`/`pkg`）+ `exact`/`regex`/`text_matches` + `index` + `within_ref` + `clickable`/`enabled`/`visible` + 同处去重。 也支持 Appium 写法 `xpath`：`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`。
+- 定位：`adb_find` 支持多字段 AND（`text`/`id`/`desc`/`cls`/`pkg`）+ `exact`/`regex`/`text_matches` + `index` + `within_ref` + `clickable`/`enabled`/`visible` + 同处去重。 也支持 Appium 写法 `xpath`：`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`、`@attr!="值"`、`starts-with(@attr,"值")`、`and` / `or` 连接（位置序号不能进 and/or，会当场报错）。
 - 防误点：`adb_ui` 给 `snapshot_id`，`adb_tap` 带 `snapshot_id` 校验，快照过期直接报错不拿旧 ref 点；`dry_run` 只算落点。
 - 等待：`adb_ui`/`adb_tap` 内建 `wait_for_text` / `wait_for_id` / `wait_for_activity` / `wait_until_gone`，`adb_do` 每步可带 `wait_text` / `wait_gone`。
 - 观测：整树 96–129 ms（25.7 KB XML 量级 → 59 行文本）【实测】；`changed_only` 增量 diff；`adb_window` 按窗口 dump；`adb_web` 读 WebView DOM；`adb_anim`/`adb_motion` 把动效变成数字；OCR 仅在树近空时兜底。
