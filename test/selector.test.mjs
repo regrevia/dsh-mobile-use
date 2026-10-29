@@ -560,6 +560,14 @@ it('元素级截图：按控件矩形扩边留白，越界夹到 0，最少 2 �
   assert.deepEqual(elementRegion({ x1: 10, y1: 10, x2: 20, y2: 20 }, 999), { x: 0, y: 0, w: 138, h: 138 }, '留白上限 64')
 })
 
+it('xpath 的文字属性同样去掉零宽字符', () => {
+  const rows = [{ index: 0, parent: -1, depth: 0, cls: 'TextView', text: '\u200b设置\u200b', desc: '\ufeff通知', id: '', pkg: 'com.android.settings', x1: 0, y1: 0, x2: 10, y2: 10 }]
+  assert.equal(selectXPath(rows, '//*[@text="设置"]').length, 1)
+  assert.equal(selectXPath(rows, '//*[contains(@text,"设")]').length, 1)
+  assert.equal(selectXPath(rows, '//*[@desc="通知"]').length, 1)
+  assert.equal(selectXPath(rows, '//*[@text="设置 "]/..').length, 0, '没有父节点时返回空')
+})
+
 it('xpath 认反向轴：.. 取父节点、following/preceding-sibling 取兄弟', () => {
   const node = (index, parent, depth, cls, text) => ({ index, parent, depth, cls, text, desc: '', id: '', pkg: 'com.demo', x1: 0, y1: 0, x2: 10, y2: 10 })
   const rows = [

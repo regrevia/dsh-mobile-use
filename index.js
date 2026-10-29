@@ -3549,6 +3549,8 @@ function xpathAttr(node, raw) {
   const value = node[key]
   if (value === undefined || value === null) return ''
   if (typeof value === 'boolean') return value ? 'true' : 'false'
+  /* 文字/描述与文字选择器一样先去掉零宽字符和多余空白：xpath 不该因为看不见的字符失配。 */
+  if (key === 'text' || key === 'desc') return dezero(value)
   return String(value)
 }
 

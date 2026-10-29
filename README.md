@@ -150,7 +150,7 @@ cd dsh-mobile-use
 | `adb_clipboard` | `action=read` 取剪贴板原文（复制不上屏的内容也拿得到），`action=write` 写入 `text` 并自动回读确认；长文本走粘帖比逐字输入快几十倍 |
 | `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 「刚才那几秒」的 6 帧拼图：动效比例/位移/卡顿这类单帧看不出的问题用它。优先用直播内存帧，没有就现场录一小段（约 +4.5 s），都不行才回落到磁盘段**并注明「不是刚刚」** |
-| `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`（按 ref 框裁，`xpath` 也认）、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`、`@attr!="值"`、`starts-with(@attr,"值")`、`A and B` / `A or B`、反向轴 `..` / `following-sibling::` / `preceding-sibling::`），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |
+| `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`（按 ref 框裁，`xpath` 也认）、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`、`@attr!="值"`、`starts-with(@attr,"值")`、`A and B` / `A or B`、反向轴 `..` / `following-sibling::` / `preceding-sibling::`；`@text`/`@desc` 同样自动去掉零宽字符），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |
 | `adb_scroll_to` | 滚到目标出现：给 `text`/`id`/`desc` 一路滑到看见为止，回执带滑动次数、命中节点和是否到底；`until` 让灰着的同名项继续滑，`dismiss` 自动点掉挡路弹窗（最多 2 次）；不用模型自己算滑动次数 |
 | `adb_anim` | 动画/过渡诊断：开 `animation_scale` 相关的 debug 开关看窗口动画、过渡、Animator 时长，定位「它到底在动什么」 |
 | `adb_proc` | 进程/内存：`top` / `mem` / `list` 一次 shell 拿回，判卡顿、被杀、内存涨，不用截图猜 |
