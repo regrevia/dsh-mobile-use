@@ -51,6 +51,11 @@ const OUTPUT_LIMIT = 20_000
 
 /** 常驻 shell 单条命令的缓冲上限（字符）：超了只留尾部，不让内存随命令数涨。 */
 const MAX_SHELL_BUF = 8 << 20
+/* 所有常驻 shell 共用一份预算：单条 8 MB 在多设备下会叠乘成几百 MB，全局合计再封一次顶。 */
+const SHELL_BUF_TOTAL = 24 << 20
+/* 被挤掉时每个通道至少留这么多尾巴，方便诊断「上一条命令的最后几行」。 */
+const SHELL_BUF_FLOOR = 256 << 10
+let shellBufBytes = 0
 
 /**
  * 找到 adb。DSH 进程的 PATH 不一定带 Homebrew，所以按常见安装位置探测，
@@ -845,10 +850,51 @@ function wsCall(url, method, params, timeoutMs) {
   })
 }
 
+/**
+ * 全局合计超预算时按「最久没动过」的顺序挤掉别的通道，最后才动正在写的那条。
+ * @param {any} active - 当前正在收数据的通道。
+ * @returns {void}
+ */
+function trimShellBudget(active) {
+  if (shellBufBytes <= SHELL_BUF_TOTAL) return
+  const others = [...shellChannels.values()]
+    .filter((channel) => channel !== active)
+    .sort((a, b) => (a.touched ?? 0) - (b.touched ?? 0))
+  for (const channel of others) {
+    if (shellBufBytes <= SHELL_BUF_TOTAL) return
+    const room = SHELL_BUF_TOTAL - (shellBufBytes - channel.buf.length)
+    const keep = Math.max(SHELL_BUF_FLOOR, Math.min(channel.buf.length, room))
+    if (channel.buf.length > keep) {
+      shellBufBytes -= channel.buf.length - keep
+      channel.buf = channel.buf.slice(-keep)
+    }
+  }
+  if (shellBufBytes > SHELL_BUF_TOTAL && active !== undefined) {
+    const room = SHELL_BUF_TOTAL - (shellBufBytes - active.buf.length)
+    const keep = Math.max(SHELL_BUF_FLOOR, Math.min(MAX_SHELL_BUF, room))
+    if (active.buf.length > keep) {
+      shellBufBytes -= active.buf.length - keep
+      active.buf = active.buf.slice(-keep)
+    }
+  }
+}
+
+/**
+ * 清空通道缓冲并同步全局预算计数。缓冲只在「追加」与「清空」两处变长/变短，
+ * 漏掉任何一处都会让计数飘高，最后误判超预算把别人的输出挤掉。
+ * @param {any} channel - 常驻 shell 通道。
+ * @returns {void}
+ */
+function clearShellBuf(channel) {
+  if (channel.buf.length > 0) shellBufBytes = Math.max(0, shellBufBytes - channel.buf.length)
+  channel.buf = ''
+}
+
 function killShell(serial) {
   const channel = shellChannels.get(serial)
   shellChannels.delete(serial)
   if (channel !== undefined) {
+    clearShellBuf(channel)
     channel.dead = true
     try {
       channel.child.kill('SIGKILL')
@@ -867,12 +913,16 @@ function openShell(serial) {
   /* 用 spawn 而不是 execFile：execFile 会给 stdout 另攒一份内部缓冲（默认上限 1 MiB），
      攒满就把整条 shell 判死；我们自己按 MAX_SHELL_BUF 截尾，不需要它再存一份。 */
   const child = spawn(ADB, ['-s', serial, 'shell'], { stdio: ['pipe', 'pipe', 'pipe'] })
-  const channel = { child, buf: '', onChunk: null, dead: false }
+  const channel = { child, buf: '', onChunk: null, dead: false, touched: Date.now() }
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk) => {
+    const before = channel.buf.length
     channel.buf += chunk
+    channel.touched = Date.now()
     /* 单条命令输出封顶：大 dump / logcat 不该把内存越堆越高，超了只留尾部。 */
     if (channel.buf.length > MAX_SHELL_BUF) channel.buf = channel.buf.slice(-MAX_SHELL_BUF)
+    shellBufBytes += channel.buf.length - before
+    if (shellBufBytes > SHELL_BUF_TOTAL) trimShellBudget(channel)
     if (channel.onChunk !== null) channel.onChunk(channel.buf)
   })
   /* 常驻 shell 的 stderr 不进解析（命令自己 `2>&1`），但必须排掉，否则管道写满会把设备端卡住。 */
@@ -882,6 +932,7 @@ function openShell(serial) {
   const shutdown = () => {
     channel.dead = true
     if (shellChannels.get(serial) === channel) shellChannels.delete(serial)
+    clearShellBuf(channel)
   }
   child.on('error', shutdown)
   child.on('exit', shutdown)
@@ -991,14 +1042,14 @@ function shellOnce(serial, cmd, timeout) {
       channel.onChunk = null
       channel.child.removeListener('exit', onExit)
       /* 这条命令读完了，缓冲清掉：否则下一条命令会带着上一条的输出越滚越大。 */
-      channel.buf = ''
+      clearShellBuf(channel)
       const ms = Math.round(performance.now() - started)
       if (code === null) resolve({ ok: false, code: null, out, ms, uncertain: true })
       else resolve({ ok: code === 0, code, out, ms })
     }
     /** 子进程退出：这次命令等不到了。 @returns {void} */
     const onExit = () => finish(null, '')
-    channel.buf = ''
+    clearShellBuf(channel)
     channel.onChunk = (text) => {
       const cut = text.indexOf(marker)
       if (cut < 0) return
@@ -7310,5 +7361,11 @@ export const __internals = {
   describeTapMiss,
   diffLines,
   shellOnce,
+  shellBufStats: () => ({
+    bytes: shellBufBytes,
+    channels: shellChannels.size,
+    cap: SHELL_BUF_TOTAL,
+    detail: [...shellChannels].map(([serial, channel]) => ({ serial, len: channel.buf.length })),
+  }),
   killShell,
 }

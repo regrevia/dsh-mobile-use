@@ -47,6 +47,35 @@ await check('单条 2 MiB 输出之后通道仍然可用', async () => {
   assert(next.out.includes('hello'), `后续命令输出丢了：${next.out.slice(0, 80)}`)
 })
 
+await check('多设备常驻 shell 合计不超全局预算', async () => {
+  const { shellBufStats } = __internals
+  killShell('fake')
+  const serials = ['qa1', 'qa2', 'qa3', 'qa4']
+  let peak = 0
+  const poll = setInterval(() => {
+    const stats = shellBufStats()
+    if (stats.bytes > peak) peak = stats.bytes
+  }, 10)
+  const results = await Promise.all(
+    serials.map((serial) => shellOnce(serial, "head -c 8388608 /dev/zero | tr '\\0' a", 90_000)),
+  )
+  clearInterval(poll)
+  for (const [index, result] of results.entries()) {
+    assert(result.ok === true, `${serials[index]} 大输出应成功，实际 code=${result.code}`)
+  }
+  assert(peak > 0, '并发写的时候合计不该是 0')
+  assert(peak <= shellBufStats().cap, `并发峰值 ${peak} 应 ≤ 上限 ${shellBufStats().cap}`)
+  const echo = await shellOnce('qa4', 'printf hi', 10_000)
+  assert(echo.ok === true, `被挤之后通道仍应可用，实际 code=${echo.code}`)
+  assert(echo.out.includes('hi'), `被挤之后输出丢了：${echo.out.slice(0, 40)}`)
+  /* 每条命令读完就清自己的缓冲，所以跑完合计应该归零；漏清就会一直涨。 */
+  assert(shellBufStats().bytes === 0, `命令跑完合计应归零，实际 ${shellBufStats().bytes}`)
+  for (const serial of serials) killShell(serial)
+  const after = shellBufStats()
+  assert(after.channels === 0, `killShell 后不应残留通道：${after.channels}`)
+  assert(after.bytes === 0, `killShell 后预算应归零：${after.bytes}`)
+})
+
 await check('超时返回不确定而不是硬失败', async () => {
   const slow = await shellOnce('fake', 'sleep 5', 300)
   assert(slow.ok === false, '应该失败')
