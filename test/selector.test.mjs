@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, failureSuffix, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -500,6 +500,20 @@ it('挡路弹窗：认出确认按钮，但不点掉自己要等的那一个', (
   assert.equal(findBlocker({ activity: '.Main', nodes: [node({ text: '允许', clickable: false })] }), null)
   assert.equal(findBlocker({ activity: '.Main', nodes: [node({ text: '允许', enabled: undefined })] })?.text, '允许', 'enabled 缺字段按可用算')
   assert.equal(findBlocker({ activity: '.Main', nodes: [] }), null)
+})
+
+it('失败现场：一句话带页面、屏上内容、截图，已有的不重复拼', () => {
+  assert.equal(failureSuffix({ message: '点不到' }), '点不到')
+  assert.equal(
+    failureSuffix({ message: '点不到', activity: 'com.a/.Main', digest: '确定 / 取消' }),
+    '点不到 · 当前页面 com.a/.Main · 屏上 确定 / 取消',
+  )
+  assert.equal(
+    failureSuffix({ message: '没有目标', activity: 'com.a/.Main', shotPath: '/tmp/x.jpg' }),
+    '没有目标 · 当前页面 com.a/.Main · 截图 /tmp/x.jpg · 目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。',
+  )
+  const already = '超时，截图 /tmp/a.jpg'
+  assert.equal(failureSuffix({ message: already, activity: 'com.a/.Main' }), already, '已带现场就不重复拼')
 })
 
 console.log(`\n${pass} 项通过\n`)

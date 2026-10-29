@@ -2836,6 +2836,66 @@ async function captureEvidence(serial, label) {
 }
 
 /**
+ * 把一次失败的现场拼成一句话：哪个页面、屏上有什么、截图在哪、下一步查什么。
+ * @param {{message: string, activity?: string, digest?: string, shotPath?: string, hint?: string}} info - 现场。
+ * @returns {string} 可直接抛出的错误文案（已带现场的会把原样返回）。
+ */
+function failureSuffix(info) {
+  const message = String(info?.message ?? '')
+  if (/截图 \//.test(message)) return message
+  const where = [info?.activity ? `当前页面 ${info.activity}` : '', info?.digest ? `屏上 ${info.digest}` : ''].filter(Boolean).join(' · ')
+  const shotNote = info?.shotPath ? `截图 ${info.shotPath}` : ''
+  const hint = info?.hint ? String(info.hint) : (/(没有|越界|ambiguous_target|核对失败)/.test(message)
+    ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
+    : '')
+  return [message, where, shotNote, hint].filter(Boolean).join(' · ')
+}
+
+/**
+ * 失败时补现场：读一次当前页面 + 屏上前几行，再留一张截图（约 0.5s，只在失败路径付）。
+ * @param {any} error - 原始错误。
+ * @param {string} label - 证据文件名前缀，用工具名。
+ * @returns {Promise<Error>} 带现场的错误对象。
+ */
+async function annotateFailure(error, label) {
+  const message = String((error && error.message) || error)
+  if (/截图 \//.test(message)) return error
+  let device = ''
+  try { device = await serial() } catch { return error }
+  let activity = ''
+  let digest = ''
+  try {
+    const state = await dumpState(device, { maxNodes: 200, changed: false })
+    activity = state.activity ?? ''
+    digest = digestLine(state.tree?.lines ?? [], 4)
+  } catch {
+    activity = await foregroundActivity(device).catch(() => '')
+  }
+  const evidence = await captureEvidence(device, label)
+  return new Error(failureSuffix({ message, activity, digest, shotPath: evidence?.path }))
+}
+
+/**
+ * 给工具的 execute 套一层失败取证，不动成功路径。
+ * @param {any} definition - 工具定义。
+ * @param {string} label - 证据文件名前缀。
+ * @returns {any} 套好的定义。
+ */
+function withEvidence(definition, label) {
+  const run = definition.execute
+  return {
+    ...definition,
+    execute: async (args, ctx) => {
+      try {
+        return await run(args, ctx)
+      } catch (error) {
+        throw await annotateFailure(error, label)
+      }
+    },
+  }
+}
+
+/**
  * 读 PNG 的 IHDR 尺寸（字节 16..24）。缩图后以文件为准，避免手算误差。
  * @param {string} path - PNG 路径。
  * @returns {Promise<{width: number, height: number}>} 尺寸。
@@ -3542,7 +3602,7 @@ export function apply(ctx, config) {
     },
   }), 'adb: adb_tap')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_gesture',
     description: '轨迹手势/拖拽：给 direction 就在框里按方向滑一条直线（不用算坐标，翻了再滑几次）；给 from+to 按控件拖；给 points 画任意轨迹（三个点以上逐点发 DOWN/MOVE/UP，能画曲线、慢速滑）。两个点走 input swipe 连续注入，延迟低。每条约 35ms 下限，单次段数 3–40。',
     parameters: {
@@ -3701,9 +3761,9 @@ export function apply(ctx, config) {
         elapsed_ms: Date.now() - started,
       }
     },
-  }), 'adb: adb_gesture')
+  }, 'adb_gesture')), 'adb: adb_gesture')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_input',
     description: '往 Android 设备输入：text 输入文字（ASCII 直发；中文默认剪贴板粘贴，装了 ADBKeyboard 且它已是当前输入法时自动走广播更快，ime 可选）、key 按键（如 ENTER/BACK/DEL/HOME）、submit 输完直接回车/搜索、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文要求先点中输入框让它获得焦点。',
     parameters: {
@@ -3803,9 +3863,9 @@ export function apply(ctx, config) {
       if (messages.length === 0) throw new Error('没有要执行的动作：给 text、key、swipe 或 clear 其中之一。')
       return { ok: true, method, field, verified, message: `${messages.join('；')}。`, elapsed_ms: Date.now() - started }
     },
-  }), 'adb: adb_input')
+  }, 'adb_input')), 'adb: adb_input')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_app',
     description: '管理 Android 应用：info 看版本号/版本名/前台页面，install 装 APK（-r 覆盖，等安装完成），start 启动，stop 强制停止，clear 清数据，foreground 只看当前前台页面。装完真机后用它确认 versionCode 有没有变。',
     parameters: {
@@ -3889,9 +3949,9 @@ export function apply(ctx, config) {
       }
       throw new Error(`未知 action：${action}`)
     },
-  }), 'adb: adb_app')
+  }, 'adb_app')), 'adb: adb_app')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_sh',
     description: '在 Android 设备上跑一条 shell 命令，返回截断后的文本（最多 20k 字符）。日志用：logcat -d -t 300 或 logcat -d -s TAG；查页面/服务用 dumpsys activity top / dumpsys package。需要「看日志有没有报错」时用它，不要截图。',
     parameters: {
@@ -3936,9 +3996,9 @@ export function apply(ctx, config) {
       const output = `${cut || '（无输出）'}${notes.length > 0 ? `\n${notes.join('\n')}` : ''}`
       return { ok: r.ok, code: typeof r.code === 'number' ? r.code : -1, uncertain: r.uncertain === true, output, elapsed_ms: r.ms }
     },
-  }), 'adb: adb_sh')
+  }, 'adb_sh')), 'adb: adb_sh')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_scroll_to',
     description: '把列表滑到目标出现：按文字/id/desc/类名找，滑一下读一次，命中就停（默认不点）。省掉「滑一下→adb_ui→再滑」的来回；滑不动会直接说滑到底了。',
     parameters: {
@@ -4092,7 +4152,7 @@ export function apply(ctx, config) {
         elapsed_ms: Date.now() - began,
       }
     },
-  }), 'adb: adb_scroll_to')
+  }, 'adb_scroll_to')), 'adb: adb_scroll_to')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_do',
@@ -4330,12 +4390,7 @@ export function apply(ctx, config) {
           now = await foregroundActivity(device).catch(() => '')
         }
         const evidence = await captureEvidence(device, 'adb_do')
-        const hint = /没有|越界|ambiguous_target|核对失败/.test(message)
-          ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
-          : ''
-        const where = [now ? `当前页面 ${now}` : '', digest ? `屏上 ${digest}` : ''].filter(Boolean).join(' · ')
-        const shotNote = evidence === null ? '' : `截图 ${evidence.path}`
-        throw new Error(`${message}${where ? ` · ${where}` : ''}${shotNote ? ` · ${shotNote}` : ''}${hint ? ` · ${hint}` : ''}`)
+        throw new Error(failureSuffix({ message, activity: now, digest, shotPath: evidence?.path }))
       }
       if (activity === '') activity = (await foregroundActivity(device).catch(() => '')) || ''
       const summary = [`${done.length} 步跑完（${Date.now() - began}ms）`, `当前 ${activity || '未知页面'}`, '', ...done.map((line, index) => `${index + 1}. ${line}`)].join('\n')
@@ -5304,7 +5359,7 @@ ctx.effect(() => ctx.tools.register({
     },
   }), 'adb: adb_web')
 
-  ctx.effect(() => ctx.tools.register({
+  ctx.effect(() => ctx.tools.register(withEvidence({
     name: 'adb_action',
     description: [
       '系统级动作一条命令完成，不用在界面里找按钮：home / back / recents / lock / wake / rotate / notifications / quick_settings / night_mode。',
@@ -5367,7 +5422,7 @@ ctx.effect(() => ctx.tools.register({
       if (lastActions.length > 400) lastActions.splice(0, lastActions.length - 400)
       return { ok: true, summary: `${label}完成（${r.ms}ms）。界面变化用 adb_ui 确认。`, elapsed_ms: Date.now() - began }
     },
-  }), 'adb: adb_action')
+  }, 'adb_action')), 'adb: adb_action')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_shot',
@@ -5860,6 +5915,7 @@ export const __internals = {
   foregroundActivity,
   waitFor,
   findBlocker,
+  failureSuffix,
   tapPointFast,
   awaitStable,
   scrollToText,

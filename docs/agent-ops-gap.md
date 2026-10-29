@@ -132,6 +132,7 @@
 | --- | --- |
 | XPath 兜底 | 仅当选择器表达不了时用；Appium 自评最慢一档，且要额外 dump+解析，作为「逃生舱」而非主路径 |
 | toast / 系统弹窗文本进树 | Appium `enableNotificationListener`（保留 3 500 ms）；本插件可用 `adb_events` 补，但文本进树更省一次调用 |
+| 失败自动取证 | 竞品都要模型自己再调一次截图/树 | 本插件把 `failureSuffix` 收成统一一句：页面 + 屏上前几行 + 截图路径，`adb_do` / `adb_tap` / `adb_wait` / `adb_find` / `adb_gesture` / `adb_input` / `adb_app` / `adb_sh` / `adb_scroll_to` / `adb_action` 全走它 | 本轮（单测覆盖拼装与去重） |
 | 元素级截图 | u2 元素 `.screenshot()`；用于「这张卡片长什么样」这类必须看图的问题，避免整屏 612–665 ms【实测】 |
 | 组合动作链（W3C 风格） | 长按拖动、双击后滑，一次提交多段轨迹；scrcpy 的 `INJECT_TOUCH_EVENT` 连续帧是参考实现 |
 | 纯 Python 免 adb 二进制 | `adb-shell` 直连设备（TCP/USB），适合 CI 容器里没装 platform-tools 的场景；本机开发不必换 |
