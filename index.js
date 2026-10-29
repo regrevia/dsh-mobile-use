@@ -4367,6 +4367,8 @@ export function apply(ctx, config) {
         hold_ms: { type: 'integer', description: '起点按住多久再移动，默认 0；长按拖动给 500' },
         wait_for_text: { type: 'string', description: '手滑完等这段文字出现再返回（滑到下一页、刷出新内容时用）' },
         wait_until_gone: { type: 'string', description: '手滑完等这段文字消失再返回' },
+        wait_for_activity: { type: 'string', description: '手滑完等前台 Activity 匹配这个正则（滑动提交后跳到结果页）' },
+        wait_activity_gone: { type: 'string', description: '手滑完等前台不再是这个正则' },
         wait_for_xpath: { type: 'string', description: '手滑完等这个 XPath 命中（翻到下一页、刷出列表项）' },
         wait_xpath_gone: { type: 'string', description: '手滑完等这个 XPath 不再命中' },
         timeout_ms: { type: 'integer', description: '等文字的超时，默认 8000' },
@@ -4484,21 +4486,29 @@ export function apply(ctx, config) {
       const wantGone = typeof args.wait_until_gone === 'string' ? args.wait_until_gone.trim() : ''
       const wantXpath = typeof args.wait_for_xpath === 'string' ? args.wait_for_xpath.trim() : ''
       const xpathGone = typeof args.wait_xpath_gone === 'string' ? args.wait_xpath_gone.trim() : ''
-      if (wantText !== '' || wantGone !== '' || wantXpath !== '' || xpathGone !== '') {
+      const wantActivity = typeof args.wait_for_activity === 'string' ? args.wait_for_activity.trim() : ''
+      const activityGone = typeof args.wait_activity_gone === 'string' ? args.wait_activity_gone.trim() : ''
+      if (wantText !== '' || wantGone !== '' || wantXpath !== '' || xpathGone !== '' || wantActivity !== '' || activityGone !== '') {
         const limit = Math.min(60_000, Math.max(200, Number(args.timeout_ms) || 8000))
         const waited = await waitFor(device, {
           text: wantText || undefined,
           gone: wantGone || undefined,
           xpath: wantXpath || undefined,
           xpath_gone: xpathGone || undefined,
+          activity: wantActivity || undefined,
+          activity_gone: activityGone || undefined,
         }, limit)
         const what = wantText !== ''
           ? `「${wantText}」出现`
           : wantGone !== ''
             ? `「${wantGone}」消失`
-            : wantXpath !== ''
-              ? `XPath ${wantXpath} 命中`
-              : `XPath ${xpathGone} 消失`
+            : wantActivity !== ''
+              ? `页面 ${wantActivity}`
+              : activityGone !== ''
+                ? `离开页面 ${activityGone}`
+                : wantXpath !== ''
+                  ? `XPath ${wantXpath} 命中`
+                  : `XPath ${xpathGone} 消失`
         const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}`
         return { ok: true, message: `${base}${tail}。`, elapsed_ms: Date.now() - started }
       }
@@ -6320,6 +6330,8 @@ ctx.effect(() => ctx.tools.register({
         enable: { type: 'boolean', description: 'night_mode 用：true 开夜间模式，false 关' },
         wait_for_text: { type: 'string', description: '动作之后等这段文字出现再返回（比如按返回后确认回到了列表页）' },
         wait_until_gone: { type: 'string', description: '动作之后等这段文字消失再返回（比如关掉弹窗确认它真没了）' },
+        wait_for_activity: { type: 'string', description: '动作之后等前台 Activity 匹配这个正则' },
+        wait_activity_gone: { type: 'string', description: '动作之后等前台不再是这个正则' },
         wait_for_xpath: { type: 'string', description: '动作之后等这个 XPath 命中（回到列表、弹出面板）' },
         wait_xpath_gone: { type: 'string', description: '动作之后等这个 XPath 不再命中' },
         timeout_ms: { type: 'integer', description: '等文字的超时，默认 10000' },
@@ -6372,21 +6384,29 @@ ctx.effect(() => ctx.tools.register({
       const wantGone = typeof args.wait_until_gone === 'string' ? args.wait_until_gone.trim() : ''
       const wantXpath = typeof args.wait_for_xpath === 'string' ? args.wait_for_xpath.trim() : ''
       const xpathGone = typeof args.wait_xpath_gone === 'string' ? args.wait_xpath_gone.trim() : ''
-      if (wantText !== '' || wantGone !== '' || wantXpath !== '' || xpathGone !== '') {
+      const wantActivity = typeof args.wait_for_activity === 'string' ? args.wait_for_activity.trim() : ''
+      const activityGone = typeof args.wait_activity_gone === 'string' ? args.wait_activity_gone.trim() : ''
+      if (wantText !== '' || wantGone !== '' || wantXpath !== '' || xpathGone !== '' || wantActivity !== '' || activityGone !== '') {
         const limit = Math.min(60_000, Math.max(200, Number(args.timeout_ms) || 10_000))
         const waited = await waitFor(device, {
           text: wantText || undefined,
           gone: wantGone || undefined,
           xpath: wantXpath || undefined,
           xpath_gone: xpathGone || undefined,
+          activity: wantActivity || undefined,
+          activity_gone: activityGone || undefined,
         }, limit)
         const what = wantText !== ''
           ? `「${wantText}」出现`
           : wantGone !== ''
             ? `「${wantGone}」消失`
-            : wantXpath !== ''
-              ? `XPath ${wantXpath} 命中`
-              : `XPath ${xpathGone} 消失`
+            : wantActivity !== ''
+              ? `页面 ${wantActivity}`
+              : activityGone !== ''
+                ? `离开页面 ${activityGone}`
+                : wantXpath !== ''
+                  ? `XPath ${wantXpath} 命中`
+                  : `XPath ${xpathGone} 消失`
         const tail = waited.matched ? `等到${what}（${waited.elapsedMs}ms）` : `超时 ${limit}ms 没等到${what}，当前页面 ${waited.state?.activity || '未知'}`
         return { ok: true, summary: `${label}完成（${r.ms}ms）；${tail}。`, elapsed_ms: Date.now() - began }
       }
