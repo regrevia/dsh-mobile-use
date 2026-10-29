@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, findBlocker, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, awaitStable, acquireDirect, DIRECT_GATE } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -489,6 +489,17 @@ it('带状态的等待：控件出现了但还灰着不算等到，要同一个�
   assert.equal(nodeStateOk({ focused: true }, 'focused'), true)
   assert.equal(nodeStateOk({}, 'visible'), true)
   assert.equal(nodeStateOk({}, '没这个状态'), true, '未知状态不拦，避免老参数静默失效')
+})
+
+it('挡路弹窗：认出确认按钮，但不点掉自己要等的那一个', () => {
+  const node = (over) => ({ x1: 0, y1: 0, x2: 200, y2: 100, text: '', desc: '', id: '', cls: 'android.widget.Button', pkg: 'com.demo', clickable: true, enabled: true, ...over })
+  const dialog = { activity: '.Main', nodes: [node({ text: '允许' }), node({ text: '拒绝' })] }
+  assert.equal(findBlocker(dialog, [])?.text, '允许')
+  assert.equal(findBlocker(dialog, ['允许']), null, '正在等「允许」时不能把它当成弹窗点掉')
+  assert.equal(findBlocker({ activity: '.Main', nodes: [node({ text: '允许', enabled: false })] }), null, '灰按钮点不动，不算')
+  assert.equal(findBlocker({ activity: '.Main', nodes: [node({ text: '允许', clickable: false })] }), null)
+  assert.equal(findBlocker({ activity: '.Main', nodes: [node({ text: '允许', enabled: undefined })] })?.text, '允许', 'enabled 缺字段按可用算')
+  assert.equal(findBlocker({ activity: '.Main', nodes: [] }), null)
 })
 
 console.log(`\n${pass} 项通过\n`)

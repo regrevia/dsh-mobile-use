@@ -1603,29 +1603,85 @@ function normalList(value) {
   return list.map((item) => String(item).trim()).filter(Boolean)
 }
 
+/** 常见挡路弹窗上的按钮文字：权限、升级、评分、隐私同意。等着等着被它挡住的概率最高。 */
+const BLOCKER_TEXTS = ['允许', '始终允许', '仅在使用中允许', '允许所有', '同意并继续', '同意', '确定', '确认', '知道了', '我知道了', '稍后再说', '以后再说', '暂不', '跳过', '关闭', '取消', '继续']
+
+/**
+ * 界面上有没有挡住目标的弹窗按钮（只看可点、可用的控件）。
+ * @param {any} state - 一次 dump 的状态。
+ * @param {string[]} wanted - 这次真正在等的内容，弹窗按钮不能和它重名，否则会把目标点掉。
+ * @returns {any|null} 命中的控件。
+ */
+function findBlocker(state, wanted) {
+  const avoid = normalList(wanted).map((item) => item.toLowerCase())
+  const nodes = Array.isArray(state?.nodes) ? state.nodes : []
+  const clickable = nodes.filter((node) => node.clickable === true && node.enabled !== false && String(node.text || '').trim() !== '')
+  for (const label of BLOCKER_TEXTS) {
+    const hitNode = clickable.find((node) => {
+      const text = String(node.text).trim()
+      if (avoid.some((item) => text.toLowerCase().includes(item))) return false
+      return text === label
+    })
+    if (hitNode) return hitNode
+  }
+  return null
+}
+
+/**
+ * 点一个绝对坐标：优先走常驻触摸通道，没有就退回 `input tap`。
+ * @param {string} serial - 设备。
+ * @param {number} x - x。
+ * @param {number} y - y。
+ * @returns {Promise<boolean>} 是否成功。
+ */
+async function tapPointFast(serial, x, y) {
+  if (fastInput.tap !== null) {
+    const fast = await fastInput.tap(serial, x, y, {}).catch(() => null)
+    if (fast !== null) return true
+  }
+  const result = await sh(serial, `input tap ${Math.round(x)} ${Math.round(y)}`, 8000).catch(() => null)
+  return result !== null && result.ok
+}
+
 /**
  * 等待界面满足条件，替代 sleep + 截图。每 120ms 一次 dump（u2 一次约 0.12s）。
  * @param {string} serial - 设备。
  * @param {{text?: string, id?: string, desc?: string, activity?: string, gone?: string, texts?: string[], any_texts?: string[], pkg?: string}} want - 条件。
  * @param {number} timeoutMs - 超时。
- * @returns {Promise<{matched: boolean, elapsedMs: number, state: any}>} 结果。
+ * @param {{dismiss?: boolean}} [options] - dismiss 允许等到一半时点掉挡路弹窗（最多 2 次）。
+ * @returns {Promise<{matched: boolean, elapsedMs: number, state: any, dismissed: string[]}>} 结果。
  */
-async function waitFor(serial, want, timeoutMs) {
+async function waitFor(serial, want, timeoutMs, options = {}) {
   const started = Date.now()
+  const dismissed = []
+  const wanted = [want.text, want.id, want.desc, ...(normalList(want.texts)), ...(normalList(want.any_texts))]
   let state = await pollDump(serial)
   while (!matches(state, want)) {
+    if (options.dismiss === true && dismissed.length < 2) {
+      const blocker = findBlocker(state, wanted)
+      if (blocker !== null) {
+        const label = String(blocker.text).trim()
+        const clicked = await tapPointFast(serial, (blocker.x1 + blocker.x2) / 2, (blocker.y1 + blocker.y2) / 2)
+        if (clicked) {
+          dismissed.push(label)
+          await new Promise((resolve) => setTimeout(resolve, 200))
+          state = await pollDump(serial)
+          continue
+        }
+      }
+    }
     if (Date.now() - started > timeoutMs) {
       /* 轮询为了快不跑 OCR，自绘界面上文字只在 OCR 里：超时前补一次带 OCR 的读，别把「有」判成「没有」。 */
       const lastChance = await dumpState(serial, { ocr: 'auto' }).catch(() => null)
       if (lastChance !== null && matches(lastChance, want)) {
-        return { matched: true, elapsedMs: Date.now() - started, state: lastChance }
+        return { matched: true, elapsedMs: Date.now() - started, state: lastChance, dismissed }
       }
-      return { matched: false, elapsedMs: Date.now() - started, state: lastChance ?? state }
+      return { matched: false, elapsedMs: Date.now() - started, state: lastChance ?? state, dismissed }
     }
     await new Promise((resolve) => setTimeout(resolve, 120))
     state = await pollDump(serial)
   }
-  return { matched: true, elapsedMs: Date.now() - started, state }
+  return { matched: true, elapsedMs: Date.now() - started, state, dismissed }
 }
 
 /**
@@ -3142,6 +3198,7 @@ export function apply(ctx, config) {
           enum: ['visible', 'enabled', 'clickable', 'checked', 'focused'],
           description: '配合 text/id/desc：等到同一个控件处于这个状态才算过（默认出现就算），例如等按钮变 enabled 再点、等开关变 checked',
         },
+        dismiss: { type: 'boolean', description: '等到一半被权限/升级/评分弹窗挡住时，自动点掉常见确认按钮（最多 2 次）再接着等，回执列出点了哪些' },
         stable: { type: 'boolean', description: '等界面静止：树签名连续 quiet_ms 不变才算（动画/加载结束）' },
         quiet_ms: { type: 'integer', description: 'stable 用：连续多久没变化算静止，默认 400' },
         timeout_ms: { type: 'integer', description: '等待上限，默认 15000' },
@@ -3157,10 +3214,11 @@ export function apply(ctx, config) {
           stable: { type: ['boolean', 'null'] },
           quiet_ms: { type: ['integer', 'null'] },
           activity: { type: 'string' },
+          dismissed: { type: 'array', items: { type: 'string' }, description: 'dismiss 时被点掉的弹窗按钮文字' },
           summary: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['ok', 'satisfied', 'stable', 'quiet_ms', 'activity', 'summary', 'elapsed_ms'],
+        required: ['ok', 'satisfied', 'stable', 'quiet_ms', 'activity', 'dismissed', 'summary', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.summary),
@@ -3182,14 +3240,14 @@ export function apply(ctx, config) {
       const askedCondition = Object.entries(want).some(([, value]) => (Array.isArray(value) ? value.length > 0 : value !== undefined))
       if (args.until !== undefined && !args.text && !args.id && !args.desc) {
         return {
-          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '',
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [],
           summary: 'until 要配合 text / id / desc 用：先说要等哪个控件，再说等到它处于什么状态。',
           elapsed_ms: Date.now() - started,
         }
       }
       if (!askedCondition && args.stable !== true) {
         return {
-          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '',
+          ok: false, satisfied: false, stable: null, quiet_ms: null, activity: '', dismissed: [],
           summary: '什么都没等：给 text / id / desc / gone / texts / any_texts / activity，或者 stable=true。',
           elapsed_ms: Date.now() - started,
         }
@@ -3197,10 +3255,12 @@ export function apply(ctx, config) {
       const dumpOptions = { full: false }
       let state = null
       let satisfied = true
+      let dismissed = []
       if (askedCondition) {
-        const waited = await waitFor(device, want, bounded(args.timeout_ms))
+        const waited = await waitFor(device, want, bounded(args.timeout_ms), { dismiss: args.dismiss === true })
         state = waited.state
         satisfied = waited.matched
+        dismissed = waited.dismissed
       }
       let calm = null
       if (args.stable === true) {
@@ -3223,6 +3283,7 @@ export function apply(ctx, config) {
           ? `界面已静止 ${calm.quietMs}ms`
           : calm.empty ? '一直读不到控件（还在加载或自己画的界面）' : `${calm.ms}ms 内画面还在变`)
       }
+      if (dismissed.length > 0) pieces.push(`先点掉了弹窗：${dismissed.join(' / ')}`)
       pieces.push(here)
       return {
         ok: satisfied,
@@ -3230,6 +3291,7 @@ export function apply(ctx, config) {
         stable: calm === null ? null : calm.stable,
         quiet_ms: calm === null ? null : calm.quietMs,
         activity: state.activity || '',
+        dismissed,
         summary: pieces.join(' · '),
         elapsed_ms: Date.now() - started,
       }
@@ -5772,6 +5834,8 @@ export const __internals = {
   dumpState,
   foregroundActivity,
   waitFor,
+  findBlocker,
+  tapPointFast,
   awaitStable,
   scrollToText,
   scrollToSelector,
