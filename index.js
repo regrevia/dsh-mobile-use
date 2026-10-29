@@ -1573,7 +1573,14 @@ async function waitFor(serial, want, timeoutMs) {
   const started = Date.now()
   let state = await pollDump(serial)
   while (!matches(state, want)) {
-    if (Date.now() - started > timeoutMs) return { matched: false, elapsedMs: Date.now() - started, state }
+    if (Date.now() - started > timeoutMs) {
+      /* 轮询为了快不跑 OCR，自绘界面上文字只在 OCR 里：超时前补一次带 OCR 的读，别把「有」判成「没有」。 */
+      const lastChance = await dumpState(serial, { ocr: 'auto' }).catch(() => null)
+      if (lastChance !== null && matches(lastChance, want)) {
+        return { matched: true, elapsedMs: Date.now() - started, state: lastChance }
+      }
+      return { matched: false, elapsedMs: Date.now() - started, state: lastChance ?? state }
+    }
     await new Promise((resolve) => setTimeout(resolve, 120))
     state = await pollDump(serial)
   }
@@ -3401,7 +3408,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_input',
-    description: '往 Android 设备输入：text 输入文字（ASCII 直发，中文走剪贴板粘贴约 1.5 s）、key 按键（如 ENTER/BACK/DEL/HOME）、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文要求先点中输入框让它获得焦点。',
+    description: '往 Android 设备输入：text 输入文字（ASCII 直发，中文走剪贴板粘贴约 1.5 s）、key 按键（如 ENTER/BACK/DEL/HOME）、submit 输完直接回车/搜索、swipe 滑动 [x1,y1,x2,y2,ms]、clear=true 先清空输入框。中文要求先点中输入框让它获得焦点。',
     parameters: {
       type: 'object',
       properties: {
@@ -3413,6 +3420,7 @@ export function apply(ctx, config) {
           description: '滑动 [x1,y1,x2,y2] 或 [x1,y1,x2,y2,毫秒]，例如 [1000,2000,1000,500,400]',
         },
         clear: { type: 'boolean', description: '输入前先清空当前聚焦输入框（END + 多次 DEL）' },
+        submit: { type: 'string', enum: ['enter', 'search'], description: '输完直接提交：enter 回车（聊天框、表单），search 搜索键（搜索框）。省掉一次 adb_input {key} 往返' },
       },
       additionalProperties: false,
     },
@@ -3443,6 +3451,13 @@ export function apply(ctx, config) {
         lastActions.push({ at: Date.now(), what: typed.how === 'paste' ? `粘贴文字 ${wanted.length} 字` : `输入文字 ${wanted.length} 字` })
         messages.push(typed.note)
         if (typed.field !== '') messages.push(`输入框现在是「${oneLine(typed.field, 40)}」`)
+      }
+      if (args.submit !== undefined) {
+        /* 输完顺手提交：搜索框/聊天框都要这一步，合成一次调用省一个模型回合。 */
+        const code = args.submit === 'search' ? 84 : 66
+        const submitted = await sh(device, `input keyevent ${code}`, 8000)
+        if (!submitted.ok) throw new Error(failureNote(args.submit === 'search' ? '搜索键' : '回车', submitted))
+        messages.push(args.submit === 'search' ? '已按搜索键' : '已按回车')
       }
       if (args.key !== undefined) {
         const key = String(args.key).trim()
