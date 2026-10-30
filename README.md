@@ -22,6 +22,15 @@ git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
 
 作品牌差异一句话：同类插件多在**让 DSH 的网页适配手机**或**让手机连回电脑**，这个方向相反——**把手机装进 DSH，让 AI 直接操作真机**。
 
+## 同一块地盘上还有谁
+
+手机方向在 DSH 生态里已经有人做，各自解决的其实不是同一件事（摘自插件市场当前介绍）：
+
+- **从手机连回电脑**：`liguobao/ds-harness-remote`、`wenbin-wb/dsh-bridge` —— 把正在跑的会话推到手机浏览器里继续，手机是显示器。
+- **iOS 设备上的操作**：`ZSeven-W/dsh-ios` —— 模拟器或 USB 连接的 iPhone，按无障碍标识或 OCR 操作，带可点的侧栏面板。
+
+这个插件是第三条：**Android 真机、画面进右栏、标注带回去**。差别不在「工具数量」，而在模型看到的就是设备本身——文本树 120 ms 给出文字与坐标，画面一变 **163 ms** 上屏，圈一处就把「这里」变成一条带图的消息。
+
 ## 为什么
 
 原做法是 `adb exec-out screencap` 出 PNG，再 `read_image` 让模型看图。一次「确认页面对不对」要花：一次截图进程 + 一张几百 KB～9 MB 的图 + 一次带图的模型步。
