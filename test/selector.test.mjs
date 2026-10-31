@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, spotCandidates, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, spotCandidates, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs, leftoverBusySerials, auditProcessCounts } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -900,4 +900,33 @@ it('数量条件：命中数不到 count_min 就不算过，xpath 按命中数�
   assert.equal(matches(state, { text: '邮件', count_min: 0 }), true)
 })
 
+it('清场跳过正在用的设备：serial 挂在实例上也算', () => {
+  assert.deepEqual([...leftoverBusySerials(undefined)], [])
+  assert.deepEqual([...leftoverBusySerials([])], [])
+  const live = new Set([
+    { serial: 'A1' },
+    { _options: { serial: 'B2' } },
+    { serial: 'A1' },
+    { },
+  ])
+  assert.deepEqual([...leftoverBusySerials(live)].sort(), ['A1', 'B2'])
+})
+
 console.log(`\n${pass} 项通过\n`)
+
+it('对账只认真正的录屏进程：sh -c 包装行不算', () => {
+  const lines = [
+    " 9993 sh -c sh -c 'echo $$ > /data/local/tmp/dsh-mobile-use-stream-15ca9736-abc-1.pid; exec screenrecord --output-format=h264 --time-limit=175 -'",
+    ' 9997 screenrecord --output-format=h264 --time-limit=175 --size=2400x1602 -',
+    ' 10176 sh -c sh -c \'echo $$ > /data/local/tmp/dsh-mobile-use-stream-15ca9736-def-2.pid; exec screenrecord --output-format=h264 -\'',
+    '',
+    '  12 CLASSPATH=/data/local/tmp/dsh-mobile-use-scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 3.1 scid=00000001',
+  ]
+  const one = auditProcessCounts(lines)
+  if (one.recorder !== 1) throw new Error(`录屏进程数应为 1，实际 ${one.recorder}`)
+  if (one.scrcpy !== 1) throw new Error(`scrcpy 数应为 1，实际 ${one.scrcpy}`)
+  const empty = auditProcessCounts([])
+  if (empty.recorder !== 0 || empty.scrcpy !== 0) throw new Error('空输入应为 0')
+  const junk = auditProcessCounts([undefined, null, 'screenrecord --output-format=h264 -', '没有 pid 的行'])
+  if (junk.recorder !== 0) throw new Error('没有 pid 前缀的行不该算进程')
+})

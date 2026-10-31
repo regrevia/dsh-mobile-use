@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-use",
-  "version": "1.4.17",
+  "version": "1.4.18",
   "private": false,
   "description": "把真手机装进 DSH 右栏：实时镜像可以直接点、圈一处标注回传会话，模型不截图也能读界面文本树。只走本机回环，不上传画面。",
   "type": "module",

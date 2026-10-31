@@ -16,7 +16,7 @@
 
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, open, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
@@ -4196,12 +4196,69 @@ function applyXPathStep(pool, step) {
 }
 
 /**
+ * 正在被本宿主使用的设备序列号：这些设备上的进程不是残留，清场时必须跳过。
+ * LiveStream 把序列号挂在实例自身（stream.js constructor：`this.serial`），早期代码
+ * 只取 `_options.serial`，于是 bundle 重载但宿主没重启时会漏掉这一台。两个都看。
+ * @param {any} streams - `globalThis.__dshAdbLiveStreams`（可能不存在或不是 Set）。
+ * @returns {Set<string>} 忙设备序列号。
+ */
+function leftoverBusySerials(streams) {
+  const busy = new Set()
+  if (!(streams instanceof Set)) return busy
+  for (const item of streams) {
+    const device = item?.serial ?? item?._options?.serial
+    if (device) busy.add(String(device))
+  }
+  return busy
+}
+
+/* 同一台机器上跑着两个宿主（比如长稳脚本 + GUI 里的插件）时，两边都会在设备上开录屏；
+   清场只能由独占的那一方做，否则后启动的一方会把前面那张流正在用的 recorder 杀掉。 */
+const HOST_LOCK = '/tmp/dsh-mobile-use-host.lock'
+
+/** @returns {string} 另一个活着的宿主 pid；没有返回空串。 */
+function peerHostPid() {
+  try {
+    const pid = Number(String(readFileSync(HOST_LOCK, 'utf8')).trim())
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return ''
+    process.kill(pid, 0)
+    return String(pid)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 从设备 `ps` 输出里数真正的录屏与 scrcpy server 进程。
+ * `sh -c '… exec screenrecord …'` 这层包装的命令行里也含 screenrecord，按行内子串数会把
+ * 1 条流数成 2 个，看着像泄漏——所以只认「pid 后面紧跟进程名」的行。
+ * @param {string[]} lines
+ * @returns {{recorder: number, scrcpy: number}} 录屏进程数、scrcpy server 数
+ */
+function auditProcessCounts(lines) {
+  let recorder = 0
+  let scrcpy = 0
+  for (const raw of lines ?? []) {
+    const line = String(raw ?? '').trim()
+    if (!/^\d+\s+/.test(line)) continue
+    if (/^\d+\s+screenrecord\s+--output-format/.test(line)) recorder += 1
+    else if (/dsh-mobile-use-scrcpy-server\.jar|com\.genymobile\.scrcpy\.Server/.test(line)) scrcpy += 1
+  }
+  return { recorder, scrcpy }
+}
+
+/**
  * 设备端的兜底清场：宿主被重载或强杀时，设备上的 scrcpy server 与录屏进程不会跟着退出，
  * 它们一直占着编码器 / 录屏器，下一次推流就表现为「连上但没帧」。这里只清本插件独占的标记
- * （自己的 jar 文件名、自己的录屏 marker），不碰别的 scrcpy 会话；本进程正在推的设备跳过。
+ * （自己的 jar 文件名、自己的录屏 marker、隔夜 pid 文件），不碰别的 scrcpy 会话；
+ * 本进程正在推的设备跳过；发现同机还有别的宿主活着就整个跳过。
  * @returns {Promise<string[]>} 这次清了哪些设备。
  */
 async function reclaimDeviceLeftovers() {
+  /* 清场只杀本插件独占命名的进程（scrcpy server jar / stream-<serial>- 前缀），
+     不碰 uiautomator、不碰别的 scrcpy。多开宿主时想完全不动设备，设 ADBM_LEFTOVER_SWEEP=0。 */
+  if (process.env.ADBM_LEFTOVER_SWEEP === '0') return []
+  if (peerHostPid() !== '') return []
   let devices = []
   try {
     devices = (await listDevices()).filter((device) => device.state === 'device')
@@ -4209,20 +4266,15 @@ async function reclaimDeviceLeftovers() {
     return []
   }
   if (devices.length === 0) return []
-  const busy = new Set()
-  const streams = globalThis.__dshAdbLiveStreams
-  if (streams instanceof Set) {
-    for (const item of streams) {
-      const device = item?._options?.serial
-      if (device) busy.add(String(device))
-    }
-  }
+  const busy = leftoverBusySerials(globalThis.__dshAdbLiveStreams)
   const cleaned = []
   for (const device of devices) {
     const name = String(device.serial)
     if (busy.has(name)) continue
     try {
-      const done = await sh(name, "pkill -9 -f 'dsh-mobile-use-scrcpy-server.jar' 2>/dev/null; pkill -9 -f 'dsh-mobile-use-stream-' 2>/dev/null; echo ok", 4000)
+      /* 进程之外还要清掉隔夜留下的 pid 文件：老版本用 dsh-mobile-use-rec- 前缀，
+         新版用 dsh-mobile-use-stream-，一天前的都可以删，否则 /data/local/tmp 只涨不降。 */
+      const done = await sh(name, "pkill -9 -f 'dsh-mobile-use-scrcpy-server.jar' 2>/dev/null; pkill -9 -f 'dsh-mobile-use-stream-' 2>/dev/null; find /data/local/tmp -maxdepth 1 -name 'dsh-mobile-use-*' -mtime +1 -delete 2>/dev/null; echo ok", 6000)
       if (done.ok) cleaned.push(name)
     } catch { /* 单台清不掉不影响别的设备 */ }
   }
@@ -4237,6 +4289,15 @@ export function apply(ctx, config) {
   let savedAt = lastActions.length > 0 ? lastActions[lastActions.length - 1].at : 0
   /* 上一轮宿主如果是被重载 / 强杀收场的，设备端的 scrcpy server 和录屏进程还活着；
      等首次调用把 adb 通道热起来之前先扫一遍，不留「老进程占着编码器」的坑。 */
+  /* 独占标记：自己活着时把 pid 写进锁文件；别的宿主启动时看到活着的 pid 就不清场。 */
+  const peer = peerHostPid()
+  let lockOwned = false
+  if (peer === '') {
+    try {
+      writeFileSync(HOST_LOCK, `${process.pid}\n`)
+      lockOwned = true
+    } catch { /* 锁写不了就退化成「每次都清」，不阻断插件 */ }
+  }
   const leftoverTimer = setTimeout(() => { void reclaimDeviceLeftovers() }, 2500)
   leftoverTimer.unref?.()
   const actionSaver = setInterval(() => {
@@ -4271,6 +4332,9 @@ export function apply(ctx, config) {
   ctx.effect(() => () => {
     clearInterval(actionSaver)
     clearTimeout(leftoverTimer)
+    if (lockOwned) {
+      try { unlinkSync(HOST_LOCK) } catch { /* 已经不在就算了 */ }
+    }
     void saveActions()
     mirror.stopAll()
     stopOcr()
@@ -6546,11 +6610,11 @@ ctx.effect(() => ctx.tools.register({
 
 ctx.effect(() => ctx.tools.register({
     name: 'adb_proc',
-    description: '看设备上的进程与内存：top 给最吃 CPU 的进程，mem 给指定包的内存明细，list 列进程。排查卡顿/被杀/内存涨先看这里。',
+    description: '看设备上的进程与内存：top 给最吃 CPU 的进程，mem 给指定包的内存明细，list 列进程，audit 对账宿主解码器与设备端录屏/scrcpy 进程（查残留、查是谁在占编码器）。排查卡顿/被杀/内存涨先看这里。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['top', 'mem', 'list'], description: '默认 top' },
+        action: { type: 'string', enum: ['top', 'mem', 'list', 'audit'], description: '默认 top' },
         package: { type: 'string', description: 'mem 用：包名，如 com.example.app' },
         lines: { type: 'integer', description: '最多回多少行，默认 20，上限 80' },
       },
@@ -6575,6 +6639,37 @@ ctx.effect(() => ctx.tools.register({
       const began = Date.now()
       const action = args.action ?? 'top'
       const limit = Math.min(Math.max(args.lines ?? 20, 3), 80)
+      if (action === 'audit') {
+        const devices = await listDevices().catch(() => [])
+        const kids = globalThis.__dshAdbKids instanceof Map ? globalThis.__dshAdbKids : new Map()
+        const live = globalThis.__dshAdbLiveStreams instanceof Set ? globalThis.__dshAdbLiveStreams : new Set()
+        const hostKid = { remux: 0, jpeg: 0, other: 0 }
+        for (const meta of kids.values()) {
+          const kind = String(meta?.kind ?? 'other')
+          if (kind === 'remux' || kind === 'jpeg') hostKid[kind] += 1
+          else hostKid.other += 1
+        }
+        const liveSerials = new Set()
+        for (const item of live) {
+          const name = item?.serial ?? item?._options?.serial
+          if (name) liveSerials.add(String(name))
+        }
+        const rows = []
+        rows.push(`宿主：解码器 remux ${hostKid.remux} · jpeg ${hostKid.jpeg}${hostKid.other > 0 ? ` · 其它 ${hostKid.other}` : ''}；推流 ${live.size} 条${liveSerials.size > 0 ? `（${[...liveSerials].join('、')}）` : ''}`)
+        for (const device of devices) {
+          if (device.state !== 'device') continue
+          const name = String(device.serial)
+          const seen = await sh(name, "ps -A -o PID,ARGS 2>/dev/null | grep -E 'scrcpy|screenrecord' | grep -v grep", 6000).catch(() => null)
+          const lines = String(seen?.out ?? '').split('\n').map((line) => line.trim()).filter((line) => line !== '')
+          const { recorder: rec, scrcpy } = auditProcessCounts(lines)
+          const want = liveSerials.has(name) ? '（本宿主在用）' : ''
+          rows.push(`设备 ${name}${want}：录屏 ${rec} · scrcpy ${scrcpy}${lines.length === 0 ? ' · 干净的' : ''}`)
+          if (liveSerials.has(name) && rec === 0) rows.push('   ⚠ 宿主认为在推流，设备上没有录屏进程：这条流该重建了')
+          if (rec > 1) rows.push(`   ⚠ 设备上有 ${rec} 个录屏进程：多半是别的宿主或上一代残留，编码器被抢会出空白流`)
+          if (!liveSerials.has(name) && (rec > 0 || scrcpy > 0)) rows.push(`   ⚠ 没在用却有残留进程（录屏 ${rec} / scrcpy ${scrcpy}）：会占编码器，下次开流前该清掉`)
+        }
+        return { ok: true, summary: `adb_proc audit（${Date.now() - began}ms）`, text: rows.join('\n'), elapsed_ms: Date.now() - began }
+      }
       let command
       if (action === 'mem') {
         if (!args.package) throw new Error('mem 需要 package：例如 com.example.app。')
@@ -8103,7 +8198,7 @@ ctx.effect(() => ctx.tools.register({
         '点击用 `adb_tap`（ref / 文字 / id，自己或最近可点祖先里挑更准的落点；ref 来自最近一次 `adb_ui`；目标还没出现会自己等最多 900ms，可用 `wait_ms` 调），不确定有哪些就先 `adb_find`（一次拿全部命中 + ref + 坐标），列表里找不到用 `adb_scroll_to` 边滑边找；输入用 `adb_input`，装包启停用 `adb_app`。要拖拽、曲线滑、按住再拖这种手指轨迹，用 `adb_gesture`（逐点 DOWN/MOVE/UP，比 `input swipe` 的直线更像真人）。顶部状态、开关这类一步就能改的，直接 `adb_sh`（如 `settings put system font_scale 1.15`、`svc wifi enable`、`pm grant`），比点 UI 快且不会点歪。设备已 root 时 `adb_sh root=true cmd="cat /data/data/<包名>/shared_prefs/x.xml"` 能直接读应用存储、数据库、dropbox —— 状态类问题先读存储，比走 UI 点进去更准。',
         '`adb_shot` 只在这些时候用：颜色/布局/相机扫码画面/图表，或文本树几乎全是空节点（Flutter、自绘、部分 WebView）。图缩到长边 900px，配 `read_image` 看。「文本树看着是空的」先别急着截图：`adb_ui` 发现可读文字少于 4 个会自动跑一次 macOS 视觉 OCR，把识别出的文字当成可点击节点补进树里（来源标记 `+ocr`），慢 200ms 但省掉一次截图回合。',
         '动效问题用 `adb_anim`：给 ref/text/id 加时长和 fps，采样期间可以带 `trigger`（tap/swipe/text/action）点一下触发动画，回来的是尺寸/位置时间线 + 抖动次数、超调、帧间步长、稳定时间，比连拍截图准，也不用读图。局限：它读的是控件树坐标，列表滚动、页面转场这类合成器动画坐标可能不动，那种情况改成 `adb_mirror` 里的帧序列看。',
-        '卡顿、被杀、内存涨用 `adb_proc`（top / mem / list），别截图猜。内嵌 H5 定位不准用 `adb_web`（CDP 直读 DOM，返回 CSS 矩形和换算后的设备坐标，可直接喂 `adb_tap point=`）；App 没开 WebView 调试时会明确报错。',
+        '卡顿、被杀、内存涨用 `adb_proc`（top / mem / list），别截图猜；怀疑宿主/设备进程对不上（残留、编码器被抢）用 `adb_proc audit` 一次对账。内嵌 H5 定位不准用 `adb_web`（CDP 直读 DOM，返回 CSS 矩形和换算后的设备坐标，可直接喂 `adb_tap point=`）；App 没开 WebView 调试时会明确报错。',
       ].join('\n'),
     }), 'adb: system prompt section')
   }
@@ -8117,6 +8212,8 @@ ctx.effect(() => ctx.tools.register({
 export const __internals = {
   mirrorStatus: async (serial) => (mirrorRef === null ? null : mirrorRef.status(serial)),
   channelFailure: (serial) => (mirrorRef === null ? null : mirrorRef.channelFailure?.(serial) ?? null),
+  leftoverBusySerials,
+  auditProcessCounts,
   visionFrame: (serial) => (mirrorRef === null ? null : mirrorRef.visionFrame(serial)),
   selectNodes,
   pinchArgs,

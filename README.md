@@ -74,7 +74,7 @@ git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
 | `adb_find` | 按选择器一次拿全部命中：`text`/`id`/`desc`/`cls`/`pkg` AND、`exact`/`regex`/`text_matches`、`clickable`/`enabled`/`visible`/`checked`/`selected`/`scrollable`/`focused`/`editable`、`index`、`within_ref`（按 ref 框裁，`xpath` 也认）、同处去重；也能直接喂 Appium 写法 `xpath`（`//*[@text="登录"]`、`//LinearLayout/node[2]`、`//*[contains(@text,"登")]`、`//*[@clickable="true"][1]`、`[last()]`、`not(@attr)`、`@attr!="值"`、`starts-with(@attr,"值")`、`A and B` / `A or B`、反向轴 `..` / `following-sibling::` / `preceding-sibling::`；`@text`/`@desc` 同样自动去掉零宽字符），在已 dump 的节点上本地求值，实测 94 节点 19–266 µs。没找到自动留截图 |
 | `adb_scroll_to` | 滚到目标出现：给 `text`/`id`/`desc` 一路滑到看见为止，回执带滑动次数、命中节点和是否到底；`until` 让灰着的同名项继续滑，`dismiss` 自动点掉挡路弹窗（最多 2 次）；不用模型自己算滑动次数 |
 | `adb_anim` | 动画/过渡诊断：开 `animation_scale` 相关的 debug 开关看窗口动画、过渡、Animator 时长，定位「它到底在动什么」 |
-| `adb_proc` | 进程/内存：`top` / `mem` / `list` 一次 shell 拿回，判卡顿、被杀、内存涨，不用截图猜 |
+| `adb_proc` | 进程/内存：`top` / `mem` / `list` 一次 shell 拿回，判卡顿、被杀、内存涨，不用截图猜；`audit` 对账宿主子进程与设备端录屏/scrcpy（查残留、查谁在占编码器） |
 | `adb_events` | 系统事件：logcat 里按 tag/pid 抓崩溃、ANR、Activity 切换，回执按时间倒序 |
 | `adb_web` | 内嵌 H5：CDP 直读 DOM，返回 CSS 矩形和换算后的设备坐标，可直接喂 `adb_tap point=`；App 没开 WebView 调试时明确报错 |
 | `adb_window` | 按窗口看界面：一次 dump 列出所有可见窗口（前台页、悬浮窗/桌宠、状态栏、输入法），给包名、尺寸、位置和窗口内控件树。`adb_ui` 只看前台页文字，悬浮窗/桌宠这类独立窗口用它；实测 236 ms（含前台 Activity 查询） |
