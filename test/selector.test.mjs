@@ -718,7 +718,7 @@ it('crashLineAgeMs：认 logcat 时间戳，几天前的崩溃按年龄筛掉', 
   // 跨年：12-31 的崩溃在 1 月 1 日看应该是「刚刚」，不是「快一年后」
   const y2 = new Date(2027, 0, 1, 0, 1, 0).getTime()
   const ny = crashLineAgeMs('12-31 23:59:00.000  1 1 E AndroidRuntime: FATAL EXCEPTION: main', y2)
-  assert.ok(ny >= 60_000 && ny < 120_000, `跨年应约 2 分钟，实际 ${ny}`)
+  assert.equal(ny, 120_000) /* 23:59:00 → 00:01:00 正好两分钟 */
   assert.equal(crashLineAgeMs('没有时间戳的一行', now), null)
 })
 
