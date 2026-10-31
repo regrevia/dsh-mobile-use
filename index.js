@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=230'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=231'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
@@ -459,9 +459,26 @@ function shortId(id) {
  * @param {string} cls - 完整类名。
  * @returns {string} 简写。
  */
+/** 常见控件按「它是干什么的」压成两三个字母：模型看 `Btn` 比看 `android.widget.LinearLayout$Button` 快得多。 */
+const ROLE_BY_SUFFIX = [
+  ['ImageButton', 'Btn'], ['CheckBox', 'Check'], ['RadioButton', 'Radio'], ['Switch', 'Switch'],
+  ['Button', 'Btn'], ['EditText', 'Input'], ['TextView', 'Text'], ['ImageView', 'Img'],
+  ['RecyclerView', 'List'], ['ListView', 'List'], ['GridView', 'Grid'], ['ScrollView', 'Scroll'],
+  ['ViewPager', 'Pager'], ['TabLayout', 'Tabs'], ['SeekBar', 'Seek'], ['ProgressBar', 'Progress'],
+  ['Spinner', 'Spinner'], ['WebView', 'Web'], ['VideoView', 'Video'], ['SurfaceView', 'Surface'],
+  ['Toolbar', 'Bar'], ['TextInputLayout', 'Field'], ['TextInputEditText', 'Input'],
+]
+
+function classBase(cls) {
+  const full = String(cls || '')
+  const dot = full.lastIndexOf('.')
+  return dot >= 0 ? full.slice(dot + 1) : full
+}
+
 function shortClass(cls) {
-  const dot = cls.lastIndexOf('.')
-  return dot >= 0 ? cls.slice(dot + 1) : cls
+  const base = classBase(cls)
+  for (const [suffix, role] of ROLE_BY_SUFFIX) if (base.endsWith(suffix)) return role
+  return base
 }
 
 /**
@@ -2935,7 +2952,7 @@ function nearMiss(state, sel) {
     const label = byId
       ? (node.id ? shortId(node.id) : '')
       : byCls
-        ? shortClass(node.cls || '')
+        ? classBase(node.cls || '')
         : String(node.text || node.desc || (node.id ? shortId(node.id) : '') || '')
     if (label === '' || seen.has(label)) continue
     seen.add(label)

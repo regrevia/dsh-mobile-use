@@ -246,6 +246,15 @@ const IDLE_GRACE_MS = Math.max(3000, Number(process.env.ADBM_IDLE_GRACE_MS ?? 12
    编码器与 ffmpeg 的空转成本是几十毫秒 CPU；ADBM_VISION_KEEPALIVE_MS=0 可关掉。 */
 const VISION_KEEPALIVE_MS = Math.max(0, Number(process.env.ADBM_VISION_KEEPALIVE_MS ?? 600000) || 0)
 /** 看门狗节拍、判定阈值、重建冷却：2 秒一拍，8 秒没初始化段就重建，15 秒内不重复重建。 */
+/* 活着的流对象：判断一只 ffmpeg「有没有主人」靠这个集合。模块重载会新建对象，旧对象不在这里，
+   它留下的子进程就该被收掉——光看 this.remuxer / this.jpegChild 看不到这一类（实测宿主上留过一只
+   跑了 1 小时 23 分的 TS 重封器）。注册表挂 globalThis，跨模块实例共享。 */
+const LIVE_STREAMS = globalThis.__dshAdbLiveStreams instanceof Set ? globalThis.__dshAdbLiveStreams : (globalThis.__dshAdbLiveStreams = new Set())
+/** 本模块实例的身份：模块重载后换新 Symbol，上一代起的 ffmpeg 一眼可辨。 */
+const EPOCH = Symbol('dsh-adb-stream-epoch')
+/** 所有由本插件起的 ffmpeg：child -> {serial, kind, owner, epoch}。 */
+const KID_REGISTRY = globalThis.__dshAdbKids instanceof Map ? globalThis.__dshAdbKids : (globalThis.__dshAdbKids = new Map())
+
 const WATCH_TICK_MS = 2000
 const WATCH_INIT_MS = 8000
 /* 已经有初始化段、画面却不再出片：静态画面会真的不出片，所以先请一帧验证，
@@ -362,6 +371,7 @@ export class LiveStream {
     this.jpegAt = 0
     this.jpegSeq = 0
     this.jpegChild = null
+    LIVE_STREAMS.add(this)
     /** 这一代 JPEG 解码器的起表时间：从没出过帧时按它判死，避免刚起就重建。 */
     this.jpegStartedAt = 0
     this.jpegPending = Buffer.alloc(0)
@@ -452,6 +462,46 @@ export class LiveStream {
   }
 
   /**
+   * 登记一只自己起的 ffmpeg，退出时自动摘掉。
+   * @param {any} child - 子进程。
+   * @param {string} serial - 设备序列号。
+   * @param {string} kind - 'remux' | 'jpeg'。
+   * @param {any} owner - 拥有它的 LiveStream。
+   * @returns {any} 原样的 child。
+   */
+  static trackKid(child, serial, kind, owner) {
+    KID_REGISTRY.set(child, { serial, kind, owner, epoch: EPOCH })
+    child.on('exit', () => {
+      if (KID_REGISTRY.get(child)?.owner === owner) KID_REGISTRY.delete(child)
+    })
+    return child
+  }
+
+  /**
+   * 收掉没有主人的 ffmpeg：注册表里有、活着的流对象里没有。
+   * @param {string} serial - 设备序列号。
+   * @param {string} [kind] - 只收这一类；不写就两类都收。
+   * @returns {number} 真收掉了几个。
+   */
+  static strayKids(serial, kind) {
+    let killed = 0
+    for (const [child, meta] of [...KID_REGISTRY]) {
+      if (!meta || meta.serial !== serial) continue
+      if (kind && meta.kind !== kind) continue
+      /* 同代、且主人还活着，才算有主；换代以后旧模块的对象哪怕还挂在集合里，它的子进程也得收。 */
+      if (meta.epoch === EPOCH && meta.owner && LIVE_STREAMS.has(meta.owner)) continue
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        /* 已经退了 */
+      }
+      KID_REGISTRY.delete(child)
+      killed += 1
+    }
+    return killed
+  }
+
+  /**
    * 收掉「进程还活着、对象已经丢了」的解码器。注册表跟着 globalThis 走，换代/重建以后
    * 上一代的子进程仍然在表里；只看 this.jpegChild 会漏掉它们，于是一个僵尸 ffmpeg
    * 长期占着 CPU 和管道（实测 8 分钟 55 秒 CPU、jpegFresh() 恒 false、每次视觉读都回退截图）。
@@ -515,6 +565,7 @@ export class LiveStream {
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     this.jpegChild = child
     this.jpegStartedAt = Date.now()
+    LiveStream.trackKid(child, this.serial, 'jpeg', this)
     if (!(globalThis.__dshAdbJpeg instanceof Map)) globalThis.__dshAdbJpeg = new Map()
     if (!(globalThis.__dshAdbJpeg.get(this.serial) instanceof Set)) globalThis.__dshAdbJpeg.set(this.serial, new Set())
     globalThis.__dshAdbJpeg.get(this.serial).add(child)
@@ -656,6 +707,8 @@ export class LiveStream {
   /** 有人在看才开始录，没人看一会儿就停，省设备电和带宽。 @returns {void} */
   start() {
     if (this.stopping || this.spawning) return
+    /* 上一代模块实例留下的 ffmpeg 先收掉：它们没有主人，留着只会和新的抢管道。 */
+    this.guard('start-stray-kids', () => LiveStream.strayKids(this.serial))
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer)
       this.forgetTimer(this.idleTimer)
@@ -1335,6 +1388,7 @@ export class LiveStream {
       '-f', 'mp4', 'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     this.remuxer = child
+    LiveStream.trackKid(child, this.serial, 'remux', this)
     /* child.on('error') 接不到管道自身的 EPIPE：必须单独接管 stdin，否则异步 error 事件会打死宿主。 */
     child.stdin.on('error', (error) => this.guard('remux-stdin-error', () => {
       this.error = 'ffmpeg 管道断开：' + String(error?.message ?? error)
@@ -1409,6 +1463,7 @@ export class LiveStream {
       }
       /* 对象丢了但注册表里还有活进程 = 僵尸解码器：它不会出帧，还会让下面的判死整段跑不到。
          收掉它，并把节流窗口清掉，让下一次读帧立即重建。 */
+      LiveStream.strayKids(this.serial, 'remux')
       if (this.jpegChild === null) {
         if (LiveStream.strayJpeg(this.serial) > 0) {
           this.jpegOpenAt = 0
@@ -1783,6 +1838,9 @@ export class LiveStream {
       /* closeJpeg 只管自己这只子进程；注册表里换代残留的同类进程也要一起收，否则停了流还留着
          一个空转的 ffmpeg（实测过 6 分钟烧 39 秒 CPU）。这里没有当前子进程，表里剩下的都是遗留。 */
       this.guard('stop-stray-jpeg', () => LiveStream.strayJpeg(this.serial))
+      /* TS 重封器同理：换代以后对象没了、进程还在，就是白烧 CPU 的一只空转 ffmpeg。 */
+      LIVE_STREAMS.delete(this)
+      this.guard('stop-stray-kids', () => LiveStream.strayKids(this.serial))
       const child = this.recorder ?? null
       this.recorder = null
       /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */
