@@ -173,7 +173,7 @@ scrcpy 的 `PositionMapper` 是按**编码尺寸**建的：
 | --- | --- | --- |
 | 堆泄漏 | 1000 轮 `adb_ui` 后堆增量 **1.59 MB**（1.63 KB/轮），曲线在第 400 轮后走平 | `--expose-gc` 每轮 dump 后 `heapUsed`：9.28→9.61 MB |
 | 栈溢出 | 3 万层嵌套 XML 解析 **514 ms 不爆栈**、`compactTree` 限深 400 行正常 | `parseNodes` 是显式栈迭代，不是递归；无调用栈增长 |
-| 宽度爆炸 | 12 万节点 XML 解析 **113 ms**，输出仍被 `maxNodes` 截到 400 行 | 同上，输入再大只花时间不花栈 |
+| 宽度爆炸 | 12 万节点 XML 解析 **23 ms**，两万个节点处**硬截断**（`truncated` 标注、回执里说明），输出再被 `maxNodes` 截到 400 行 | 同一棵树同时要进 `lastTrees` 快照缓存，不截断就是按设备数吃宿主堆 |
 | 僵尸解码进程 | 设备端录制器被杀后，宿主 ffmpeg 存活但不出帧 → **6 s 判死、自动重建**，恢复后取帧回到 37–139 ms | 杀 27145/17165 后观察：冷回退 828 ms，重建出新 `screenrecord` + 新转封装进程，热帧恢复 |
 | 临时文件 | OCR 帧、颜色网格、截图、`screencap` 落盘图统一按 **10 分钟**清理（此前只清 OCR 一类） | `pruneOcrTemp` → 覆盖 `dsh-mobile-use-ocr-*` / `adbm-look-*` / `adb-*.jpg` / `dsh-mobile-use/` |
 | 等待者堆积 | JPEG 取帧等待者超配额立刻返回 `null` 并计数，不排队 | `MAX_JPEG_WAITERS` 硬配额 |

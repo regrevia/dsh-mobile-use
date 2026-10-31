@@ -1395,6 +1395,12 @@ function attrOf(attrs, key) {
   return found ? decodeEntities(found[1]) : ''
 }
 
+/* 节点数硬上限：正常界面几十到几千个节点，两万已经离谱。
+   不加这个，一段畸形/异常膨胀的 XML（曾经见过自绘列表一次吐十几万节点）就能把
+   整棵 nodes 钉进 lastTrees 快照缓存，等于按设备数无限吃宿主堆。截断只丢尾部兄弟节点，
+   前两万个（含活动窗口骨架）照旧能读、能点。 */
+const PARSE_MAX_NODES = 20000
+
 function parseNodes(xml) {
   const nodes = []
   const stack = []
@@ -1404,6 +1410,10 @@ function parseNodes(xml) {
     if (match[3]) {
       stack.pop()
       continue
+    }
+    if (nodes.length >= PARSE_MAX_NODES) {
+      nodes.truncated = true
+      break
     }
     const attrs = match[1]
     const selfClosing = match[2] === '/'
@@ -1815,7 +1825,15 @@ function compactTree(nodes, options) {
      否则「只看这一行」读出来的东西全在十几层，depth 一给就一行都不剩。 */
   const box = Array.isArray(options.box) && options.box.length === 4 ? options.box.map((value) => Number(value)) : null
   const inside = box === null ? nodes : nodes.filter((node) => inWithinBox(node, box))
-  const baseDepth = box === null || inside.length === 0 ? 0 : Math.min(...inside.map((node) => Number(node.depth) || 0))
+  /* 不用 Math.min(...) 展开：框里节点多的时候会撞参数个数上限，直接抛 RangeError。 */
+  let baseDepth = box === null || inside.length === 0 ? 0 : Infinity
+  if (baseDepth === Infinity) {
+    for (const node of inside) {
+      const each = Number(node.depth) || 0
+      if (each < baseDepth) baseDepth = each
+    }
+    if (baseDepth === Infinity) baseDepth = 0
+  }
   const lines = []
   const refs = []
   /** 每个深度上正在打开的容器签名，用来消除父子重复文字。 */
@@ -2376,7 +2394,7 @@ async function dumpStateUnlocked(serial, options) {
   const nodes = parseNodes(xml)
   /* 文本树给不出几个能读的控件（Flutter / 自绘 / 相机 / WebView）就补一次 OCR，别让模型对着空树猜。 */
   const textNodes = nodes.filter((node) => (node.text || node.desc || node.id) && node.enabled).length
-  let ocrNote = ''
+  let ocrNote = nodes.truncated ? ` · 节点超过 ${PARSE_MAX_NODES} 个，已截断尾部` : ''
   let ocrMs = 0
   const needOcr = options.ocr === 'force' || (textNodes < 4 && options.ocr !== false && options.ocr !== 'off')
   if (needOcr) {
