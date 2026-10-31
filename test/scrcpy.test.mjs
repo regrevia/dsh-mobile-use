@@ -906,6 +906,14 @@ it('参数集与最近 GOP 缓存成 replay，供迟到的消费者补喂', () =
   assert.equal(channel.replay.length, 6 + 6 + 6)
 })
 
+it('启动失败留下 lastError，供宿主回执说明为什么退回录屏', () => {
+  const channel = new ScrcpyChannel({ serial: 'probe', adbPath: 'adb' })
+  assert.equal(channel.lastError, '')
+  const ok = channel._fail('连接 scrcpy 视频 / 控制 socket 失败')
+  assert.equal(ok, false)
+  assert.match(channel.lastError, /socket/)
+})
+
 console.log('')
 
 if (failures.length > 0) {

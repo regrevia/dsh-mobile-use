@@ -738,6 +738,8 @@ export class ScrcpyChannel extends EventEmitter {
     }
 
     this._state = 'idle'
+    /* 最近一次启动失败的短原因（给宿主侧回执用），成功后保持空。 */
+    this.lastError = ''
     this._stopped = false
     this._disposed = false
     this._scid = 0
@@ -857,6 +859,9 @@ export class ScrcpyChannel extends EventEmitter {
 
   /** 失败统一收口：日志 + 清理，返回 false。 */
   _fail(message) {
+    /* 失败原因不能只进日志：宿主侧拿不到就只会报「一直退回录屏」，
+       agent 看不到是 forward 没建起来还是设备端 server 没起来。 */
+    this.lastError = String(message ?? '')
     this._log(message)
     this.stop()
     return false

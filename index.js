@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=231'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=232'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
@@ -7650,7 +7650,13 @@ ctx.effect(() => ctx.tools.register({
       const age = frameAge >= 0 ? `（${Math.max(0, Math.round(frameAge))}ms 前）` : ''
       if (source === 'live') parts.push(`复用侧栏直播帧${age}，没碰设备`)
       else if (source === 'warm') parts.push(`推流帧${age}，没碰设备`)
-      else parts.push(`截图 ${captureMs}ms${warmTried === 1 ? '（推流正在冷启动，下一次起免截图）' : ''}`)
+      else {
+        const fail = mirrorRef === null ? null : mirrorRef.channelFailure?.(serial)
+        const why = fail !== null && fail !== undefined && fail.message !== ''
+          ? `（scrcpy 通道起不来：${String(fail.message).slice(0, 60)}；已退到截图）`
+          : ''
+        parts.push(`截图 ${captureMs}ms${warmTried === 1 ? '（推流正在冷启动，下一次起免截图）' : ''}${why}`)
+      }
       parts.push(`抽色 ${Date.now() - colorBegan}ms`)
       note = `${parts.join(' · ')}${note === '' ? '' : ` · ${note}`}`
       return {
@@ -8110,6 +8116,7 @@ ctx.effect(() => ctx.tools.register({
  */
 export const __internals = {
   mirrorStatus: async (serial) => (mirrorRef === null ? null : mirrorRef.status(serial)),
+  channelFailure: (serial) => (mirrorRef === null ? null : mirrorRef.channelFailure?.(serial) ?? null),
   visionFrame: (serial) => (mirrorRef === null ? null : mirrorRef.visionFrame(serial)),
   selectNodes,
   pinchArgs,

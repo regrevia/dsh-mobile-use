@@ -1156,6 +1156,19 @@ export function setupMirror(ctx, tools) {
    * @param {boolean} [autoStart] - 没就绪时是否启动。
    * @returns {any | null} 已就绪的通道；没就绪给 null。
    */
+  /**
+   * 最近一次 scrcpy 通道启动失败的原因（没有失败过就是 null）。
+   * 回执里带上它，agent 才知道低延迟通道为什么退回了录屏/截图。
+   * @param {string} serial - 设备。
+   * @returns {{message: string, at: number} | null} 失败原因与时间戳。
+   */
+  function channelFailure(serial) {
+    const entry = channels.get(serial)
+    const message = String(entry?.failNote ?? '')
+    if (message === '') return null
+    return { message, at: Number(entry.failAt) || 0 }
+  }
+
   function channelFor(serial, autoStart = true) {
     let entry = channels.get(serial)
     /* failed 不能是永久判决：设备侧 server 偶发起不来一次，之后所有观众都被钉在
@@ -1224,7 +1237,9 @@ export function setupMirror(ctx, tools) {
             entry.channel = null
             entry.failed = true
             entry.failedAt = Date.now()
-            streamFor(serial).debug('scrcpy 通道启动失败（start 返回非 true），退回 screenrecord')
+            entry.failNote = String(entry.channel?.lastError ?? '启动返回非 true')
+            entry.failAt = Date.now()
+            streamFor(serial).debug('scrcpy 通道启动失败（start 返回非 true），退回 screenrecord：' + entry.failNote)
             ctx.logger?.warn?.('[scrcpy] 通道启动失败，退回 screenrecord（4 秒后再试）')
           }
         })
@@ -1233,6 +1248,8 @@ export function setupMirror(ctx, tools) {
           entry.channel = null
           entry.failed = true
           entry.failedAt = Date.now()
+          entry.failNote = String(error?.message ?? error)
+          entry.failAt = Date.now()
           streamFor(serial).debug('scrcpy 通道启动抛错：' + String(error?.message ?? error))
           ctx.logger?.warn?.('[scrcpy] 通道启动抛错：' + String(error?.message ?? error))
         })
@@ -1557,6 +1574,7 @@ export function setupMirror(ctx, tools) {
     if (mirror === undefined) {
       mirror = new Mirror(serial, tools.adb)
       mirror.bridgeFresh = () => streamFor(serial).jpegFresh()
+      mirror.channelFailure = (target) => channelFailure(String(target))
       mirrors.set(serial, mirror)
     }
     return mirror
