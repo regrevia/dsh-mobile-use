@@ -983,7 +983,9 @@ export class LiveStream {
        每次开录前都扫（不只首个 session）：换代会中途接手，只扫一次会漏掉后面的残留。
        同机多宿主抢同一台设备时可用 ADBM_STREAM_SWEEP=0 关掉。 */
     const recorderAlive = this.recorder !== null && this.recorder !== undefined && this.recorder.exitCode === null && !this.recorder.killed
-    if (!recorderAlive && process.env.ADBM_STREAM_SWEEP !== '0') {
+    /* 同机还有另一个宿主时，设备端清场交给它：两个宿主都扫会互相杀对方的 recorder，来回重建。 */
+    const peerHost = typeof globalThis.__dshAdbPeerHostPid === 'function' ? String(globalThis.__dshAdbPeerHostPid() ?? '') : ''
+    if (!recorderAlive && peerHost === '' && process.env.ADBM_STREAM_SWEEP !== '0') {
       const tag = this.serial.replace(/[^\w.-]/g, '_')
       const sweep = `pkill -f 'dsh-mobile-use-stream-${tag}-' 2>/dev/null; pkill -f 'dsh-mobile-use-rec-${tag}-' 2>/dev/null; echo ok`
       try {

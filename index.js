@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=233'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=234'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
@@ -4298,6 +4298,8 @@ export function apply(ctx, config) {
       lockOwned = true
     } catch { /* 锁写不了就退化成「每次都清」，不阻断插件 */ }
   }
+  /* 推流侧开录前也要知道「同机是否还有别的宿主」：有的话设备端清场由持有锁的那个负责。 */
+  globalThis.__dshAdbPeerHostPid = peerHostPid
   const leftoverTimer = setTimeout(() => { void reclaimDeviceLeftovers() }, 2500)
   leftoverTimer.unref?.()
   const actionSaver = setInterval(() => {
@@ -4332,6 +4334,7 @@ export function apply(ctx, config) {
   ctx.effect(() => () => {
     clearInterval(actionSaver)
     clearTimeout(leftoverTimer)
+    if (globalThis.__dshAdbPeerHostPid === peerHostPid) delete globalThis.__dshAdbPeerHostPid
     if (lockOwned) {
       try { unlinkSync(HOST_LOCK) } catch { /* 已经不在就算了 */ }
     }
