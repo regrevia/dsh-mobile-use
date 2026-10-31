@@ -380,19 +380,40 @@ async function clipboardPut(serial, text, label = 'dsh') {
  * @param {string} serial - 设备序列号。
  * @returns {Promise<{ok: boolean, count: number, last: string}>} 次数与最后一条摘要；读不到时 count 为 -1。
  */
-async function crashCount(serial) {
+async function crashCount(serial, windowMs = 10 * 60_000) {
   const log = await adb(['-s', serial, 'shell', 'logcat', '-b', 'crash', '-d', '-t', '600'], { timeout: 20_000 }).catch(() => null)
   if (log === null || !log.ok) return { ok: false, count: -1, last: '' }
   const lines = String(log.out ?? '').split('\n')
+  const now = Date.now()
   let count = 0
   let last = ''
   for (let i = 0; i < lines.length; i += 1) {
     if (!lines[i].includes('FATAL EXCEPTION')) continue
+    /* 缓冲里可能躺着几天前的崩溃：只有窗口内的才算「这次是它崩了」，
+       否则一次无关的失败会被扣上一顶「应用崩了」的帽子，把 agent 带偏。 */
+    const age = crashLineAgeMs(lines[i], now)
+    if (age !== null && age > windowMs) continue
     count += 1
     const proc = lines.slice(i, i + 4).find((line) => line.includes('Process:')) ?? lines[i]
     last = oneLine(proc, 140)
   }
   return { ok: true, count, last }
+}
+
+/**
+ * logcat 崩溃行离现在多久（毫秒）：`11-01 00:09:41.973 ...`，不带年份。
+ * @param {string} line - 一行 logcat。
+ * @param {number} now - 当前时间戳。
+ * @returns {number|null} 毫秒年龄；行首没有时间戳时返回 null（按「未知」算，不筛掉）。
+ */
+function crashLineAgeMs(line, now) {
+  const m = /^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})/.exec(String(line))
+  if (m === null) return null
+  const d = new Date(now)
+  const year = d.getFullYear()
+  let at = new Date(year, Number(m[1]) - 1, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).getTime()
+  if (at - now > 24 * 3600_000) at = new Date(year - 1, Number(m[1]) - 1, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).getTime()
+  return Math.max(0, now - at)
 }
 
 /**
@@ -5134,7 +5155,11 @@ export function apply(ctx, config) {
       if (!pkg) throw new Error(`${action} 需要 package。`)
       if (action === 'uninstall') {
         const r = await adb(['-s', device, 'shell', `pm uninstall --user 0 ${pkg}`], { timeout: 60_000 })
-        if (!/Success/i.test(String(r.out))) throw new Error(`卸载失败：${oneLine(r.out || r.err, 240)}`)
+        if (!/Success/i.test(String(r.out))) {
+          const raw = oneLine(r.out || r.err, 240)
+          const hint = /not installed|unknown package/i.test(raw) ? '（这台设备上没有这个包，用 adb_app list 查包名）' : ''
+          throw new Error(`卸载失败：${raw}${hint}`)
+        }
         return { ok: true, action, message: `已卸载 ${pkg}（仅当前用户）`, elapsed_ms: Date.now() - started }
       }
       if (action === 'info') {
@@ -8039,6 +8064,7 @@ export const __internals = {
   parseNodes,
   compactTree,
   crashHint,
+  crashLineAgeMs,
   dezero,
   pollGap,
   shortId,

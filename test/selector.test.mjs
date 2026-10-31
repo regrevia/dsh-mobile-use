@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -707,6 +707,19 @@ it('crashHint：只有真崩过才在失败信息里提一句', () => {
   assert.match(hit, /3 条 FATAL EXCEPTION/)
   assert.match(hit, /com\.demo/)
   assert.match(hit, /adb_crash/)
+})
+
+it('crashLineAgeMs：认 logcat 时间戳，几天前的崩溃按年龄筛掉', () => {
+  const now = new Date(2026, 10, 1, 0, 10, 0).getTime()
+  const fresh = crashLineAgeMs('11-01 00:09:41.973  1234  1234 E AndroidRuntime: FATAL EXCEPTION: main', now)
+  assert.ok(fresh >= 18_000 && fresh <= 19_000, `应约 18s，实际 ${fresh}`)
+  const old = crashLineAgeMs('10-30 14:17:37.966  28758 32010 E AndroidRuntime: FATAL EXCEPTION: main', now)
+  assert.ok(old > 24 * 3600_000, `两天前应大于一天，实际 ${old}`)
+  // 跨年：12-31 的崩溃在 1 月 1 日看应该是「刚刚」，不是「快一年后」
+  const y2 = new Date(2027, 0, 1, 0, 1, 0).getTime()
+  const ny = crashLineAgeMs('12-31 23:59:00.000  1 1 E AndroidRuntime: FATAL EXCEPTION: main', y2)
+  assert.ok(ny >= 60_000 && ny < 120_000, `跨年应约 2 分钟，实际 ${ny}`)
+  assert.equal(crashLineAgeMs('没有时间戳的一行', now), null)
 })
 
 it('compactTree：box 只留框里的控件，ref 从 1 连续，深度重定基', () => {
