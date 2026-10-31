@@ -977,11 +977,17 @@ export class LiveStream {
       return
     }
     /* 上一个模块实例（重载、探针、旧会话）留下的 screenrecord 会一直占着设备唯一的编码器，
-       新推流拿到的是一张永久空白的 h264 流：表现为热身永远不结束。开录前清一次孤儿进程。 */
-    if (!this.deviceSwept) {
-      this.deviceSwept = true
+       新推流拿到的是一张永久空白的 h264 流：表现为热身永远不结束。开录前清一次孤儿进程。
+       只按本插件的 marker（`dsh-mobile-use-stream-<serial>-` / 老版 `dsh-mobile-use-rec-`）精确杀：
+       泛化 pkill screenrecord 会把用户自己正在录的屏也杀掉。自己这条流还活着就不扫，避免自杀。
+       每次开录前都扫（不只首个 session）：换代会中途接手，只扫一次会漏掉后面的残留。
+       同机多宿主抢同一台设备时可用 ADBM_STREAM_SWEEP=0 关掉。 */
+    const recorderAlive = this.recorder !== null && this.recorder !== undefined && this.recorder.exitCode === null && !this.recorder.killed
+    if (!recorderAlive && process.env.ADBM_STREAM_SWEEP !== '0') {
+      const tag = this.serial.replace(/[^\w.-]/g, '_')
+      const sweep = `pkill -f 'dsh-mobile-use-stream-${tag}-' 2>/dev/null; pkill -f 'dsh-mobile-use-rec-${tag}-' 2>/dev/null; echo ok`
       try {
-        execFileSync(this.adbPath, ['-s', this.serial, 'shell', 'pkill -f screenrecord'], { timeout: 4000, stdio: 'ignore' })
+        execFileSync(this.adbPath, ['-s', this.serial, 'shell', sweep], { timeout: 4000, stdio: 'ignore' })
       } catch (error) {
         this.debug('sweep-screenrecord failed ' + String(error?.message ?? error).slice(0, 80))
       }
