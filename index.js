@@ -23,11 +23,11 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=225'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=228'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
-import { ocrAvailable, ocrImage, stopOcr, toDeviceRects } from './ocr.js?v=118'
+import { ocrAvailable, ocrImage, stopOcr, toDeviceRects } from './ocr.js?v=119'
 import { diffGrid, gridArt, regionsOf, sampleGrid, trimBars } from './look.js?v=3'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -2118,6 +2118,8 @@ const OCR_REMOTE = '/data/local/tmp/dsh-mobile-use-ocr.jpg'
 const OCR_DEFAULT_MAX = 0
 /* 直播帧要够大才敢喂 OCR：960 宽那档会把中文认成别的字（实测 `独角兽`→`独角售`）。 */
 const OCR_LIVE_MIN_WIDTH = 1300
+/* Fast 档只在裁小后的区域上划算（整帧会丢掉近一半文字），超过这个长边就走 Accurate。 */
+const OCR_FAST_MAX_EDGE = 1100
 
 /**
  * 拿一张给 OCR 用的截图：`exec-out screencap -j` 一次调用直达，设备端编 JPEG 直接吐回宿主
@@ -2177,14 +2179,26 @@ async function pruneOcrTemp() {
   try {
     const dir = tmpdir()
     const names = await readdir(dir)
+    /* 三种落盘：OCR 帧（dsh-mobile-use-ocr-<ms>.jpg）、颜色网格（adbm-look-*）、
+       截图（adb-<ms>.jpg），再加一个子目录 dsh-mobile-use/ 存 screen-<serial>-<ms>.jpg。
+       长会话里每张几十到几百 KB，只清 OCR 那一类会把临时目录慢慢塞满。 */
+    const temp = /^(?:dsh-mobile-use-ocr|adbm-look|adb)-(\d{10,})\.(?:jpg|jpeg|png)$/
     let seen = 0
     for (const entry of names) {
-      if (!entry.startsWith('dsh-mobile-use-ocr-')) continue
+      const hit = temp.exec(entry)
+      if (hit === null) continue
       seen += 1
       if (seen > 400) break
-      const at = Number(entry.replace('dsh-mobile-use-ocr-', '').split('.')[0])
+      const at = Number(hit[1])
       if (!Number.isFinite(at) || now - at < 600_000) continue
       await rm(join(dir, entry), { force: true }).catch(() => {})
+    }
+    const sub = join(dir, 'dsh-mobile-use')
+    const files = await readdir(sub).catch(() => [])
+    for (const entry of files.slice(-800)) {
+      const hit = /-(\d{10,})\.(?:jpg|jpeg|png)$/.exec(entry)
+      if (hit === null || now - Number(hit[1]) < 600_000) continue
+      await rm(join(sub, entry), { force: true }).catch(() => {})
     }
   } catch {
     /* 清理失败不影响读屏 */
@@ -2223,19 +2237,29 @@ async function ocrNodes(serial, options = {}) {
   const path = join(tmpdir(), `dsh-mobile-use-ocr-${Date.now()}.${ext}`)
   await writeFile(path, image).catch(() => {})
   /* 只识别 region 那块：Vision 的耗时基本跟着像素量走，裁一块 2136x400 从 162ms 降到 ~80ms。 */
+  /* region 是设备像素；用推流帧时帧是缩过的，按帧/屏比例换到帧坐标，输出再按屏换算回去。 */
+  const devSize = Number(options.size?.width) > 0 ? options.size : null
+  const frameScaleX = devSize === null || dims === null ? 1 : dims.w / devSize.width
+  const frameScaleY = devSize === null || dims === null ? 1 : dims.h / devSize.height
   let crop = null
   if (dims !== null && options.region !== undefined && options.region !== null) {
     const region = options.region
-    const x = Math.max(0, Math.min(Math.round(region.x), dims.w - 2))
-    const y = Math.max(0, Math.min(Math.round(region.y), dims.h - 2))
-    const w = Math.max(2, Math.min(Math.round(region.w), dims.w - x))
-    const h = Math.max(2, Math.min(Math.round(region.h), dims.h - y))
+    const x = Math.max(0, Math.min(Math.round(region.x * frameScaleX), dims.w - 2))
+    const y = Math.max(0, Math.min(Math.round(region.y * frameScaleY), dims.h - 2))
+    const w = Math.max(2, Math.min(Math.round(region.w * frameScaleX), dims.w - x))
+    const h = Math.max(2, Math.min(Math.round(region.h * frameScaleY), dims.h - y))
     crop = [x, y, w, h]
   }
   const recognizeBegan = Date.now()
   /* 字节哈希相同 = 同一张图：直接复用上次的识别结果，连 Vision 都不用起。 */
+  const cropLong = crop === null ? Infinity : Math.max(crop[2], crop[3])
+  const level = options.level === 'fast'
+    ? 'fast'
+    : options.level === 'accurate'
+      ? 'accurate'
+      : (cropLong <= OCR_FAST_MAX_EDGE ? 'fast' : 'accurate')
   const imageHash = options.cache === false ? '' : ocrImageHash(image)
-  const cacheKey = imageHash === '' ? '' : `${imageHash}:${crop === null ? '' : crop.join(',')}:${options.max ?? OCR_DEFAULT_MAX}`
+  const cacheKey = imageHash === '' ? '' : `${imageHash}:${crop === null ? '' : crop.join(',')}:${options.max ?? OCR_DEFAULT_MAX}:${level}`
   if (cacheKey !== '') {
     const hit = OCR_CACHE.get(cacheKey)
     if (hit !== undefined && Date.now() - hit.at < OCR_CACHE_TTL) {
@@ -2277,10 +2301,20 @@ async function ocrNodes(serial, options = {}) {
   let rects = []
   let recognized = null
   try {
-    recognized = await ocrImage(path, { crop, max: options.max ?? OCR_DEFAULT_MAX })
-    const width = dims?.w ?? recognized.srcWidth
-    const height = dims?.h ?? recognized.srcHeight
+    recognized = await ocrImage(path, { crop, max: options.max ?? OCR_DEFAULT_MAX, level })
+    const width = devSize?.width ?? dims?.w ?? recognized.srcWidth
+    const height = devSize?.height ?? dims?.h ?? recognized.srcHeight
     rects = toDeviceRects(recognized.blocks ?? [], recognized, width, height)
+    /* 推流刚起时第一帧可能是黑的：一个字都没认出来就老老实实抓一张整图再认一次。 */
+    if (rects.length === 0 && reuse) {
+      const again = await ocrCapture(serial).catch(() => null)
+      if (again !== null) {
+        image = again
+        await writeFile(path, again).catch(() => {})
+        recognized = await ocrImage(path, { crop, max: options.max ?? OCR_DEFAULT_MAX, level, cache: false })
+        rects = toDeviceRects(recognized.blocks ?? [], recognized, devSize?.width ?? dims?.w ?? recognized.srcWidth, devSize?.height ?? dims?.h ?? recognized.srcHeight)
+      }
+    }
   } catch (error) {
     return { nodes: [], rects: [], ms: Date.now() - began, note: `OCR 失败：${oneLine(error.message, 60)}`, path }
   }
@@ -2315,7 +2349,7 @@ async function ocrNodes(serial, options = {}) {
   return { nodes, rects, ms: Date.now() - began, note, path, captureMs, recognizeMs }
 }
 
-async function dumpState(serial, options) {
+async function dumpStateUnlocked(serial, options) {
   const started = Date.now()
   const wantActivity = options.activity !== false
   const activityPromise = wantActivity ? foregroundActivity(serial) : Promise.resolve('')
@@ -2384,7 +2418,86 @@ async function dumpState(serial, options) {
  * @param {string} serial - 设备。
  * @returns {Promise<any>} 状态。
  */
-const pollDump = (serial) => dumpState(serial, { ocr: false })
+/**
+ * 同一台设备的读树串行化 + 短窗复用。
+ * 一次 dump 本身要 150–230 ms（时间全在设备端无障碍遍历），两个条件轮询撞在一起就是两次同样的遍历，
+ * 还会让 u2 服务端同时处理两个请求。这里做三件事：同设备排队、在飞行时合并、90 ms 内直接复用上一次结果。
+ * adb_ui / adb_find 的「最终 dump」仍走 dumpState，拿到的永远是排队后新读的一块，changed/snapshotId 语义不变。
+ */
+const DUMP_REUSE_MS = 90
+const dumpQueues = new Map()
+const dumpPending = new Map()
+
+/**
+ * 把一次读树挂到该设备的队尾，保证同一设备不会有两个 dump 同时跑。
+ * @param {string} serial - 设备。
+ * @param {() => Promise<any>} task - 真正读树的函数。
+ * @returns {Promise<any>} 任务结果。
+ */
+function serialDump(serial, task) {
+  const previous = dumpQueues.get(serial) ?? Promise.resolve()
+  const run = previous.then(task, task)
+  dumpQueues.set(serial, run.then(() => {}, () => {}))
+  return run
+}
+
+/**
+ * 读界面树：进设备队列，读一块新的。
+ * @param {string} serial - 设备。
+ * @param {any} options - OCR / activity 选项。
+ * @returns {Promise<any>} 状态。
+ */
+function dumpState(serial, options) {
+  const run = serialDump(serial, () => dumpStateUnlocked(serial, options))
+  dumpPending.set(serial, run)
+  run.then(() => {
+    if (dumpPending.get(serial) === run) dumpPending.delete(serial)
+  }, () => {
+    if (dumpPending.get(serial) === run) dumpPending.delete(serial)
+  })
+  return run
+}
+
+/**
+ * 把上一次已读到的树包成这次调用的返回形状（不碰设备）。
+ * @param {string} serial - 设备。
+ * @param {any} options - 只用来重压树的行数。
+ * @returns {any | null} 命中缓存时的状态，否则 null。
+ */
+function reusedDump(serial, options) {
+  const hit = lastTrees.get(serial)
+  if (!hit || Date.now() - hit.at > DUMP_REUSE_MS) return null
+  const tree = compactTree(hit.nodes, options)
+  return {
+    serial,
+    activity: hit.activity,
+    nodes: hit.nodes,
+    refs: tree.refs,
+    tree,
+    changed: false,
+    ms: 0,
+    source: 'cache',
+    ocrNote: '',
+    snapshotId: hit.snapshotId,
+    generated_at: new Date(hit.at).toISOString(),
+  }
+}
+
+/**
+ * 轮询里的 dump：不走 OCR，且允许复用 90 ms 内的结果 / 合并正在飞的那一次。
+ * @param {string} serial - 设备。
+ * @returns {Promise<any>} 状态。
+ */
+const pollDump = (serial, options = {}) => {
+  /* 「等界面静止」必须每次都真读：复用会让同一棵树连续两次相等，动画中被误判成已经停了。 */
+  if (options.fresh !== true) {
+    const reused = reusedDump(serial, { ocr: false })
+    if (reused) return Promise.resolve(reused)
+    const pending = dumpPending.get(serial)
+    if (pending) return pending
+  }
+  return dumpState(serial, { ocr: false })
+}
 
 /**
  * 校验手上这次快照还能用：没有快照、过期、或编号对不上都直接说清楚，不拿旧 ref 乱点。
@@ -4565,7 +4678,7 @@ export function apply(ctx, config) {
           : `，等待超时 ${args.timeout_ms ?? 10_000}ms，界面没出现预期变化`
       } else if (args.wait_stable === true) {
         /* 点完等它静下来再判「变没变」：动画中途读到的树会骗人。 */
-        const calmed = await awaitStable(() => pollDump(device), {
+        const calmed = await awaitStable(() => pollDump(device, { fresh: true }), {
           quietMs: args.quiet_ms ?? 400,
           timeoutMs: args.timeout_ms ?? 10_000,
         })
@@ -5474,7 +5587,7 @@ export function apply(ctx, config) {
 
         if (step.wait_idle === true || step.wait_stable === true) {
           /* 等界面静止：树签名连续 idle_ms 不变才算稳定，最多等到本步上限。 */
-          const calmed = await awaitStable(() => pollDump(device), {
+          const calmed = await awaitStable(() => pollDump(device, { fresh: true }), {
             quietMs: step.idle_ms ?? 400,
             timeoutMs: limit,
           })
@@ -7058,8 +7171,12 @@ ctx.effect(() => ctx.tools.register({
         const node = nodeForRef(device, args.ref, args.snapshot_id)
         region = elementRegion(node, args.pad ?? 8)
       }
-      /* 直播帧是 960x640 缩过的，按它裁会错位：有 region 就老老实实抓整屏。 */
-      const live = args.scale === 0 || region !== null ? null : mirror.liveFrame(device)
+      /*
+       * 直播帧是 960x640 缩过的，按它裁会错位：有 region 就老老实实抓整屏。
+       * 没人在看侧栏时接手推流帧（冷启约 1.4s，之后 0 ms）：比 screencap -j 的 0.8s 慢一点，
+       * 但设备端编码器只在没人看时才有空，拿到之后整屏图直接落盘，不必再要一次截图。
+       */
+      const live = args.scale === 0 || region !== null ? null : (mirror.liveFrame(device) ?? mirror.visionFrameNow(device))
       if (live !== null) {
         const dims = jpegSize(live.frame)
         if (dims !== null) {
@@ -7128,12 +7245,11 @@ ctx.effect(() => ctx.tools.register({
       let region = parseRegion(args.region)
       if (args.ref !== undefined) region = elementRegion(nodeForRef(device, args.ref, args.snapshot_id), 8)
       /* 侧栏没在看也能拿帧：没人看就用「按需推流」的同步取帧（第一次点火，之后 0ms）。 */
-      const live = args.fresh === true || region !== null
-        ? null
-        : (mirror.liveFrame(device) ?? mirror.visionFrameNow(device))
+      const live = args.fresh === true ? null : (mirror.liveFrame(device) ?? mirror.visionFrameNow(device))
       const extra = await ocrNodes(device, {
         image: live === null ? undefined : live.frame,
         captureMs: live === null ? 0 : Math.max(0, Date.now() - Number(live.at)),
+        size: live === null ? undefined : await screenSize(device),
         region: region === null ? undefined : region,
         max: args.max,
       })
@@ -7872,6 +7988,7 @@ export const __internals = {
   retryBudget,
   resolveSerial,
   dumpState,
+  pollDump,
   foregroundActivity,
   waitFor,
   findBlocker,

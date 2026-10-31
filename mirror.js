@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=205'
+import { LiveStream, packFrame } from './stream.js?v=208'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
 import { PLAYER_HTML } from './page.js?v=36'
 
@@ -2540,6 +2540,7 @@ export function setupMirror(ctx, tools) {
     visionFrameNow(serial) {
       if (streams.size >= MAX_STREAMS) reclaimStream()
       const stream = streamFor(serial, { plain: true })
+      stream.keepWarm()
       if (stream.jpegFresh()) return { frame: stream.jpeg, at: stream.jpegAt }
       stream.start()
       stream.enableJpeg()
@@ -2549,6 +2550,7 @@ export function setupMirror(ctx, tools) {
     async visionFrame(serial) {
       if (streams.size >= MAX_STREAMS) reclaimStream()
       const stream = streamFor(serial, { plain: true })
+      stream.keepWarm()
       if (stream.jpegFresh()) return { frame: stream.jpeg, at: stream.jpegAt }
       /* 帧是「有人要才转」的：先开 JPEG 支路，再等它给一张，最长 1.2s。 */
       stream.start()

@@ -72,7 +72,7 @@ def scale_image(image, max_edge):
     return scaled
 
 
-def recognize(path, max_edge, crop):
+def recognize(path, max_edge, crop, level="accurate"):
     original = load(path)
     ow = CGImageGetWidth(original)
     oh = CGImageGetHeight(original)
@@ -82,7 +82,11 @@ def recognize(path, max_edge, crop):
         image, used = crop_image(image, crop)
     image = scale_image(image, max_edge)
     request = Vision.VNRecognizeTextRequest.alloc().init()
-    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    if level == "fast":
+        # Fast 只在裁小后的区域上划算：整帧用会丢近一半文字（实测 44 段 → 24 段）。
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelFast)
+    else:
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     request.setUsesLanguageCorrection_(False)
     request.setRecognitionLanguages_(["zh-Hans", "en-US"])
     handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(image, None)
@@ -130,6 +134,7 @@ def main():
         path = text
         max_edge = 0
         crop = None
+        level = "accurate"
         if text.startswith("{"):
             try:
                 parsed = json.loads(text)
@@ -147,7 +152,9 @@ def main():
                 continue
         began = time.time()
         try:
-            result = recognize(path, max_edge, crop)
+            if parsed.get("level") == "fast":
+                level = "fast"
+            result = recognize(path, max_edge, crop, level)
             result["id"] = request_id
             result["path"] = path
             result["ms"] = int(round((time.time() - began) * 1000))

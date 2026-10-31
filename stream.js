@@ -242,12 +242,19 @@ function containsIdr(chunk) {
     而冷启动要重新推 server、等 IDR，实测 8~9 秒。静止画面时编码器本来就不产出流量，留 2 分钟不费资源。 */
 /* 没人在看多久后收掉设备端采集。默认两分钟：重开侧栏是热的；调试/自测可用环境变量压到几秒。 */
 const IDLE_GRACE_MS = Math.max(3000, Number(process.env.ADBM_IDLE_GRACE_MS ?? 120000) || 120000)
+/* 走过一次视觉读的设备，把宽限拉长：隔几分钟再读一次屏不该再付 0.8–1.1s 的冷启。
+   编码器与 ffmpeg 的空转成本是几十毫秒 CPU；ADBM_VISION_KEEPALIVE_MS=0 可关掉。 */
+const VISION_KEEPALIVE_MS = Math.max(0, Number(process.env.ADBM_VISION_KEEPALIVE_MS ?? 600000) || 0)
 /** 看门狗节拍、判定阈值、重建冷却：2 秒一拍，8 秒没初始化段就重建，15 秒内不重复重建。 */
 const WATCH_TICK_MS = 2000
 const WATCH_INIT_MS = 8000
 /* 已经有初始化段、画面却不再出片：静态画面会真的不出片，所以先请一帧验证，
    请了还不来才判卡死。长跑时这条是「画面冻住」的唯一出路。 */
 const WATCH_STALL_MS = 10000
+/* 视觉路径专用：解码器活着但一帧都不出，说明设备端录制器已经死了（僵尸 ffmpeg）。
+   冷调 screencap 要 500–900 ms，比等一次重建慢得多，所以这里主动修，而不是让视觉变慢。 */
+const JPEG_STALL_MS = 6000
+const JPEG_INIT_STALL_MS = 8000
 const WATCH_COOLDOWN_MS = 15000
 /** 主链路待写队列上限：ffmpeg 不读数据时，队列涨到这里就整条重建，绝不把宿主内存吃光。 */
 const MAX_REMUX_QUEUE = 4 * 1024 * 1024
@@ -300,6 +307,7 @@ export class LiveStream {
     this.width = options.width ?? 0
     this.height = options.height ?? 0
     this.sizeFixed = this.width > 0 && this.height > 0
+    this.sizeAt = 0
     this.bitrateFixed = options.bitrate !== undefined
     this.bitrate = options.bitrate ?? 8_000_000
     /* 分片时长决定转封装的缓冲深度：10 ms 一片，拖动能到 60 fps；调大更省开销但画面更"钝"。 */
@@ -337,6 +345,7 @@ export class LiveStream {
     this.intentional = false
     this.idleTimer = null
     this.idleArmedAt = 0
+    this.idleGrace = IDLE_GRACE_MS
     this.lastViewerAt = 0
     this.firstFrameAt = 0
     this.bytes = 0
@@ -353,6 +362,8 @@ export class LiveStream {
     this.jpegAt = 0
     this.jpegSeq = 0
     this.jpegChild = null
+    /** 这一代 JPEG 解码器的起表时间：从没出过帧时按它判死，避免刚起就重建。 */
+    this.jpegStartedAt = 0
     this.jpegPending = Buffer.alloc(0)
     this.jpegWaiters = new Set()
     /* 配额拒绝计数：看诊断就知道是不是被上限挡过（不是静默截断）。 */
@@ -460,7 +471,7 @@ export class LiveStream {
       '-flags', 'low_delay',
       '-f', 'h264', '-i', 'pipe:0',
       /* 12 fps 够看清手指动作；960 高在展开的侧栏里也不糊，编码开销只有几十毫秒。 */
-      '-vf', 'fps=15,scale=-2:1400',
+      '-vf', 'fps=15,scale=1400:1400:force_original_aspect_ratio=decrease',
       /* mjpeg 复用器会把 20 KB 级的帧攒在 avio 缓冲里，不加这个要等进程退出才吐一帧。 */
       '-flush_packets', '1',
       '-fps_mode', 'passthrough',
@@ -468,6 +479,7 @@ export class LiveStream {
       'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'pipe'] })
     this.jpegChild = child
+    this.jpegStartedAt = Date.now()
     if (!(globalThis.__dshAdbJpeg instanceof Map)) globalThis.__dshAdbJpeg = new Map()
     if (!(globalThis.__dshAdbJpeg.get(this.serial) instanceof Set)) globalThis.__dshAdbJpeg.set(this.serial, new Set())
     globalThis.__dshAdbJpeg.get(this.serial).add(child)
@@ -560,7 +572,18 @@ export class LiveStream {
   }
 
   /** 观众都走了：留一段宽限再停，重开侧栏就不用重新起流。 @returns {void} */
-  scheduleIdleStop(delayMs = IDLE_GRACE_MS) {
+  /**
+   * 有人读过帧：把停止宽限拉长到 keepalive，下次视觉读免冷启。
+   * @param {number} [ms] - 宽限毫秒数。
+   * @returns {void}
+   */
+  keepWarm(ms = VISION_KEEPALIVE_MS) {
+    if (ms <= this.idleGrace) return
+    this.idleGrace = ms
+    if (this.idleTimer === null) this.scheduleIdleStop()
+  }
+
+  scheduleIdleStop(delayMs = this.idleGrace ?? IDLE_GRACE_MS) {
     if (this.idleTimer !== null) return
     if (this.idleArmedAt === 0) this.idleArmedAt = Date.now()
     /* 代际校验：已取消但已入队的回调仍会跑一次，换过代就不许它再动状态。 */
@@ -585,7 +608,7 @@ export class LiveStream {
         Number(this.lastViewerAt) || 0,
         Number(this.idleArmedAt) || 0,
       )
-      const left = IDLE_GRACE_MS - (now - lastSeen)
+      const left = (this.idleGrace ?? IDLE_GRACE_MS) - (now - lastSeen)
       if (left > 250) {
         this.scheduleIdleStop(left)
         return
@@ -794,22 +817,26 @@ export class LiveStream {
     }
   }
 
-  /* 开录前定一次尺寸：按 `wm size` 等比缩到长边 2400，长边不足就不放大。
-     同步跑一条 adb（~40ms），只做一次；失败就退回 720x1280 稳妥值。 */
+  /* 开录前定一次尺寸：按当前朝向的显示尺寸等比缩到长边 2400，长边不足就不放大。
+     必须用 `cur=WxH`（当前朝向）而不是 `wm size`（物理端口）：横屏时按物理竖屏尺寸录，
+     编码器会把横向画面整条塞进竖屏画布，帧里 60% 是黑边、文字被压成一半高。
+     同步跑一条 adb（~150ms），缓存 90s；转了屏最迟 90s 或下次重开录屏时跟上。失败退回 720x1280。 */
   ensureSize() {
-    if (this.sizeFixed) return
+    if (this.sizeFixed && Date.now() - this.sizeAt < 90_000) return
     this.sizeFixed = true
+    this.sizeAt = Date.now()
     let w = 0
     let h = 0
     try {
-      const out = execFileSync(this.adbPath, ['-s', this.serial, 'shell', 'wm', 'size'], { timeout: 4000, encoding: 'utf8' })
-      const hit = /(\d+)\s*x\s*(\d+)/.exec(String(out))
+      const out = execFileSync(this.adbPath, ['-s', this.serial, 'shell', "wm size; dumpsys window displays | grep -m1 -oE 'cur=[0-9]+x[0-9]+'"], { timeout: 6000, encoding: 'utf8' })
+      const cur = /cur=(\d+)x(\d+)/.exec(String(out))
+      const hit = cur ?? /(\d+)\s*x\s*(\d+)/.exec(String(out))
       if (hit !== null) {
         w = Number(hit[1])
         h = Number(hit[2])
       }
     } catch (error) {
-      this.debug('wm size failed ' + String(error?.message ?? error).slice(0, 60))
+      this.debug('display size failed ' + String(error?.message ?? error).slice(0, 60))
     }
     if (!(w > 8 && h > 8)) {
       this.width = 720
@@ -1326,6 +1353,23 @@ export class LiveStream {
     if (viewers === 0) {
       this.viewerSince = 0
       this.revivedAt = 0
+      /* 走视觉的人不进 clients/waiting：镜像没开、只用 adb_ocr/adb_look 时观众数就是 0。
+         这种情况下面那段判死完全跑不到，于是「宿主 ffmpeg 活着、设备 screenrecord 已死」
+         会一直装健康——每次视觉读都回退 screencap（实测 531–893 ms），长会话里越来越慢。
+         真机实测过的现场：ffmpeg 跑了 8 分钟、CPU 55 s、jpegFresh() 恒 false。
+         只在确实还想看帧（宽限内读过）时修，空闲的流不许被修活。 */
+      if (this.jpegChild === null || this.stopping) return
+      const wanted = Number(this.jpegWantedAt) || 0
+      if (wanted === 0 || Date.now() - wanted >= (this.idleGrace ?? IDLE_GRACE_MS)) return
+      if (this.revivedAt !== 0 && Date.now() - this.revivedAt < WATCH_COOLDOWN_MS) return
+      const started = Number(this.jpegStartedAt) || 0
+      const lastFrame = Number(this.jpegAt) || 0
+      const stale = lastFrame > 0 ? Date.now() - lastFrame : (started > 0 ? Date.now() - started : 0)
+      const limit = lastFrame > 0 ? JPEG_STALL_MS : JPEG_INIT_STALL_MS
+      if (stale < limit) return
+      this.revivedAt = Date.now()
+      this.debug('看门狗：JPEG 桥接 ' + String(Math.round(stale / 1000)) + ' 秒没有新帧，重建采集链路')
+      this.reviveSource()
       return
     }
     if (this.init !== null) {

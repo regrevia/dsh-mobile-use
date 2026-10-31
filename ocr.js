@@ -197,7 +197,7 @@ function start() {
 /**
  * 识别一张本机图片上的文字。只给路径就整图识别；给 `crop` 只识别那一块，给 `max` 先缩到长边上限。
  * @param {string} path - 图片绝对路径（PNG/JPEG）。
- * @param {{ crop?: [number, number, number, number], max?: number }} [options] - `crop` 是原图像素、左上角原点；`max` 是处理图长边上限。
+ * @param {{ crop?: [number, number, number, number], max?: number, level?: 'accurate'|'fast' }} [options] - `crop` 是原图像素、左上角原点；`max` 是处理图长边上限；`level` 给 `fast` 用快速档（只适合裁小后的区域）。
  * @returns {Promise<{blocks: Array<{text: string, conf: number, x: number, y: number, w: number, h: number}>, width: number, height: number, srcWidth: number, srcHeight: number, crop: {x: number, y: number, w: number, h: number}|null, ms: number|null}>}
  *   `x/y/w/h` 是归一化坐标，原点在**左下角**（Vision 的习惯），对应 `width x height` 的处理图。
  */
@@ -212,6 +212,7 @@ export async function ocrImage(path, options = {}) {
   const payload = { id, path }
   if (Array.isArray(options.crop) && options.crop.length === 4) payload.crop = options.crop.map((v) => Math.round(Number(v) || 0))
   if (Number(options.max) > 0) payload.max = Math.round(Number(options.max))
+  if (options.level === 'fast') payload.level = 'fast'
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(id)
