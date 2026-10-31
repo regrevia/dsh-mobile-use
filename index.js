@@ -547,7 +547,7 @@ function validateSteps(steps) {
       continue
     }
     if (used.length > 1) {
-      problems.push(`第 ${at} 步同时给了 ${used.slice(0, 3).join(' 和 ')}：一步只做一个动作。`)
+      problems.push(`第 ${at} 步同时给了 ${used.slice(0, 3).join(' 和 ')}：一步只做一个动作，改成只留 {"${used[0]}": …}。`)
     }
     if (step.long !== undefined && !['tap', 'id', 'ref', 'xpath'].includes(used[0] ?? '')) {
       problems.push(`第 ${at} 步 long 只能配 tap / id / ref / xpath 用。`)
@@ -2841,6 +2841,27 @@ function spotList(nodes) {
 }
 
 /**
+ * 歧义命中时给「该用几号」的清单：光报坐标，agent 还得自己数哪个是列表项。
+ * 可点的排前面、同一点上文字多的排前面，并带上角色/文字/id，让 index 可以直接填。
+ * @param {Array<any>} nodes - collapseSameSpot 之后的候选。
+ * @returns {string} 形如 `\n  0 Text「WLAN」#wifi @270,1295（可点）`；没有候选返回空串。
+ */
+function spotCandidates(nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) return ''
+  const score = (node) => (node.clickable === true ? 2 : 0) + (String(node.text ?? '').trim() !== '' ? 1 : 0)
+  const ordered = nodes.map((node, i) => ({ node, i })).sort((a, b) => score(b.node) - score(a.node) || a.i - b.i)
+  const lines = ordered.slice(0, 5).map(({ node, i }) => {
+    const label = String(node.text ?? '').trim() || String(node.desc ?? '').trim()
+    const id = String(node.id ?? '') === '' ? '' : `#${shortId(String(node.id))}`
+    const x = Math.round((node.x1 + node.x2) / 2)
+    const y = Math.round((node.y1 + node.y2) / 2)
+    return `\n  index:${i} ${shortClass(String(node.cls ?? ''))}${label === '' ? '' : `「${oneLine(label, 24)}」`}${id} @${x},${y}${node.clickable === true ? '（可点）' : ''}`
+  })
+  const more = ordered.length > lines.length ? `\n  …还有 ${ordered.length - lines.length} 个` : ''
+  return lines.join('') + more
+}
+
+/**
  * 把 within_ref / within_rect 解析成一个矩形框（x, y, w, h）。
  * 两种写法共用一个实现，免得「按 ref 限定范围」在不同工具里语义不一致。
  * @param {any} state - 一次 dump 的状态（需要 refs）。
@@ -3014,7 +3035,7 @@ function nodeForSelector(serial, want) {
   }
   if (want.index !== undefined && want.index !== null && want.index !== '') return hits[0]
   const places = collapseSameSpot(hits)
-  if (places.length > 1) throw new Error(`ambiguous_target：匹配到 ${places.length} 个控件${spotList(places)}，加 index 挑一个、用 ref，或直接 point 点其中一处。`)
+  if (places.length > 1) throw new Error(`ambiguous_target：匹配到 ${places.length} 个控件${spotList(places)}，按下面编号加 index 挑一个（从 0 开始），或给 ref / point：${spotCandidates(places)}`)
   return places[0]
 }
 
@@ -3626,9 +3647,12 @@ function failureSuffix(info) {
   if (/截图 \//.test(message)) return message
   const where = [info?.activity ? `当前页面 ${info.activity}` : '', info?.digest ? `屏上 ${info.digest}` : ''].filter(Boolean).join(' · ')
   const shotNote = info?.shotPath ? `截图 ${info.shotPath}` : ''
-  const hint = info?.hint ? String(info.hint) : (/(没有|越界|ambiguous_target|核对失败)/.test(message)
-    ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
-    : '')
+  /* 歧义已经自带「按编号挑一个」的清单，再补一句「目标不在当前界面」就是把人往错的路上带。 */
+  const hint = info?.hint ? String(info.hint) : (/ambiguous_target/.test(message)
+    ? ''
+    : (/(没有|越界|核对失败)/.test(message)
+      ? '目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。'
+      : ''))
   return [message, where, shotNote, hint].filter(Boolean).join(' · ')
 }
 
@@ -8065,6 +8089,7 @@ export const __internals = {
   compactTree,
   crashHint,
   crashLineAgeMs,
+  spotCandidates,
   dezero,
   pollGap,
   shortId,

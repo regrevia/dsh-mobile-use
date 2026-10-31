@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, spotCandidates, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -129,6 +129,17 @@ it('spotList 给可点坐标，多了说等几处', () => {
   assert.match(twice, /@50,20/)
   assert.match(twice, /@50,120/)
   assert.match(spotList([1, 2, 3, 4, 5].map((i) => node('x', 0, i * 100))), /等 5 处/)
+})
+
+it('spotCandidates：歧义时候选按可点优先，直接给出 index 编号', () => {
+  assert.equal(spotCandidates([]), '')
+  const plain = node('设置', 0, 0)
+  const clickable = node('设置', 0, 0, { clickable: true, id: 'com.android.settings:id/title', cls: 'android.widget.TextView' })
+  const out = spotCandidates([plain, clickable])
+  assert.match(out, /index:1 Text「设置」#title/)
+  assert.match(out, /（可点）/)
+  // 可点的那条排在第一（编号仍是它在入参里的位置 1）
+  assert.ok(out.indexOf('index:1') < out.indexOf('index:0'), out)
 })
 
 it('横屏/分屏按当前显示尺寸算滑点，不拿物理竖屏尺寸', () => {
@@ -512,6 +523,8 @@ it('失败现场：一句话带页面、屏上内容、截图，已有的不重�
     failureSuffix({ message: '没有目标', activity: 'com.a/.Main', shotPath: '/tmp/x.jpg' }),
     '没有目标 · 当前页面 com.a/.Main · 截图 /tmp/x.jpg · 目标不在当前界面：用 adb_find 搜一下看现在有什么，或 adb_ui 看整屏再重试。',
   )
+  const amb = failureSuffix({ message: 'ambiguous_target：匹配到 3 个控件', activity: 'com.a/.Main' })
+  assert.equal(amb, 'ambiguous_target：匹配到 3 个控件 · 当前页面 com.a/.Main', '歧义不再补「目标不在当前界面」')
   const already = '超时，截图 /tmp/a.jpg'
   assert.equal(failureSuffix({ message: already, activity: 'com.a/.Main' }), already, '已带现场就不重复拼')
 })
