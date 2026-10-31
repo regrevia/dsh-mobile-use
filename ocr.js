@@ -154,11 +154,23 @@ function start() {
           }
           continue
         }
-        const entry = pending.get(message.path)
+        /* 按请求号回话：同一张图的并发请求不会互相顶掉（老格式只有 path，兜底用 path）。 */
+        const key = message.id === undefined || message.id === null ? message.path : message.id
+        const entry = pending.get(key)
         if (!entry) continue
-        pending.delete(message.path)
+        pending.delete(key)
         if (message.error) entry.reject(new Error(message.error))
-        else entry.resolve({ blocks: message.blocks ?? [], width: message.w, height: message.h })
+        else {
+          entry.resolve({
+            blocks: message.blocks ?? [],
+            width: message.w,
+            height: message.h,
+            srcWidth: message.ow ?? message.w,
+            srcHeight: message.oh ?? message.h,
+            crop: message.crop ?? null,
+            ms: message.ms ?? null,
+          })
+        }
       }
     })
     child.stderr.setEncoding('utf8')
@@ -183,24 +195,29 @@ function start() {
 }
 
 /**
- * 识别一张本机图片上的文字。
+ * 识别一张本机图片上的文字。只给路径就整图识别；给 `crop` 只识别那一块，给 `max` 先缩到长边上限。
  * @param {string} path - 图片绝对路径（PNG/JPEG）。
- * @returns {Promise<{blocks: Array<{text: string, conf: number, x: number, y: number, w: number, h: number}>, width: number, height: number}>}
- *   `x/y/w/h` 是归一化坐标，原点在**左下角**（Vision 的习惯）。
+ * @param {{ crop?: [number, number, number, number], max?: number }} [options] - `crop` 是原图像素、左上角原点；`max` 是处理图长边上限。
+ * @returns {Promise<{blocks: Array<{text: string, conf: number, x: number, y: number, w: number, h: number}>, width: number, height: number, srcWidth: number, srcHeight: number, crop: {x: number, y: number, w: number, h: number}|null, ms: number|null}>}
+ *   `x/y/w/h` 是归一化坐标，原点在**左下角**（Vision 的习惯），对应 `width x height` 的处理图。
  */
-export async function ocrImage(path) {
+export async function ocrImage(path, options = {}) {
   /* 启动和识别共用一个 deadline：启动慢了，识别就少等，整体最多 CALL_TIMEOUT_MS。 */
   const deadline = Date.now() + CALL_TIMEOUT_MS
   await start()
   armIdle()
   const left = deadline - Date.now()
   if (left <= 0) throw new Error('OCR 超时')
+  const id = ++seq
+  const payload = { id, path }
+  if (Array.isArray(options.crop) && options.crop.length === 4) payload.crop = options.crop.map((v) => Math.round(Number(v) || 0))
+  if (Number(options.max) > 0) payload.max = Math.round(Number(options.max))
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      pending.delete(path)
+      pending.delete(id)
       reject(new Error('OCR 超时'))
     }, left)
-    pending.set(path, {
+    pending.set(id, {
       resolve: (result) => {
         clearTimeout(timer)
         resolve(result)
@@ -212,15 +229,15 @@ export async function ocrImage(path) {
     })
     /* worker 可能在 start() resolve 之后、这里之前就退了：写不进去就明确失败，别抛同步异常。 */
     if (worker === null) {
-      pending.delete(path)
+      pending.delete(id)
       clearTimeout(timer)
       reject(new Error('OCR 进程已退出'))
       return
     }
     try {
-      worker.stdin.write(`${path}\n`)
+      worker.stdin.write(`${JSON.stringify(payload)}\n`)
     } catch (error) {
-      pending.delete(path)
+      pending.delete(id)
       clearTimeout(timer)
       reject(error instanceof Error ? error : new Error(String(error)))
     }
@@ -250,6 +267,48 @@ export function toRects(blocks, width, height) {
     const y2 = Math.round((1 - block.y) * height)
     if (x2 - x1 < 6 || y2 - y1 < 6) continue
     rects.push({ text: block.text, conf: block.conf, x1, y1, x2, y2 })
+  }
+  return rects
+}
+
+/**
+ * 把识别结果换算成设备像素矩形，自动处理裁剪与缩放：先回到原图像素，再按原图与设备的比例缩放。
+ * @param {Array} blocks - `ocrImage` 返回的 `blocks`。
+ * @param {object} result - `ocrImage` 的整个返回值（要用其中的 crop/srcWidth/srcHeight）。
+ * @param {number} deviceWidth - 设备宽（屏幕像素）。
+ * @param {number} deviceHeight - 设备高。
+ * @returns {Array<{text: string, conf: number, x1: number, y1: number, x2: number, y2: number, cx: number, cy: number}>}
+ */
+export function toDeviceRects(blocks, result, deviceWidth, deviceHeight) {
+  const crop = result?.crop ?? null
+  const srcWidth = result?.srcWidth || result?.width || deviceWidth
+  const srcHeight = result?.srcHeight || result?.height || deviceHeight
+  const ox = crop ? crop.x : 0
+  const oy = crop ? crop.y : 0
+  const cw = crop ? crop.w : srcWidth
+  const ch = crop ? crop.h : srcHeight
+  const scaleX = srcWidth > 0 ? deviceWidth / srcWidth : 1
+  const scaleY = srcHeight > 0 ? deviceHeight / srcHeight : 1
+  const rects = []
+  for (const block of blocks ?? []) {
+    if (!block.text || block.conf < 0.3) continue
+    const x1 = Math.round((ox + block.x * cw) * scaleX)
+    const x2 = Math.round((ox + (block.x + block.w) * cw) * scaleX)
+    const y1 = Math.round((oy + (1 - block.y - block.h) * ch) * scaleY)
+    const y2 = Math.round((oy + (1 - block.y) * ch) * scaleY)
+    if (x2 - x1 < 6 || y2 - y1 < 6) continue
+    /* 屏幕外的垃圾结果直接丢，免得 agent 点空。 */
+    if (x2 < 0 || y2 < 0 || x1 > deviceWidth || y1 > deviceHeight) continue
+    rects.push({
+      text: block.text,
+      conf: block.conf,
+      x1: Math.max(0, x1),
+      y1: Math.max(0, y1),
+      x2: Math.min(deviceWidth, x2),
+      y2: Math.min(deviceHeight, y2),
+      cx: Math.round((Math.max(0, x1) + Math.min(deviceWidth, x2)) / 2),
+      cy: Math.round((Math.max(0, y1) + Math.min(deviceHeight, y2)) / 2),
+    })
   }
   return rects
 }

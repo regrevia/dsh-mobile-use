@@ -40,6 +40,7 @@
     "README.md",
     "selftest.mjs",
     "ocr.js",
+    "look.js",
     "ocr_worker.py",
     ".env.example",
     "THIRD_PARTY_NOTICES.md",

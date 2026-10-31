@@ -24,7 +24,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=225'
-import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=117'
+
+/** 工具层内部自检用：镜像实例在 apply 之后才有。 */
+let mirrorRef = null
+import { ocrAvailable, ocrImage, stopOcr, toDeviceRects } from './ocr.js?v=118'
+import { diffGrid, gridArt, regionsOf, sampleGrid, trimBars } from './look.js?v=3'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
 export const name = 'adb'
@@ -64,14 +68,27 @@ let shellBufBytes = 0
  */
 function pickAdb() {
   if (process.env.ADB) return process.env.ADB
-  const candidates = [
+  const win = process.platform === 'win32'
+  const exe = win ? 'adb.exe' : 'adb'
+  const candidates = []
+  /* Windows：SDK 一般在 %LOCALAPPDATA%\Android\Sdk，也认 ANDROID_HOME / ANDROID_SDK_ROOT。 */
+  if (win) {
+    const local = process.env.LOCALAPPDATA
+    if (local) candidates.push(join(local, 'Android', 'Sdk', 'platform-tools', 'adb.exe'))
+    if (process.env.USERPROFILE) candidates.push(join(process.env.USERPROFILE, 'AppData', 'Local', 'Android', 'Sdk', 'platform-tools', 'adb.exe'))
+  }
+  /* 环境变量显式指定 SDK 的机器：各平台都认这两个变量。 */
+  for (const root of [process.env.ANDROID_SDK_ROOT, process.env.ANDROID_HOME]) {
+    if (root) candidates.push(join(root, 'platform-tools', exe))
+  }
+  candidates.push(
     '/opt/homebrew/bin/adb',
     '/usr/local/bin/adb',
     join(homedir(), 'Library/Android/sdk/platform-tools/adb'),
     join(homedir(), 'Android/Sdk/platform-tools/adb'),
-  ]
+  )
   for (const candidate of candidates) if (existsSync(candidate)) return candidate
-  return 'adb'
+  return exe
 }
 
 const ADB = pickAdb()
@@ -1869,6 +1886,8 @@ async function foregroundActivity(serial) {
  * @type {Map<string, {snapshotId: string, serial: string, activity: string, at: number, refs: Array<{ref: number, node: any}>, nodes: any[], signature: string}>}
  */
 const lastTrees = new Map()
+/* 上一轮这台的文本树是不是稀疏（自绘 / 游戏 / 相机）：稀疏就下一轮边 dump 边先抓截图，省掉串行等待。 */
+const lastSparseTrees = new Map()
 
 /** 快照序号：只增不减，和时间戳一起组成快照编号。 */
 let snapshotSeq = 0
@@ -2095,21 +2114,33 @@ const PNG_SIG_OCR = Buffer.from([0x89, 0x50, 0x4e, 0x47])
 const JPEG_SIG_OCR = Buffer.from([0xff, 0xd8, 0xff])
 const OCR_REMOTE = '/data/local/tmp/dsh-mobile-use-ocr.jpg'
 
+/* OCR 的图片长边上限：整图 2136x3200 暖机后 162ms 就能接受，缩到 1600 反而更慢（多一次重绘）还丢块，默认不缩。 */
+const OCR_DEFAULT_MAX = 0
+/* 直播帧要够大才敢喂 OCR：960 宽那档会把中文认成别的字（实测 `独角兽`→`独角售`）。 */
+const OCR_LIVE_MIN_WIDTH = 1300
+
 /**
- * 拿一张给 OCR 用的截图：设备端编 JPEG 再 cat 回来，比 `exec-out screencap -p` 快一个量级
- * （3200x2136 PNG 要 8.5MB / 3s，JPEG 3.5MB / 0.36s）。
+ * 拿一张给 OCR 用的截图：`exec-out screencap -j` 一次调用直达，设备端编 JPEG 直接吐回宿主
+ * （3.9MB / 实测 0.63s），比「设备端写文件 + 再 cat 回来」少一次往返和一次拉取。
  * @param {string} serial - 设备序列号。
  * @returns {Promise<Buffer|null>} 图片字节；失败返回 null。
  */
 async function ocrCapture(serial) {
   try {
-    const shot = await adb(['-s', serial, 'shell', 'screencap', '-j', OCR_REMOTE], { timeout: 10_000 })
-    if (shot?.code !== 0) return null
+    const shot = await adb(['-s', serial, 'exec-out', 'screencap', '-j'], { timeout: 12_000 })
+    const raw = shot?.raw
+    if (Buffer.isBuffer(raw) && raw.length > 2000) {
+      const at = raw.indexOf(JPEG_SIG_OCR)
+      if (at >= 0) return raw.subarray(at)
+    }
+    /* 老系统不认 `-j`：退回设备端写文件再 cat 回来。 */
+    const wrote = await adb(['-s', serial, 'shell', 'screencap', '-j', OCR_REMOTE], { timeout: 10_000 })
+    if (wrote?.code !== 0) return null
     const pulled = await adb(['-s', serial, 'exec-out', 'cat', OCR_REMOTE], { timeout: 15_000 })
-    const raw = pulled?.raw
-    if (!Buffer.isBuffer(raw) || raw.length < 2000) return null
-    const at = raw.indexOf(JPEG_SIG_OCR)
-    return at < 0 ? null : raw.subarray(at)
+    const raw2 = pulled?.raw
+    if (!Buffer.isBuffer(raw2) || raw2.length < 2000) return null
+    const at2 = raw2.indexOf(JPEG_SIG_OCR)
+    return at2 < 0 ? null : raw2.subarray(at2)
   } catch {
     return null
   }
@@ -2118,36 +2149,142 @@ async function ocrCapture(serial) {
 /**
  * 文本树稀疏时用本机 Vision OCR 补一批可点候选。
  * @param {string} serial - 设备序列号。
- * @returns {Promise<{nodes: Array<object>, ms: number, note: string}>} 追加的节点。
+ * @param {{ image?: Buffer, region?: {x: number, y: number, w: number, h: number}, max?: number, capture?: Promise<Buffer|null> }} [options]
+ *   `image` 是现成的截图字节（例如侧栏直播的最新帧）；`region` 只识别这块（设备像素）；`max` 处理图长边上限。
+ * @returns {Promise<{nodes: Array<object>, rects: Array<object>, ms: number, note: string, path: string}>} 追加的节点。
  */
-async function ocrNodes(serial) {
+/** OCR 结果缓存：同一块区域、同一张图（字节哈希相同）就不必再认一次。
+ *  典型场景是「点了一下再看」而屏没变，一次 1000ms 的读屏直接省成几毫秒。
+ *  只留 24 条、30 秒过期；命中与否都要过哈希校验，不会把旧屏的文字当成新屏的。 */
+const OCR_CACHE = new Map()
+const OCR_CACHE_MAX = 24
+const OCR_CACHE_TTL = 30_000
+
+function ocrImageHash(image) {
+  try {
+    return createHash('sha1').update(image).digest('hex')
+  } catch {
+    return ''
+  }
+}
+
+/** 截图落盘的临时文件会一直堆着：每分钟清一次超过 10 分钟的，别把 /tmp 塞满。 */
+let lastOcrPrune = 0
+async function pruneOcrTemp() {
+  const now = Date.now()
+  if (now - lastOcrPrune < 60_000) return
+  lastOcrPrune = now
+  try {
+    const dir = tmpdir()
+    const names = await readdir(dir)
+    let seen = 0
+    for (const entry of names) {
+      if (!entry.startsWith('dsh-mobile-use-ocr-')) continue
+      seen += 1
+      if (seen > 400) break
+      const at = Number(entry.replace('dsh-mobile-use-ocr-', '').split('.')[0])
+      if (!Number.isFinite(at) || now - at < 600_000) continue
+      await rm(join(dir, entry), { force: true }).catch(() => {})
+    }
+  } catch {
+    /* 清理失败不影响读屏 */
+  }
+}
+
+async function ocrNodes(serial, options = {}) {
   const began = Date.now()
-  if (!ocrAvailable()) return { nodes: [], ms: 0, note: '本机没有 OCR' }
-  let image = await ocrCapture(serial)
+  if (!ocrAvailable()) return { nodes: [], rects: [], ms: 0, note: '本机没有 OCR', path: '' }
+  let image = Buffer.isBuffer(options.image) ? options.image : null
+  if (image !== null) {
+    /* 直播帧是缩过的：太小就认不准，宁可回头抓一张原图。 */
+    /* 竖屏帧的短边才是宽度：按长边判「够不够认字」，实测 876x1400 能认到 19/22 段。 */
+    const dims = jpegSize(image)
+    if (dims === null || Math.max(dims.w, dims.h) < OCR_LIVE_MIN_WIDTH) image = null
+  }
+  const reuse = image !== null
+  const captureBegan = Date.now()
+  if (image === null) image = await ocrCapture(serial)
+  /* 复用上游预抓的图时，像样的耗时是那一侧花掉的，不是这里的 0。 */
+  const captureMs = image === null ? 0 : reuse ? Math.max(0, Math.round(Number(options.captureMs ?? 0))) : Date.now() - captureBegan
   let ext = 'jpg'
   if (!image) {
     /* JPEG 路不通（老系统没有 `screencap -j`）再退回 PNG。 */
     const shot = await adb(['-s', serial, 'exec-out', 'screencap', '-p'], { timeout: 20_000 }).catch(() => null)
     const raw = shot?.raw
-    if (!Buffer.isBuffer(raw) || raw.length < 1000) return { nodes: [], ms: 0, note: '截图失败' }
+    if (!Buffer.isBuffer(raw) || raw.length < 1000) return { nodes: [], rects: [], ms: Date.now() - began, note: '截图失败', path: '' }
     const at = raw.indexOf(PNG_SIG_OCR)
-    if (at < 0) return { nodes: [], ms: 0, note: '截图不是图片' }
+    if (at < 0) return { nodes: [], rects: [], ms: Date.now() - began, note: '截图不是图片', path: '' }
     image = raw.subarray(at)
     ext = 'png'
   }
+  const dims = ext === 'png'
+    ? (image.length > 24 && image.toString('latin1', 1, 4) === 'PNG' ? { w: image.readUInt32BE(16), h: image.readUInt32BE(20) } : null)
+    : jpegSize(image)
   const path = join(tmpdir(), `dsh-mobile-use-ocr-${Date.now()}.${ext}`)
   await writeFile(path, image).catch(() => {})
-  let rects
-  try {
-    const recognized = await ocrImage(path)
-    const blocks = Array.isArray(recognized) ? recognized : recognized.blocks
-    const width = recognized.width ?? (ext === 'png' ? image.readUInt32BE(16) : 0)
-    const height = recognized.height ?? (ext === 'png' ? image.readUInt32BE(20) : 0)
-    if (!width || !height) throw new Error('拿不到图片尺寸')
-    rects = toRects(blocks, width, height)
-  } catch (error) {
-    return { nodes: [], ms: Date.now() - began, note: `OCR 失败：${oneLine(error.message, 60)}` }
+  /* 只识别 region 那块：Vision 的耗时基本跟着像素量走，裁一块 2136x400 从 162ms 降到 ~80ms。 */
+  let crop = null
+  if (dims !== null && options.region !== undefined && options.region !== null) {
+    const region = options.region
+    const x = Math.max(0, Math.min(Math.round(region.x), dims.w - 2))
+    const y = Math.max(0, Math.min(Math.round(region.y), dims.h - 2))
+    const w = Math.max(2, Math.min(Math.round(region.w), dims.w - x))
+    const h = Math.max(2, Math.min(Math.round(region.h), dims.h - y))
+    crop = [x, y, w, h]
   }
+  const recognizeBegan = Date.now()
+  /* 字节哈希相同 = 同一张图：直接复用上次的识别结果，连 Vision 都不用起。 */
+  const imageHash = options.cache === false ? '' : ocrImageHash(image)
+  const cacheKey = imageHash === '' ? '' : `${imageHash}:${crop === null ? '' : crop.join(',')}:${options.max ?? OCR_DEFAULT_MAX}`
+  if (cacheKey !== '') {
+    const hit = OCR_CACHE.get(cacheKey)
+    if (hit !== undefined && Date.now() - hit.at < OCR_CACHE_TTL) {
+      const nodes = hit.rects.map((rect, index) => ({
+        index,
+        parent: -1,
+        depth: 1,
+        text: rect.text,
+        id: '',
+        cls: 'ocr',
+        desc: '',
+        clickable: true,
+        longClickable: false,
+        scrollable: false,
+        enabled: true,
+        checked: false,
+        selected: false,
+        focused: false,
+        x1: rect.x1,
+        y1: rect.y1,
+        x2: rect.x2,
+        y2: rect.y2,
+      }))
+      const scope = crop === null ? '' : ` · 只认区域 ${crop[0]},${crop[1]},${crop[2]},${crop[3]}`
+      const age = Date.now() - hit.at
+      return {
+        nodes,
+        rects: hit.rects,
+        ms: Date.now() - began,
+        note: `${nodes.length} 段文字 · 屏未变，复用 ${age}ms 前的结果 · 截图 ${captureMs}ms · 识别 0ms${scope}`,
+        path,
+        captureMs,
+        recognizeMs: 0,
+        cached: true,
+      }
+    }
+    if (hit !== undefined) OCR_CACHE.delete(cacheKey)
+  }
+  let rects = []
+  let recognized = null
+  try {
+    recognized = await ocrImage(path, { crop, max: options.max ?? OCR_DEFAULT_MAX })
+    const width = dims?.w ?? recognized.srcWidth
+    const height = dims?.h ?? recognized.srcHeight
+    rects = toDeviceRects(recognized.blocks ?? [], recognized, width, height)
+  } catch (error) {
+    return { nodes: [], rects: [], ms: Date.now() - began, note: `OCR 失败：${oneLine(error.message, 60)}`, path }
+  }
+  const recognizeMs = Date.now() - recognizeBegan
   const nodes = rects.map((rect, index) => ({
     index,
     parent: -1,
@@ -2168,13 +2305,24 @@ async function ocrNodes(serial) {
     x2: rect.x2,
     y2: rect.y2,
   }))
-  return { nodes, ms: Date.now() - began, note: `${nodes.length} 段文字（置信度 ≥ 0.3）` }
+  const scope = crop === null ? '' : `只认区域 ${crop[0]},${crop[1]},${crop[2]},${crop[3]}`
+  const note = `${nodes.length} 段文字（置信度 ≥ 0.3）· 截图 ${captureMs}ms · 识别 ${recognizeMs}ms${scope === '' ? '' : ` · ${scope}`}`
+  if (cacheKey !== '') {
+    OCR_CACHE.set(cacheKey, { rects, at: Date.now() })
+    while (OCR_CACHE.size > OCR_CACHE_MAX) OCR_CACHE.delete(OCR_CACHE.keys().next().value)
+  }
+  pruneOcrTemp().catch(() => {})
+  return { nodes, rects, ms: Date.now() - began, note, path, captureMs, recognizeMs }
 }
 
 async function dumpState(serial, options) {
   const started = Date.now()
   const wantActivity = options.activity !== false
   const activityPromise = wantActivity ? foregroundActivity(serial) : Promise.resolve('')
+  /* 大概率要 OCR 的场景，抓图和 dump 并行跑：两次 IO 重叠，实测省掉 0.4–0.6s。 */
+  const likelyOcr = options.ocr === 'force' || (lastSparseTrees.get(serial) === true && options.ocr !== false && options.ocr !== 'off')
+  const prefetchBegan = Date.now()
+  const capturePromise = likelyOcr && ocrAvailable() ? ocrCapture(serial) : null
   let xml = ''
   let source = 'uiautomator2'
   try {
@@ -2198,7 +2346,9 @@ async function dumpState(serial, options) {
   let ocrMs = 0
   const needOcr = options.ocr === 'force' || (textNodes < 4 && options.ocr !== false && options.ocr !== 'off')
   if (needOcr) {
-    const extra = await ocrNodes(serial)
+    const prefetched = capturePromise === null ? null : await capturePromise
+    const prefetchedMs = capturePromise === null ? 0 : Date.now() - prefetchBegan
+    const extra = await ocrNodes(serial, prefetched === null ? {} : { image: prefetched, captureMs: prefetchedMs })
     ocrMs = extra.ms
     if (extra.nodes.length > 0) {
       const base = nodes.length
@@ -2207,11 +2357,16 @@ async function dumpState(serial, options) {
         nodes.push(node)
       }
       source = `${source}+ocr`
+      const split = `截图 ${extra.captureMs ?? 0}ms + 识别 ${extra.recognizeMs ?? 0}ms`
       ocrNote = options.ocr === 'force'
-        ? ` · 按要求用本机 OCR 补 ${extra.nodes.length} 段文字（${ocrMs}ms）`
-        : ` · 文本树只有 ${textNodes} 个控件，已用本机 OCR 补 ${extra.nodes.length} 段文字（${ocrMs}ms）`
+        ? ` · 按要求用本机 OCR 补 ${extra.nodes.length} 段文字（${split}）`
+        : ` · 文本树只有 ${textNodes} 个控件，已用本机 OCR 补 ${extra.nodes.length} 段文字（${split}）`
     }
+  } else if (capturePromise !== null) {
+    /* 预抓的截图这次没用上：把结果吞掉，别留未处理的拒绝。 */
+    capturePromise.catch(() => {})
   }
+  lastSparseTrees.set(serial, textNodes < 4)
   const tree = compactTree(nodes, options)
   const signature = tree.lines.join('\n')
   const previous = lastTrees.get(serial)
@@ -3455,7 +3610,7 @@ async function screenshot(serial, options) {
   }
   const dir = join(tmpdir(), 'dsh-mobile-use')
   await mkdir(dir, { recursive: true })
-  const path = options.path || join(dir, `screen-${serial}-${Date.now()}.${jpeg ? 'jpg' : 'png'}`)
+  let path = options.path || join(dir, `screen-${serial}-${Date.now()}.${jpeg ? 'jpg' : 'png'}`)
   await writeFile(path, buffer)
   const scale = options.scale ?? 900
   /* 尺寸一律从磁盘上的文件头读：sips 缩过之后 buffer 已经不代表文件内容。 */
@@ -3472,8 +3627,30 @@ async function screenshot(serial, options) {
   }
   let size = await dimsOf()
   if (scale > 0 && Math.max(size.w, size.h) > scale) {
+    /* macOS 用 sips；Windows / Linux 没有 sips 时退到 ffmpeg，两个都没有就保留原图（只是大一点，不算失败）。 */
     await new Promise((resolve) => execFile('sips', ['-Z', String(scale), path], () => resolve(undefined)))
     size = await dimsOf()
+    if (Math.max(size.w, size.h) > scale) {
+      const longEdge = size.w >= size.h ? `w=${scale}` : `h=${scale}`
+      const target = path.replace(/\.(png|jpg|jpeg)$/i, '-scaled.$1')
+      await new Promise((resolve) => execFile(process.env.FFMPEG ?? 'ffmpeg', ['-y', '-loglevel', 'error', '-i', path, '-vf', `scale=${longEdge}`, target], () => resolve(undefined)))
+      const shrunk = await stat(target).then((value) => value.size).catch(() => 0)
+      if (shrunk > 0) size = (await (async () => {
+        const handle = await open(target, 'r')
+        try {
+          const head = Buffer.alloc(4096)
+          const { bytesRead } = await handle.read(head, 0, head.length, 0)
+          const probe = jpeg ? jpegSize(head.subarray(0, bytesRead)) : { w: head.readUInt32BE(16), h: head.readUInt32BE(20) }
+          return probe ?? { w: 0, h: 0 }
+        } finally {
+          await handle.close()
+        }
+      })())
+      if (shrunk > 0) {
+        await rm(path, { force: true }).catch(() => {})
+        path = target
+      }
+    }
   }
   const bytes = await stat(path).then((value) => value.size).catch(() => buffer.length)
   return {
@@ -3859,6 +4036,7 @@ export function apply(ctx, config) {
     },
     typeText: typeViaClipboard,
   })
+  mirrorRef = mirror
   ctx.effect(() => () => {
     clearInterval(actionSaver)
     void saveActions()
@@ -6897,6 +7075,337 @@ ctx.effect(() => ctx.tools.register({
   }), 'adb: adb_shot')
 
   ctx.effect(() => ctx.tools.register({
+    name: 'adb_ocr',
+    description: '直接读屏上的文字，不花图片 token：给 ref 或 region 就只读那一块，一般 0.15–0.8s 回一批带坐标的文字。自绘界面、游戏、相机预览这类文本树空空如也的页面用它；能读文本树时优先 adb_ui。返回的坐标可以直接给 adb_tap point=\"x,y\"。',
+    parameters: {
+      type: 'object',
+      properties: {
+        region: { type: 'string', description: '只读这块区域，格式 "x,y,w,h"（设备像素，左上角原点）。整屏识别约 0.8s，裁一块常能压到 0.2s' },
+        ref: { type: 'integer', description: '只读这个 ref 的控件（用最近一次 adb_ui 给的编号）' },
+        snapshot_id: { type: 'string', description: '可选：校验快照还是不是那次，对不上直接报错' },
+        max: { type: 'integer', description: '处理图长边上限，默认不缩。缩到 1600 更快但可能丢小字，文字识不全时去掉它' },
+        fresh: { type: 'boolean', description: 'true 时强制重新抓屏，不复用侧栏直播的最新帧' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          texts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                text: { type: 'string' },
+                conf: { type: 'number' },
+                x: { type: 'integer' },
+                y: { type: 'integer' },
+                x1: { type: 'integer' },
+                y1: { type: 'integer' },
+                x2: { type: 'integer' },
+                y2: { type: 'integer' },
+              },
+              required: ['text', 'conf', 'x', 'y', 'x1', 'y1', 'x2', 'y2'],
+              additionalProperties: false,
+            },
+          },
+          note: { type: 'string' },
+          path: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'texts', 'note', 'path', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.texts.length === 0
+        ? `没读到文字（${value.elapsed_ms}ms）：${value.note}`
+        : `${value.texts.length} 段文字（${value.elapsed_ms}ms，截图 ${value.path}）：\n${value.texts.map((item) => `「${item.text}」 @${item.x},${item.y}`).join('\n')}`),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      let region = parseRegion(args.region)
+      if (args.ref !== undefined) region = elementRegion(nodeForRef(device, args.ref, args.snapshot_id), 8)
+      /* 侧栏没在看也能拿帧：没人看就用「按需推流」的同步取帧（第一次点火，之后 0ms）。 */
+      const live = args.fresh === true || region !== null
+        ? null
+        : (mirror.liveFrame(device) ?? mirror.visionFrameNow(device))
+      const extra = await ocrNodes(device, {
+        image: live === null ? undefined : live.frame,
+        captureMs: live === null ? 0 : Math.max(0, Date.now() - Number(live.at)),
+        region: region === null ? undefined : region,
+        max: args.max,
+      })
+      const texts = extra.rects.map((rect) => ({
+        text: rect.text,
+        conf: rect.conf,
+        x: rect.cx,
+        y: rect.cy,
+        x1: rect.x1,
+        y1: rect.y1,
+        x2: rect.x2,
+        y2: rect.y2,
+      }))
+      return {
+        ok: texts.length > 0,
+        texts,
+        note: extra.note,
+        path: extra.path,
+        elapsed_ms: Date.now() - began,
+      }
+    },
+  }), 'adb: adb_ocr')
+
+  /**
+   * 「看」的文本化：一次截图 → 颜色网格 + 同色块区域 + 与上一次的差异。
+   *
+   * canvas、游戏、相机预览这类页面控件树是空壳（PvZ 游戏内 99 个节点 0 段文字），
+   * 而把整张图交给视觉模型，一帧就要几百毫秒到几秒、还吃图片 token。这里给的是
+   * 另一条路：12×24 的格子里每格一个字母，模型看几行字就知道「红的一片在左下」，
+   * 块的 bbox 是设备像素，可以直接拿去点。成本 = 截图（能用直播帧就 0）+ 抽色 40ms。
+   */
+  const lookCache = new Map()
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_look',
+    description: '不看图也能看清画面：把屏幕压成颜色网格（每格一个字母）、列出同色块的位置与占比、给出与上一次的差异。canvas/游戏/自绘界面、控件树没有文字时用它，比 adb_shot 快、不花图片 token。读文字用 adb_ocr，要控件坐标用 adb_ui。',
+    parameters: {
+      type: 'object',
+      properties: {
+        region: { type: 'string', description: '只看这块区域，格式 "x,y,w,h"（设备像素，左上角原点）。默认整屏' },
+        cols: { type: 'integer', description: '网格列数，默认 12；要看清小图标就加到 24–32（会被夹在 2–64）' },
+        rows: { type: 'integer', description: '网格行数，默认按屏幕比例算；给了就按给的值（2–96）' },
+        fresh: { type: 'boolean', description: 'true 时重新截图；默认优先复用侧栏直播的最新帧（≤1.5s），拿不到才截图' },
+        diff: { type: 'boolean', description: '默认 true：和同一区域上一次的网格比，报改了哪些格' },
+        text: { type: 'boolean', description: 'true 时顺带附上控件树里的文字（多约 0.2s），看画面同时想读字时用' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          size: {
+            type: 'object',
+            properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } },
+            required: ['x', 'y', 'w', 'h'],
+            additionalProperties: false,
+          },
+          cols: { type: 'integer' },
+          rows: { type: 'integer' },
+          grid: { type: 'array', items: { type: 'string' } },
+          legend: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                letter: { type: 'string' },
+                name: { type: 'string' },
+                hex: { type: 'string' },
+                share: { type: 'number' },
+              },
+              required: ['letter', 'name', 'hex', 'share'],
+              additionalProperties: false,
+            },
+          },
+          blocks: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                letter: { type: 'string' },
+                name: { type: 'string' },
+                share: { type: 'number' },
+                x1: { type: 'integer' },
+                y1: { type: 'integer' },
+                x2: { type: 'integer' },
+                y2: { type: 'integer' },
+                gx1: { type: 'integer' },
+                gy1: { type: 'integer' },
+                gx2: { type: 'integer' },
+                gy2: { type: 'integer' },
+              },
+              required: ['letter', 'name', 'share', 'x1', 'y1', 'x2', 'y2', 'gx1', 'gy1', 'gx2', 'gy2'],
+              additionalProperties: false,
+            },
+          },
+          diff: {
+            type: 'object',
+            properties: {
+              changedCells: { type: 'integer' },
+              share: { type: 'number' },
+              mean: { type: 'number' },
+              cells: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['changedCells', 'share', 'mean', 'cells'],
+            additionalProperties: false,
+          },
+          text: { type: 'array', items: { type: 'string' } },
+          note: { type: 'string' },
+          path: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['ok', 'size', 'cols', 'rows', 'grid', 'legend', 'blocks', 'text', 'note', 'path', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const top = value.legend.slice(0, 6).map((item) => `${item.letter}=${item.name}${item.hex}(${Math.round(item.share * 100)}%)`).join(' ')
+        const blocks = value.blocks.slice(0, 4).map((block) => `${block.letter} ${block.name} ${Math.round(block.share * 100)}% @(${block.x1},${block.y1})-(${block.x2},${block.y2})`).join('\n')
+        const diff = value.diff === undefined ? '' : `\n变了 ${value.diff.changedCells}/${value.cols * value.rows} 格（${Math.round(value.diff.share * 100)}%）${value.diff.cells.length > 0 ? `：${value.diff.cells.join(' ')}` : ''}`
+        const text = value.text.length === 0 ? '' : `\n文字：${value.text.slice(0, 20).join(' / ')}`
+        return textBlock(`${value.cols}x${value.rows} 颜色网格 · ${value.size.w}x${value.size.h} · ${value.elapsed_ms}ms · 截图 ${value.path}\n图例 ${top}\n${value.grid.join('\n')}${diff}${blocks === '' ? '' : `\n色块\n${blocks}`}${text}${value.note === '' ? '' : `\n${value.note}`}`)
+      },
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const size = await screenSize(device)
+      const cols = Math.max(2, Math.min(64, Math.round(Number(args.cols ?? 12)) || 12))
+      const parsed = parseRegion(args.region)
+      let region = parsed ?? { x: 0, y: 0, w: size.width, h: size.height }
+      let rows = Math.max(2, Math.min(96, Math.round(Number(args.rows ?? Math.round((cols * region.h) / Math.max(1, region.w))) || 24)))
+      let jpeg = null
+      let note = ''
+      let source = 'capture'
+      let captureMs = 0
+      let warmTried = 0
+      const live = args.fresh === true ? null : mirror.liveFrame(device)
+      let frameAge = -1
+      if (live !== null && Date.now() - live.at <= 1500) {
+        jpeg = live.frame
+        source = 'live'
+        frameAge = Date.now() - live.at
+      } else {
+        /* 侧栏没在看也别急着花 630ms 截图：先问推流要一帧。
+           冷启动这一次会顺手把推流拉起来（取不到帧就走截图），下一次起就是 0ms。 */
+        const warm = args.fresh === true ? null : mirror.visionFrameNow(device)
+        if (warm !== null) {
+          jpeg = warm.frame
+          source = 'warm'
+          frameAge = Date.now() - (Number(warm.at) || Date.now())
+        } else {
+          warmTried = args.fresh === true ? 0 : 1
+          const capBegan = Date.now()
+          jpeg = await ocrCapture(device)
+          captureMs = Date.now() - capBegan
+        }
+      }
+      if (!Buffer.isBuffer(jpeg) || jpeg.length === 0) {
+        return { ok: false, size: { x: region.x, y: region.y, w: region.w, h: region.h }, cols, rows, grid: [], legend: [], blocks: [], text: [], note: '截不到图：设备掉线或 screencap 被拒', path: '', elapsed_ms: Date.now() - began }
+      }
+      /* 截到的图才是「当前朝向」的坐标系，wm size 给的是自然方向。
+         竖屏板子上两者宽高正好互换，不校正的话色块坐标整体是错的（点下去偏一大截）。 */
+      const shot = jpegSize(jpeg) ?? { w: region.w, h: region.h }
+      let displayW = (shot.w > shot.h) === (size.width > size.height) ? size.width : size.height
+      let displayH = displayW === size.width ? size.height : size.width
+      if (parsed === null) {
+        region = { x: 0, y: 0, w: displayW, h: displayH }
+        rows = Math.max(2, Math.min(96, Math.round(Number(args.rows ?? Math.round((cols * region.h) / Math.max(1, region.w))) || 24)))
+      }
+      const key = `${device}:${region.x},${region.y},${region.w},${region.h}:${cols}x${rows}`
+      const before = lookCache.get(key) ?? null
+      const path = join(tmpdir(), `adbm-look-${String(device).replace(/[^\w.-]/g, '_')}-${cols}x${rows}.jpg`)
+      let grid = null
+      const colorBegan = Date.now()
+      try {
+        await writeFile(path, jpeg)
+        const scale = shot.w / Math.max(1, displayW)
+        const fullFrame = region.x === 0 && region.y === 0 && region.w === displayW && region.h === displayH
+        const crop = fullFrame
+          ? null
+          : [Math.round(region.x * scale), Math.round(region.y * scale), Math.max(2, Math.round(region.w * scale)), Math.max(2, Math.round(region.h * scale))]
+        grid = await sampleGrid(path, { cols, rows, crop })
+      } catch (error) {
+        note = `抽色失败：${error instanceof Error ? error.message : String(error)}（本机需要 ffmpeg）`
+      }
+      let text = []
+      if (args.text === true) {
+        try {
+          const state = await dumpState(device, { maxNodes: 120 })
+          text = state.nodes.filter((node) => typeof node.text === 'string' && node.text.trim() !== '').map((node) => node.text.trim()).slice(0, 80)
+        } catch {
+          text = []
+        }
+      }
+      if (grid === null) {
+        return { ok: false, size: { x: region.x, y: region.y, w: region.w, h: region.h }, cols, rows, grid: [], legend: [], blocks: [], text, note, path, elapsed_ms: Date.now() - began }
+      }
+      /* 黑边占掉的格子不参与取景，也不当成画面内容：坐标只落在内容框里。 */
+      const content = trimBars(grid) ?? { x0: 0, y0: 0, x1: cols - 1, y1: rows - 1 }
+      const contentCols = content.x1 - content.x0 + 1
+      const contentRows = content.y1 - content.y0 + 1
+      const contentCells = []
+      for (let y = content.y0; y <= content.y1; y += 1) {
+        for (let x = content.x0; x <= content.x1; x += 1) contentCells.push(grid.cells[y * cols + x])
+      }
+      /* 黑边裁掉以后内容框的横竖才是真实朝向：推流帧是竖屏画布装着横屏内容，
+         不按内容框翻过来，坐标就会落进 2136x3200 的假坐标系。 */
+      const longSide = Math.max(size.width, size.height)
+      const shortSide = Math.min(size.width, size.height)
+      const wantW = contentCols > contentRows ? longSide : shortSide
+      const wantH = contentCols > contentRows ? shortSide : longSide
+      if (wantW !== displayW || wantH !== displayH) {
+        displayW = wantW
+        displayH = wantH
+        if (parsed === null) region = { x: 0, y: 0, w: displayW, h: displayH }
+      }
+      const view = { cols: contentCols, rows: contentRows, cells: contentCells }
+      const art = gridArt(view)
+      const cellW = region.w / contentCols
+      const cellH = region.h / contentRows
+      const blocks = regionsOf(view, art.letters).map((block) => ({
+        letter: block.letter,
+        name: art.legend.find((item) => item.letter === block.letter)?.name ?? '杂',
+        share: block.share,
+        x1: Math.round(region.x + block.x1 * cellW),
+        y1: Math.round(region.y + block.y1 * cellH),
+        x2: Math.round(region.x + (block.x2 + 1) * cellW),
+        y2: Math.round(region.y + (block.y2 + 1) * cellH),
+        gx1: block.x1 + content.x0,
+        gy1: block.y1 + content.y0,
+        gx2: block.x2 + content.x0,
+        gy2: block.y2 + content.y0,
+      }))
+      let diff
+      if (args.diff !== false && before !== null) {
+        const delta = diffGrid(before, grid)
+        if (delta !== null) {
+          diff = {
+            changedCells: delta.changedCells,
+            share: delta.share,
+            mean: delta.mean,
+            cells: delta.at.slice(0, 12).map((cell) => `${cell.x},${cell.y}`),
+          }
+        }
+      }
+      lookCache.set(key, grid)
+      while (lookCache.size > 8) lookCache.delete(lookCache.keys().next().value)
+      const parts = []
+      const age = frameAge >= 0 ? `（${Math.max(0, Math.round(frameAge))}ms 前）` : ''
+      if (source === 'live') parts.push(`复用侧栏直播帧${age}，没碰设备`)
+      else if (source === 'warm') parts.push(`推流帧${age}，没碰设备`)
+      else parts.push(`截图 ${captureMs}ms${warmTried === 1 ? '（推流正在冷启动，下一次起免截图）' : ''}`)
+      parts.push(`抽色 ${Date.now() - colorBegan}ms`)
+      note = `${parts.join(' · ')}${note === '' ? '' : ` · ${note}`}`
+      return {
+        ok: true,
+        size: { x: region.x, y: region.y, w: region.w, h: region.h },
+        cols,
+        rows,
+        grid: art.rows,
+        legend: art.legend.map((item) => ({ letter: item.letter, name: item.name, hex: item.hex, share: item.share })),
+        blocks,
+        text,
+        note,
+        path,
+        elapsed_ms: Date.now() - began,
+        ...(diff === undefined ? {} : { diff }),
+      }
+    },
+  }), 'adb: adb_look')
+
+  ctx.effect(() => ctx.tools.register({
     name: 'adb_recent',
     description: '把最近几秒的画面拼成一张 3x2 序列图（本地环形录像里抽帧，不碰设备）：动画比例、位移、卡顿这类单帧看不出的问题用它。看路径用 read_image。',
     parameters: {
@@ -7077,7 +7586,7 @@ ctx.effect(() => ctx.tools.register({
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_state',
-    description: '一次调用拿到设备底层状态：前台 Activity、窗口栈（弹窗/输入法/悬浮窗都在栈里）、键盘是否弹出、方向与分辨率、亮屏、电量、是否 root。约 0.5s，判断「有没有弹窗 / 键盘挡没挡 / 跳没跳页」先用它，不要截图。',
+    description: '一次调用拿到设备底层状态：前台 Activity、窗口栈（弹窗/输入法/悬浮窗都在栈里）、键盘是否弹出、方向与分辨率、亮屏、电量、是否 root。约 0.15s，判断「有没有弹窗 / 键盘挡没挡 / 跳没跳页」先用它，不要截图。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     output: {
       schema: {
@@ -7104,18 +7613,33 @@ ctx.effect(() => ctx.tools.register({
     execute: async () => {
       const device = await serial()
       const started = Date.now()
-      const script = [
+      /* 七条 dumpsys 各自 45–73ms：串着跑 380ms，并发跑 136ms。设备有多个核，
+         所以并行跑、再按固定顺序拼回一份输出，语义不变（哪条失败就少那一段）。 */
+      const parts = [
         /* 不能用 -m2：MIUI 先输出两行 null（mCurrentFocus=null / mFocusedApp=null），
            真值在后面的 Window{...} / ActivityRecord{...} 行里，截前两条就永远读到「未知」。 */
-        'echo @F@', 'dumpsys window | grep -E "mCurrentFocus=|mFocusedApp=" | head -8',
-        'echo @W@', 'dumpsys window windows | grep -E "^  Window #" | head -12',
-        'echo @I@', 'dumpsys input_method | grep -m3 -E "mInputShown=|mShowRequested="',
-        'echo @P@', 'dumpsys power | grep -m1 -E "mWakefulness="',
-        'echo @B@', 'dumpsys battery | grep -m2 -E "level:|status:"',
-        'echo @R@', 'dumpsys display | grep -m1 -o "orientation=[0-9]"',
-        'echo @S@', 'wm size',
-      ].join('; ')
-      const r = await adb(['-s', device, 'shell', script], { timeout: 20_000, buffer: 4 << 20 })
+        ['F', 'dumpsys window | grep -E "mCurrentFocus=|mFocusedApp=" | head -8'],
+        ['W', 'dumpsys window windows | grep -E "^  Window #" | head -12'],
+        ['I', 'dumpsys input_method | grep -m3 -E "mInputShown=|mShowRequested="'],
+        ['P', 'dumpsys power | grep -m1 -E "mWakefulness="'],
+        ['B', 'dumpsys battery | grep -m2 -E "level:|status:"'],
+        ['R', 'dumpsys display | grep -m1 -o "orientation=[0-9]"'],
+        ['S', 'wm size'],
+      ]
+      const tag = `/data/local/tmp/dsh-state-${process.pid}-${Date.now().toString(36)}`
+      const runParallel = [
+        ...parts.map(([key, cmd]) => `( echo @${key}@; ${cmd}; ) > ${tag}-${key} 2>/dev/null &`),
+        'wait',
+        `cat ${parts.map(([key]) => `${tag}-${key}`).join(' ')}`,
+        `rm -f ${parts.map(([key]) => `${tag}-${key}`).join(' ')}`,
+        /* 每段自带 `&` 结尾；必须换行拼接，`& ;` 与 `& wait` 都会被 sh 当参数报错。 */
+      ].join('\n')
+      let r = await adb(['-s', device, 'shell', runParallel], { timeout: 20_000, buffer: 4 << 20 })
+      if (r.ok && !r.out.includes('@F@')) {
+        /* 并行版整段没回来（没有 /data/local/tmp 写权限、或 sh 是别的方言）：退回串行。 */
+        const serialScript = parts.map(([key, cmd]) => `echo @${key}@; ${cmd}`).join('; ')
+        r = await adb(['-s', device, 'shell', serialScript], { timeout: 20_000, buffer: 4 << 20 })
+      }
       if (!r.ok && !r.out) throw new Error(`读状态失败：${oneLine(r.err || 'adb 无输出', 200)}`)
       const sections = {}
       let current = ''
@@ -7320,6 +7844,8 @@ ctx.effect(() => ctx.tools.register({
  * 需要设备的地方（如 resolveSerial）必须显式写清它连 adb。
  */
 export const __internals = {
+  mirrorStatus: async (serial) => (mirrorRef === null ? null : mirrorRef.status(serial)),
+  visionFrame: (serial) => (mirrorRef === null ? null : mirrorRef.visionFrame(serial)),
   selectNodes,
   pinchArgs,
   recordScreen,

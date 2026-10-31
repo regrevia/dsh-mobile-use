@@ -29,7 +29,8 @@ check(packed.status === 0, 'npm pack --dry-run 能跑通', (packed.stderr || pac
 const manifest = packed.status === 0 ? JSON.parse(packed.stdout)[0] : { files: [] }
 const files = new Set(manifest.files.map((f) => f.path))
 
-for (const required of ['index.js', 'mirror.js', 'stream.js', 'ocr.js', 'ocr_worker.py', 'client.js', 'client.rev', 'page.js', 'scrcpy.js', 'tsmux.js', 'cordis.patch.yml', 'locale/zh.json', 'vendor/u2.jar', 'vendor/scrcpy-server', 'vendor/app-uiautomator.apk']) {
+for (const required of ['index.js', 'mirror.js', 'stream.js', 'ocr.js', 'ocr_worker.py',
+  'look.js', 'client.js', 'client.rev', 'page.js', 'scrcpy.js', 'tsmux.js', 'cordis.patch.yml', 'locale/zh.json', 'vendor/u2.jar', 'vendor/scrcpy-server', 'vendor/app-uiautomator.apk']) {
   check(files.has(required), `包里含 ${required}`)
 }
 

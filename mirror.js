@@ -87,6 +87,13 @@ const SEGMENT_KEEP = 18
 /** 一次注入最多带的图：PNG 原图 base64 后可能很大，超过就不注入。 */
 const MAX_INJECT_BYTES = 8 * 1024 * 1024
 
+/** 每台设备最多缓存几条推流对象：Map 不许随历史设备无界长，空闲的先回收再拒绝。 */
+const MAX_STREAMS = 8
+/** 全进程同时挂着的 /stream 长连接上限：每一条都是一个持续写的 socket。 */
+const MAX_LIVE_SUBSCRIBERS = 16
+/** /diag 上报的页面客户端表上限：pid 会换，Map 不许随历史进程无界长。 */
+const MAX_PAGE_CLIENTS = 32
+
 /** 找 ffmpeg：DSH 进程的 PATH 未必带 Homebrew。 */
 function pickFfmpeg(name = 'ffmpeg') {
   const env = name === 'ffmpeg' ? process.env.FFMPEG : process.env.FFPROBE
@@ -1135,6 +1142,9 @@ export function setupMirror(ctx, tools) {
   /** 每台设备的 H.264 推流。 @type {Map<string, LiveStream>} */
   const streams = new Map()
 
+  /** 全进程 /stream 长连接计数：超上限时在 writeHead 之前回 503，不进订阅。 */
+  let liveSubscribers = 0
+
   /* 低延迟通道：一台设备一条 scrcpy 连接，懒启动，失败就永久退回 adb。
      host 不能因为它崩：起停全在 guard 里，启动 Promise 失败也只记一个 failed。 */
   const channels = new Map()
@@ -1478,21 +1488,59 @@ export function setupMirror(ctx, tools) {
    * @returns {Mirror} 镜像。
    */
   /**
+   * 推流对象是按设备缓存的：设备历史不是无界的，超上限就先回收一条。
+   * 优先扔「没人订阅、也没人在等」的最久未活动项；都有人看就扔最久没动静的那条，
+   * 绝不因为超限抛异常（调用方多半已经在写响应了）。
+   * @returns {boolean} 是否真的回收了一条。
+   */
+  function reclaimStream() {
+    let idleKey = ''
+    let idleStamp = Infinity
+    let oldKey = ''
+    let oldStamp = Infinity
+    for (const [key, item] of streams) {
+      const stamp = Number(item?.lastAt) || 0
+      if (stamp < oldStamp) {
+        oldStamp = stamp
+        oldKey = key
+      }
+      const idle = Number(item?.clients?.size) === 0 && Number(item?.waiting?.size) === 0
+      if (idle && stamp < idleStamp) {
+        idleStamp = stamp
+        idleKey = key
+      }
+    }
+    const victimKey = idleKey !== '' ? idleKey : oldKey
+    if (victimKey === '') return false
+    const victim = streams.get(victimKey)
+    streams.delete(victimKey)
+    guard('stream-reclaim', () => {
+      victim?.stop()
+    })
+    return true
+  }
+
+  /**
    * 拿一台设备的持续推流，没有就建。和抓帧的 Mirror 并行，互不影响。
    * @param {string} serial - 序列号。
    * @returns {LiveStream} 推流。
    */
-  function streamFor(serial) {
+  function streamFor(serial, options = {}) {
     let stream = streams.get(serial)
     if (stream === undefined) {
+      /* 上限按真实对象数卡：先回收一条再建，Map 不会随设备历史长下去。 */
+      if (streams.size >= MAX_STREAMS) reclaimStream()
+      /* plain：不等 scrcpy 通道，直接上 screenrecord。后台读画面没有控制通道可等，
+         等下去会一直卡在「通道还在连」里，一帧都出不来。 */
+      const plain = options.plain === true
       stream = new LiveStream({
         serial,
         adb: tools.adb.path,
         /* 有低延迟通道就用它的 H.264：连续出帧、少一个设备编码器；没就绪退回 screenrecord。 */
-        sourceReady: () => channelFor(serial),
+        sourceReady: () => (plain ? null : channelFor(serial)),
         /* 通道还在连的时候等它一下（≤2.5s），别先起 screenrecord 再切。 */
-        sourceWait: (ms) => waitSource(serial, ms),
-        sourceState: () => channelState(serial),
+        sourceWait: plain ? null : (ms) => waitSource(serial, ms),
+        sourceState: plain ? null : () => channelState(serial),
       })
       /* 空闲回收前先问一句：镜像还有人在看（/live 常连或刚拉过帧）就别停。 */
       stream.stillWanted = () => {
@@ -2034,6 +2082,13 @@ export function setupMirror(ctx, tools) {
 
       if (path === '/stream' && req.method === 'GET') {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        /* 配额：全进程长连接有硬上限。超了直接 503，拒在 writeHead 之前，
+           这样还能正常回一个状态码（header 发出去之后就只能 destroy 了）。 */
+        if (liveSubscribers >= MAX_LIVE_SUBSCRIBERS) {
+          res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: `推流连接数已达上限 ${String(MAX_LIVE_SUBSCRIBERS)}` }))
+          return
+        }
         const stream = streamFor(serial)
         res.writeHead(200, {
           'content-type': 'application/octet-stream',
@@ -2042,12 +2097,18 @@ export function setupMirror(ctx, tools) {
           connection: 'keep-alive',
         })
         res.flushHeaders()
+        liveSubscribers += 1
+        let counted = true
         let closed = false
         /* 先占位再订阅：subscribe 可能同步补发初始化段，那时 unsubscribe 还没赋值。 */
         let unsubscribe = () => {}
         const close = () => {
           if (closed) return
           closed = true
+          if (counted) {
+            counted = false
+            liveSubscribers = Math.max(0, liveSubscribers - 1)
+          }
           try {
             unsubscribe()
           } catch {
@@ -2063,8 +2124,8 @@ export function setupMirror(ctx, tools) {
         try {
           unsubscribe = stream.subscribe((bytes) => {
             if (closed) return
-            /* 积压超过 2 MB 就断开重连：宁可重连一次，也不要让延迟越滚越大。 */
-            if (res.writableLength > 2 << 20) {
+            /* 积压超过 MAX_LIVE_QUEUE 就断开重连：宁可重连一次，也不要让延迟越滚越大。 */
+            if (res.writableLength > MAX_LIVE_QUEUE) {
               close()
               res.destroy()
               return
@@ -2381,7 +2442,23 @@ export function setupMirror(ctx, tools) {
         const body = await readJson(req)
         diag.push({ at: Date.now(), body })
         if (diag.length > 20) diag.shift()
-        if (typeof body?.pid === 'string') clients.set(body.pid, { at: Date.now(), ...body })
+        if (typeof body?.pid === 'string') {
+          clients.set(body.pid, { at: Date.now(), ...body })
+          /* pid 会随页面重载换：表按最久未上报淘汰，不会随历史进程无界长。 */
+          while (clients.size > MAX_PAGE_CLIENTS) {
+            let oldKey = ''
+            let oldStamp = Infinity
+            for (const [key, item] of clients) {
+              const stamp = Number(item?.at) || 0
+              if (stamp < oldStamp) {
+                oldStamp = stamp
+                oldKey = key
+              }
+            }
+            if (oldKey === '') break
+            clients.delete(oldKey)
+          }
+        }
         return json({ ok: true })
       }
 
@@ -2450,6 +2527,35 @@ export function setupMirror(ctx, tools) {
       if (mirror.watchers.size === 0) return null
       if (Date.now() - mirror.latestAt > 2500) return null
       return { frame: mirror.latest, at: mirror.latestAt }
+    },
+    /**
+     * 不看侧栏也要帧：给「看清画面」的读操作临时起一条推流。
+     * 第一次调用会拉起设备端 screenrecord（约 0.5–1s），之后每次取帧 ≈ 0ms；
+     * 没人再看就由推流自己的空闲回收停掉，不会常驻。
+     * @param {string} serial - 设备。
+     * @returns {{ frame: Buffer, at: number } | null} 新鲜帧或 null。
+     */
+    /* 同步版：手上有新鲜推流帧就直接给，没有就顺手把推流拉起来（不阻塞），
+       调用方这一轮走截图、下一轮起就是 0ms。 */
+    visionFrameNow(serial) {
+      if (streams.size >= MAX_STREAMS) reclaimStream()
+      const stream = streamFor(serial, { plain: true })
+      if (stream.jpegFresh()) return { frame: stream.jpeg, at: stream.jpegAt }
+      stream.start()
+      stream.enableJpeg()
+      return null
+    },
+
+    async visionFrame(serial) {
+      if (streams.size >= MAX_STREAMS) reclaimStream()
+      const stream = streamFor(serial, { plain: true })
+      if (stream.jpegFresh()) return { frame: stream.jpeg, at: stream.jpegAt }
+      /* 帧是「有人要才转」的：先开 JPEG 支路，再等它给一张，最长 1.2s。 */
+      stream.start()
+      stream.enableJpeg()
+      const frame = await stream.nextJpeg(0, 1200)
+      if (frame === null) return null
+      return { frame, at: Date.now() }
     },
     /**
      * 最近几秒的画面拼成一张 3x2 图：动效比例/位移这类问题看序列帧最快。

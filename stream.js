@@ -9,7 +9,7 @@
  * 推给浏览器的帧头部会带上类型，让前端重建 MediaSource。
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -256,6 +256,10 @@ const MAX_JPEG_QUEUE = 1024 * 1024
 
 /** GOP 缓存字节上限：超过就整段丢掉等下一张 IDR，保证新观众永远从 IDR 起播。 */
 const MAX_GOP_BYTES = 4 * 1024 * 1024
+/** 每个流最多挂多少个观众（正在看的 + 等关键帧的合计）：超出直接拒绝，Set 不许无界长。 */
+const MAX_SUBSCRIBERS = 12
+/** 每个流最多挂多少个等 JPEG 的请求：轮询页面一多就会排成无界队列。 */
+const MAX_JPEG_WAITERS = 48
 /** 排空比这还慢就认为 ffmpeg 卡死了（设备端编码器会一直吐，不能跟着等）。 */
 const REMUX_STALL_MS = 2000
 /** 本进程的随机标识：设备端 pid 文件名带上它，多开/重启不会互相认领对方的录屏。 */
@@ -291,10 +295,13 @@ export class LiveStream {
   constructor(options) {
     this.serial = options.serial
     this.adbPath = options.adb
-    /* 默认必须是竖屏比例：横屏录制出来的帧和抓帧帧比例不同，侧栏画面就会一大一小跳。 */
-    this.width = options.width ?? 720
-    this.height = options.height ?? 1280
-    this.bitrate = options.bitrate ?? 4_000_000
+    /* 尺寸不写死：第一次开录按设备真实分辨率算（长边封顶 2400，保持比例），
+       这样 OCR 能在推流帧上认字，不必再花 ~680ms 抓原图。 */
+    this.width = options.width ?? 0
+    this.height = options.height ?? 0
+    this.sizeFixed = this.width > 0 && this.height > 0
+    this.bitrateFixed = options.bitrate !== undefined
+    this.bitrate = options.bitrate ?? 8_000_000
     /* 分片时长决定转封装的缓冲深度：10 ms 一片，拖动能到 60 fps；调大更省开销但画面更"钝"。 */
     const frag = Number(options.fragmentMs)
     this.fragMs = Number.isFinite(frag) ? Math.min(200, Math.max(10, Math.round(frag))) : 10
@@ -348,6 +355,9 @@ export class LiveStream {
     this.jpegChild = null
     this.jpegPending = Buffer.alloc(0)
     this.jpegWaiters = new Set()
+    /* 配额拒绝计数：看诊断就知道是不是被上限挡过（不是静默截断）。 */
+    this.subscriberRejects = 0
+    this.jpegWaiterRejects = 0
     this.jpegOpenAt = 0
     /** 最近一次有人要 JPEG 的时间：JPEG 观看者也该把推流钉住，否则每轮轮询都要重开录屏。 */
     this.jpegWantedAt = 0
@@ -381,6 +391,12 @@ export class LiveStream {
     this.revivedAt = 0
     this.watchTimer = null
     this.initAt = 0
+    /** 本对象创建的所有定时器：stop() 按这个集合逐个取消，漏一个就是一条停不掉的复活路。 @type {Set<any>} */
+    this.timers = new Set()
+    /** stop() 重入计数：清理过程中再次被调（closed 回调、退出回调）直接返回，不重复拆。 */
+    this.stopDepth = 0
+    /** 最近一次 stop() 的时间戳，给 /state 和她人排查用。 */
+    this.closedAt = 0
   }
 
   /**
@@ -444,7 +460,7 @@ export class LiveStream {
       '-flags', 'low_delay',
       '-f', 'h264', '-i', 'pipe:0',
       /* 12 fps 够看清手指动作；960 高在展开的侧栏里也不糊，编码开销只有几十毫秒。 */
-      '-vf', 'fps=15,scale=-2:960',
+      '-vf', 'fps=15,scale=-2:1400',
       /* mjpeg 复用器会把 20 KB 级的帧攒在 avio 缓冲里，不加这个要等进程退出才吐一帧。 */
       '-flush_packets', '1',
       '-fps_mode', 'passthrough',
@@ -505,16 +521,35 @@ export class LiveStream {
   /** 有比 since 更新的帧就立刻给，否则等到超时。 @param {number} since - 客户端已有的序号。 @param {number} ms - 最多等多久。 @returns {Promise<Buffer|null>} 帧或 null。 */
   nextJpeg(since, ms) {
     if (this.jpeg !== null && this.jpegSeq > since && Date.now() - this.jpegAt < 1200) return Promise.resolve(this.jpeg)
+    /* 配额：轮询端一多，等帧队列就是无界数组；满了立刻给 null（调用方会重试），不排队。 */
+    if (this.jpegWaiters.size >= MAX_JPEG_WAITERS) {
+      this.jpegWaiterRejects += 1
+      return Promise.resolve(null)
+    }
     return new Promise((resolve) => {
       let done = false
+      let timer = null
       const finish = (value) => {
         if (done) return
         done = true
         this.jpegWaiters.delete(finish)
+        if (timer !== null) {
+          clearTimeout(timer)
+          this.forgetTimer(timer)
+        }
         resolve(value)
       }
       this.jpegWaiters.add(finish)
-      const timer = setTimeout(() => finish(this.jpeg !== null && Date.now() - this.jpegAt < 2500 ? this.jpeg : null), Math.max(120, ms))
+      /* 代际校验：等帧的定时器可能在 stop() 之后才到期（已取消的 timer 仍可能已入队）。 */
+      const gen = this.generation
+      timer = this.trackTimer(setTimeout(() => {
+        this.forgetTimer(timer)
+        if (gen !== this.generation) {
+          finish(null)
+          return
+        }
+        finish(this.jpeg !== null && Date.now() - this.jpegAt < 2500 ? this.jpeg : null)
+      }, Math.max(120, ms)))
       timer.unref?.()
     })
   }
@@ -528,9 +563,13 @@ export class LiveStream {
   scheduleIdleStop(delayMs = IDLE_GRACE_MS) {
     if (this.idleTimer !== null) return
     if (this.idleArmedAt === 0) this.idleArmedAt = Date.now()
-    this.idleTimer = setTimeout(() => this.guard('idle-stop', () => {
+    /* 代际校验：已取消但已入队的回调仍会跑一次，换过代就不许它再动状态。 */
+    const gen = this.generation
+    this.idleTimer = this.trackTimer(setTimeout(() => this.guard('idle-stop', () => {
+      this.forgetTimer(this.idleTimer)
       this.idleTimer = null
       this.idleArmedAt = 0
+      if (gen !== this.generation) return
       if (this.clients.size > 0 || this.waiting.size > 0) return
       /* 只看帧的人每隔一秒来一次，取帧时间戳会被不断刷新；差多少补多少，不重复排满宽限。 */
       /* 镜像那边还有常连观看者（/live）时不能停：它不走 clients，只靠这个回调说话。 */
@@ -552,7 +591,7 @@ export class LiveStream {
         return
       }
       this.stop()
-    }), Math.max(0, delayMs))
+    }), Math.max(0, delayMs)))
     this.idleTimer.unref?.()
   }
 
@@ -561,6 +600,7 @@ export class LiveStream {
     if (this.stopping || this.spawning) return
     if (this.idleTimer !== null) {
       clearTimeout(this.idleTimer)
+      this.forgetTimer(this.idleTimer)
       this.idleTimer = null
     }
     if (this.recorder !== null) {
@@ -711,6 +751,37 @@ export class LiveStream {
     guardCall((note) => this.debug(note), where, run)
   }
 
+  /**
+   * 登记一个定时器：所有者就是本对象，取消入口是 clearTimers() / stop()。
+   * 定时器一律进集合，不许有「起了就没人记得」的裸 setTimeout。
+   * @param {any} timer - setTimeout/setInterval 的返回值。
+   * @returns {any} 同一个 timer，方便 `this.xTimer = this.trackTimer(setTimeout(...))`。
+   */
+  trackTimer(timer) {
+    if (!(this.timers instanceof Set)) this.timers = new Set()
+    if (timer != null) this.timers.add(timer)
+    return timer
+  }
+
+  /** 摘掉一个已经自己结束的定时器（不取消，只清账）。 @param {any} timer - 定时器。 @returns {void} */
+  forgetTimer(timer) {
+    this.timers?.delete?.(timer)
+  }
+
+  /** 取消并清空所有登记在案的定时器：stop() 的第一批动作。 @returns {number} 取消了几个。 */
+  clearTimers() {
+    const timers = this.timers
+    if (!(timers instanceof Set)) return 0
+    let count = 0
+    for (const timer of [...timers]) {
+      /* 有 unref 的 timer 和 interval 用同一个 clearTimeout 也能取消，但分开调更明确。 */
+      this.guard('clear-timer', () => clearTimeout(timer))
+      count += 1
+    }
+    timers.clear()
+    return count
+  }
+
   /** 起一次录屏。 @returns {void} */
   debug(note) {
     /* 常开：只在开/停录屏时写一行，量极小，出问题不用再复现一次。 */
@@ -721,6 +792,37 @@ export class LiveStream {
     } catch {
       /* 调试失败不影响推流 */
     }
+  }
+
+  /* 开录前定一次尺寸：按 `wm size` 等比缩到长边 2400，长边不足就不放大。
+     同步跑一条 adb（~40ms），只做一次；失败就退回 720x1280 稳妥值。 */
+  ensureSize() {
+    if (this.sizeFixed) return
+    this.sizeFixed = true
+    let w = 0
+    let h = 0
+    try {
+      const out = execFileSync(this.adbPath, ['-s', this.serial, 'shell', 'wm', 'size'], { timeout: 4000, encoding: 'utf8' })
+      const hit = /(\d+)\s*x\s*(\d+)/.exec(String(out))
+      if (hit !== null) {
+        w = Number(hit[1])
+        h = Number(hit[2])
+      }
+    } catch (error) {
+      this.debug('wm size failed ' + String(error?.message ?? error).slice(0, 60))
+    }
+    if (!(w > 8 && h > 8)) {
+      this.width = 720
+      this.height = 1280
+      return
+    }
+    const long = Math.max(w, h)
+    const scale = Math.min(1, 2400 / long)
+    const nw = Math.max(2, Math.round((w * scale) / 2) * 2)
+    const nh = Math.max(2, Math.round((h * scale) / 2) * 2)
+    this.width = nw
+    this.height = nh
+    if (!this.bitrateFixed && nw * nh > 720 * 1280 * 2) this.bitrate = 12_000_000
   }
 
   spawnRecorder() {
@@ -759,6 +861,17 @@ export class LiveStream {
       this.guard('scrcpy-wait', () => { attempt() })
       return
     }
+    /* 上一个模块实例（重载、探针、旧会话）留下的 screenrecord 会一直占着设备唯一的编码器，
+       新推流拿到的是一张永久空白的 h264 流：表现为热身永远不结束。开录前清一次孤儿进程。 */
+    if (!this.deviceSwept) {
+      this.deviceSwept = true
+      try {
+        execFileSync(this.adbPath, ['-s', this.serial, 'shell', 'pkill -f screenrecord'], { timeout: 4000, stdio: 'ignore' })
+      } catch (error) {
+        this.debug('sweep-screenrecord failed ' + String(error?.message ?? error).slice(0, 80))
+      }
+    }
+    this.ensureSize()
     const source = this.pickSource()
     if (source !== null && this.attachScrcpy(source)) return
     const size = `${this.width}x${this.height}`
@@ -858,10 +971,12 @@ export class LiveStream {
       this.frameTries = 0
       if (this.frameRetryTimer !== null) {
         clearTimeout(this.frameRetryTimer)
+        this.forgetTimer(this.frameRetryTimer)
         this.frameRetryTimer = null
       }
       if (this.scrcpyTimer !== null) {
         clearTimeout(this.scrcpyTimer)
+        this.forgetTimer(this.scrcpyTimer)
         this.scrcpyTimer = null
       }
       this.feedRaw(data, packet?.pts)
@@ -898,22 +1013,24 @@ export class LiveStream {
     })
     let tries = 0
     const askAgain = () => {
+      this.forgetTimer(this.frameRetryTimer)
       this.frameRetryTimer = null
       if (gen !== this.generation || this.stopping || this.scrcpy !== source || fed > 0) return
       tries += 1
       this.requestFrame()
       if (tries < 3) {
-        this.frameRetryTimer = setTimeout(askAgain, 700)
+        this.frameRetryTimer = this.trackTimer(setTimeout(askAgain, 700))
         this.frameRetryTimer.unref?.()
       }
     }
-    this.frameRetryTimer = setTimeout(askAgain, 500)
+    this.frameRetryTimer = this.trackTimer(setTimeout(askAgain, 500))
     this.frameRetryTimer.unref?.()
     /* 通道可能「连着但不出帧」。注意静止画面本来就不出帧，所以不能一没包就判死：
        先用控制消息请它出一帧，请不到（控制通道不可写 / 请了几次仍然没包）才退回 screenrecord。 */
     let probes = 0
     let blind = 0
     const probeFirstFrame = () => {
+      this.forgetTimer(this.scrcpyTimer)
       this.scrcpyTimer = null
       /* 停的条件是「已经能从这条流解出 moov」，不是「收到过包」：
          server 起流时先发一个只有 SPS/PPS 的配置包，liveFed 立刻变 1，但一帧画面都没有，
@@ -930,7 +1047,7 @@ export class LiveStream {
         return
       }
       if (probes < 8) {
-        this.scrcpyTimer = setTimeout(probeFirstFrame, 700)
+        this.scrcpyTimer = this.trackTimer(setTimeout(probeFirstFrame, 700))
         this.scrcpyTimer.unref?.()
         return
       }
@@ -941,15 +1058,21 @@ export class LiveStream {
       this.scrcpyHoldUntil = Date.now() + 1500
       this.detachScrcpy()
       if (this.clients.size > 0 || this.waiting.size > 0) this.guard('reprobe-source', () => {
-        setTimeout(() => this.guard('reprobe-spawn', () => {
-          this.scrcpyHoldUntil = 0
-          this.spawnRecorder()
-        }), 1500).unref?.()
+        /* 延迟重接：必须进 timers 集合，否则 stop() 之后它还会把新链路拉起来。 */
+        const reprobe = this.trackTimer(setTimeout(() => {
+          this.forgetTimer(reprobe)
+          this.guard('reprobe-spawn', () => {
+            if (this.stopping || gen !== this.generation) return
+            this.scrcpyHoldUntil = 0
+            this.spawnRecorder()
+          })
+        }, 1500))
+        reprobe.unref?.()
       })
     }
     /* 冷启动时 scrcpy 还在往设备推 server、编码器还没起，太早请帧没人接：
        第一次放到 2.5 秒，之后每秒再请一次，共 4 次（约 6 秒）。 */
-    this.scrcpyTimer = setTimeout(probeFirstFrame, 800)
+    this.scrcpyTimer = this.trackTimer(setTimeout(probeFirstFrame, 800))
     this.scrcpyTimer.unref?.()
     this.debug('scrcpy 采集源已接上 gen=' + String(gen))
     return true
@@ -962,10 +1085,12 @@ export class LiveStream {
     this.scrcpyBound = null
     if (this.scrcpyTimer !== null) {
       this.guard('scrcpy-timer-clear', () => clearTimeout(this.scrcpyTimer))
+      this.forgetTimer(this.scrcpyTimer)
       this.scrcpyTimer = null
     }
     if (this.frameRetryTimer !== null) {
       this.guard('frame-timer-clear', () => clearTimeout(this.frameRetryTimer))
+      this.forgetTimer(this.frameRetryTimer)
       this.frameRetryTimer = null
     }
     if (bound === null) return
@@ -979,14 +1104,18 @@ export class LiveStream {
   scheduleRestart() {
     if (this.stopping || this.restartTimer !== null) return
     if (this.clients.size === 0 && this.waiting.size === 0) return
-    this.restartTimer = setTimeout(() => this.guard('restart', () => {
+    const gen = this.generation
+    this.restartTimer = this.trackTimer(setTimeout(() => this.guard('restart', () => {
+      this.forgetTimer(this.restartTimer)
       this.restartTimer = null
+      /* 代际校验：换成这一代的 stop() 已经跑过后，这个迟到回调不许再起新录屏。 */
+      if (gen !== this.generation) return
       if (!this.stopping && (this.clients.size > 0 || this.waiting.size > 0)) {
         /* 上一轮可能是被 SIGKILL 的 adb：先按自己的 pid 清掉设备端残留，再开新录屏。 */
         this.killOwnRecorder()
         this.spawnRecorder()
       }
-    }), 120)
+    }), 120))
     this.restartTimer.unref?.()
   }
 
@@ -1079,8 +1208,12 @@ export class LiveStream {
     } catch {
       /* 已经关了 */
     }
-    let timer = setTimeout(() => this.guard('remux-stall', () => {
+    /* 代际校验：这一代 stop 之后，卡死判定和 drain 回调都不许再动状态。 */
+    const gen = this.generation
+    let timer = this.trackTimer(setTimeout(() => this.guard('remux-stall', () => {
+      this.forgetTimer(timer)
       timer = null
+      if (gen !== this.generation) return
       if (this.remuxer === remuxer) {
         this.error = 'ffmpeg 2 秒未消费数据，已重建'
         this.closeRemuxer()
@@ -1088,13 +1221,15 @@ export class LiveStream {
         this.rekey()
       }
       this.resumeRecorder()
-    }), REMUX_STALL_MS)
+    }), REMUX_STALL_MS))
     timer.unref?.()
     remuxer.stdin.once('drain', () => this.guard('remux-drain', () => {
       if (timer !== null) {
         clearTimeout(timer)
+        this.forgetTimer(timer)
         timer = null
       }
+      if (gen !== this.generation) return
       this.resumeRecorder()
     }))
   }
@@ -1236,7 +1371,17 @@ export class LiveStream {
   /** 起一个 2 秒的看门狗；没人看的时候它自己空转，不碰设备。 @returns {void} */
   armWatch() {
     if (this.watchTimer !== null) return
-    this.watchTimer = setInterval(() => this.guard('watchdog', () => this.checkHealth()), WATCH_TICK_MS)
+    /* 看门狗是独立故障域：换代之后它必须自己停，不能替新一代判死。 */
+    const gen = this.generation
+    this.watchTimer = this.trackTimer(setInterval(() => this.guard('watchdog', () => {
+      if (gen !== this.generation || this.stopping) {
+        this.guard('watchdog-stale', () => clearInterval(this.watchTimer))
+        this.forgetTimer(this.watchTimer)
+        this.watchTimer = null
+        return
+      }
+      this.checkHealth()
+    }), WATCH_TICK_MS))
     this.watchTimer.unref?.()
   }
 
@@ -1373,6 +1518,8 @@ export class LiveStream {
    * @returns {void}
    */
   emitMedia(chunk) {
+    /* 代际校验：stop() 之后残留在管道里的最后一帧不许再往已拆掉的客户端里灌。 */
+    if (this.stopping) return
     this.framesSeen += 1
     this.lastAt = Date.now()
     this.stallTries = 0
@@ -1450,7 +1597,15 @@ export class LiveStream {
    * @returns {() => void} 退订函数。
    */
   subscribe(sink) {
+    if (typeof sink !== 'function') throw new TypeError('subscribe: sink 必须是函数')
+    /* 配额：每个流最多 MAX_SUBSCRIBERS 个观众。超了直接拒绝（/stream 那边转成断开），
+       clients / waiting 两个 Set 不许跟着请求数无界长。 */
+    if (this.clients.size + this.waiting.size >= MAX_SUBSCRIBERS) {
+      this.subscriberRejects += 1
+      throw new Error(`订阅数已达上限 ${String(MAX_SUBSCRIBERS)}`)
+    }
     this.start()
+    const gen = this.generation
     this.debug('观众订阅 init=' + String(this.init !== null) + ' 源=' + String(this.scrcpy !== null) + ' 客户端=' + String(this.clients.size) + '/' + String(this.waiting.size))
     this.lastViewerAt = Date.now()
     if (this.viewerSince === 0) this.viewerSince = Date.now()
@@ -1469,10 +1624,15 @@ export class LiveStream {
       if (this.recorder !== null && this.restartTimer === null && Date.now() - this.startedAt > 700) this.rekey()
       this.sendPrelude(sink)
     }
+    /* 退订是取消入口：幂等（重复调用不重复记「最后一个观众走了」），也按代际作废。 */
+    let released = false
     return () => {
+      if (released) return
+      released = true
       this.clients.delete(sink)
       this.waiting.delete(sink)
       this.lastViewerAt = Date.now()
+      if (gen !== this.generation) return
       if (this.clients.size === 0 && this.waiting.size === 0) this.scheduleIdleStop()
     }
   }
@@ -1498,47 +1658,53 @@ export class LiveStream {
 
   /** 没人看了就停，别占着设备编码器。幂等：重复调用、对象已销毁都不抛。 @returns {void} */
   stop() {
-    /* 换代：之前所有 in-flight 的退出/重启回调从此作废，停止之后不会自己复活。 */
-    if (this.watchTimer !== null) {
-      this.guard('stop-watch-timer', () => clearInterval(this.watchTimer))
+    /* 幂等：stop 期间又被调（closed 回调、子进程 exit 回调）直接返回，不重复拆、不重复换代。
+       stopDepth 在 finally 里复位，所以顺序的第二次 stop() 仍然是完整的一次收尾。 */
+    if (this.stopDepth > 0) return
+    this.stopDepth += 1
+    try {
+      /* 第 1 步永远是「作废这一代」：先置 stopping、再换 generation，之后所有 in-flight 的
+         退出/重启/定时器回调都会被代际校验挡住，停止之后不会自己复活。 */
+      this.stopping = true
+      this.generation = (Number(this.generation) || 0) + 1
+      this.viewerSince = 0
+      this.revivedAt = 0
+      this.closedAt = Date.now()
+      /* 所有登记在案的定时器统一取消：它们的所有者就是本对象，取消入口就是这里。 */
+      this.guard('stop-timers', () => this.clearTimers())
       this.watchTimer = null
-    }
-    this.viewerSince = 0
-    this.revivedAt = 0
-    this.generation = (Number(this.generation) || 0) + 1
-    if (this.idleTimer != null) {
-      this.guard('stop-idle-timer', () => clearTimeout(this.idleTimer))
       this.idleTimer = null
-    }
-    this.stopping = true
-    if (this.restartTimer != null) {
-      this.guard('stop-restart-timer', () => clearTimeout(this.restartTimer))
       this.restartTimer = null
-    }
-    /* 清理方法可能没注入/已被替换（历史事故就是这么打崩 host 的），每一步单独兜底。 */
-    this.guard('stop-scrcpy', () => this.detachScrcpy())
-    this.guard('stop-remuxer', () => this.closeRemuxer())
-    this.guard('stop-jpeg', () => this.closeJpeg())
-    const child = this.recorder ?? null
-    this.recorder = null
-    /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */
-    this.guard('stop-sweep-recorders', () => this.sweepOwnRecorders())
-    this.guard('stop-device-recorder', () => this.killOwnRecorder())
-    if (child !== null) {
-      try {
-        child.kill('SIGKILL')
-      } catch {
-        /* 已经退了 */
+      this.scrcpyTimer = null
+      this.frameRetryTimer = null
+      /* 清理方法可能没注入/已被替换（历史事故就是这么打崩 host 的），每一步单独兜底。 */
+      this.guard('stop-scrcpy', () => this.detachScrcpy())
+      this.guard('stop-remuxer', () => this.closeRemuxer())
+      this.guard('stop-jpeg', () => this.closeJpeg())
+      const child = this.recorder ?? null
+      this.recorder = null
+      /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */
+      this.guard('stop-sweep-recorders', () => this.sweepOwnRecorders())
+      this.guard('stop-device-recorder', () => this.killOwnRecorder())
+      if (child !== null) {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          /* 已经退了 */
+        }
       }
+      this.intentional = true
+      this.init = null
+      this.lastKeyChunks = []
+      this.lastKeyBytes = 0
+      this.waiting?.clear?.()
+      this.config = null
+      this.firstFrameAt = 0
+    } finally {
+      /* stopping 兼作「正在收尾」标志：收完必须复位，否则空闲回收之后 start() 再也起不来。 */
+      this.stopping = false
+      this.stopDepth -= 1
     }
-    this.intentional = true
-    this.stopping = false
-    this.init = null
-    this.lastKeyChunks = []
-    this.lastKeyBytes = 0
-    this.waiting?.clear?.()
-    this.config = null
-    this.firstFrameAt = 0
   }
 
   /** 给 /state 用的快照。 @returns {any} 状态。 */
@@ -1573,6 +1739,11 @@ export class LiveStream {
       remuxQueued: this.remuxer === null ? 0 : this.remuxer.stdin?.writableLength ?? 0,
       jpegQueued: this.jpegChild === null ? 0 : this.jpegChild.stdin?.writableLength ?? 0,
       generations: this.generation,
+      /* 资源账：登记在案的定时器数、被配额挡下的订阅/等帧请求数、最近一次收尾时间。 */
+      timers: this.timers instanceof Set ? this.timers.size : 0,
+      subscriberRejects: this.subscriberRejects,
+      jpegWaiterRejects: this.jpegWaiterRejects,
+      closedAt: this.closedAt,
       /* 最近一片的解码时间与它距现在的秒数：两个数一起看就是整条链路的延迟。 */
       lastPts: this.lastPts ?? null,
       /* 端到端延迟的测量口径：Date.now() - (ptsOriginMs + mediaTime*1000)。 */

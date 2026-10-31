@@ -109,6 +109,8 @@ const EXPECTED = [
   'adb_pinch',
   'adb_record',
   'adb_clipboard',
+  'adb_ocr',
+  'adb_look',
 ]
 
 /** 递归查 schema：类型得认识、required 得真在 properties 里、不许有 undefined 描述。 */
@@ -156,7 +158,7 @@ function sampleOf(schema) {
   return null
 }
 
-await it('24 个工具全部注册成功，名字唯一且都以 adb_ 开头', () => {
+await it('30 个工具全部注册成功，名字唯一且都以 adb_ 开头', () => {
   expect(tools.length === EXPECTED.length, `注册了 ${tools.length} 个，应为 ${EXPECTED.length}`)
   const names = tools.map((tool) => tool.name)
   for (const name of EXPECTED) expect(names.includes(name), `少了 ${name}`)

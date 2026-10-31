@@ -160,6 +160,29 @@ check('stop() 之后的迟到回调不会复活（generation 已换代）', () =
   assert(s.stopping === false, 'stopping 复位')
 })
 
+check('空闲回收定时器必须有主：挂在 idleTimer 上、不重复建、stop() 后清空', () => {
+  /* 2026-10-29 实测回归：trackTimer 只记账没赋给 this.idleTimer，于是
+     enableJpeg() → scheduleIdleStop() 走到 this.idleTimer.unref() 读 null 直接抛，
+     JPEG 支路（/frame 轮询）跟着整条死掉。这里按形态兜住。 */
+  const s = fakeStream({ idleArmedAt: 0, stopDepth: 0, closedAt: 0 })
+  s.scheduleIdleStop(60_000)
+  assert(s.idleTimer !== null, 'scheduleIdleStop 之后 idleTimer 必须非空')
+  const first = s.idleTimer
+  assert(s.timers instanceof Set, 'timer 必须登记进 timers')
+  assert(s.timers.size === 1, `timers 应为 1，实际 ${s.timers.size}`)
+  s.scheduleIdleStop(60_000)
+  assert(s.idleTimer === first, '已有定时器时不许再建一个')
+  let threw = false
+  try {
+    s.stop()
+  } catch {
+    threw = true
+  }
+  assert(threw === false, 'stop() 不得抛')
+  assert(s.idleTimer === null, 'stop() 之后 idleTimer 必须为 null')
+  assert(s.timers.size === 0, `stop() 之后定时器集合必须清空，实际 ${s.timers.size}`)
+})
+
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`)
 if (fail > 0) {
   console.log('=== 未通过 ===')
