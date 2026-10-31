@@ -451,6 +451,39 @@ export class LiveStream {
     seen.clear()
   }
 
+  /**
+   * 收掉「进程还活着、对象已经丢了」的解码器。注册表跟着 globalThis 走，换代/重建以后
+   * 上一代的子进程仍然在表里；只看 this.jpegChild 会漏掉它们，于是一个僵尸 ffmpeg
+   * 长期占着 CPU 和管道（实测 8 分钟 55 秒 CPU、jpegFresh() 恒 false、每次视觉读都回退截图）。
+   * @param {string} serial - 设备序列号。
+   * @returns {number} 真收掉了几个。
+   */
+  static strayJpeg(serial) {
+    const registry = globalThis.__dshAdbJpeg
+    if (!(registry instanceof Map)) return 0
+    const seen = registry.get(serial)
+    if (!(seen instanceof Set)) return 0
+    let killed = 0
+    for (const child of [...seen]) {
+      if (child === null || typeof child !== 'object') {
+        seen.delete(child)
+        continue
+      }
+      if (Number(child.exitCode) !== null && child.exitCode !== undefined) {
+        seen.delete(child)
+        continue
+      }
+      try {
+        child.kill('SIGKILL')
+        killed += 1
+      } catch {
+        /* 已经退了 */
+      }
+      seen.delete(child)
+    }
+    return killed
+  }
+
   /** 有人要看 JPEG 帧时才起解码器：不看不花 CPU。 @returns {boolean} 是否可用（解码器起来后 300 ms 内有帧）。 */
   enableJpeg() {
     this.jpegWantedAt = Date.now()
@@ -461,6 +494,8 @@ export class LiveStream {
       return true
     }
     if (this.stopping) return false
+    /* 上一代留下的僵尸先收掉再谈节流，否则要白等一个 2 秒窗口。 */
+    if (LiveStream.strayJpeg(this.serial) > 0) this.jpegOpenAt = 0
     if (Date.now() - this.jpegOpenAt < 2000) return false
     this.jpegOpenAt = Date.now()
     this.start()
@@ -1358,9 +1393,18 @@ export class LiveStream {
          会一直装健康——每次视觉读都回退 screencap（实测 531–893 ms），长会话里越来越慢。
          真机实测过的现场：ffmpeg 跑了 8 分钟、CPU 55 s、jpegFresh() 恒 false。
          只在确实还想看帧（宽限内读过）时修，空闲的流不许被修活。 */
-      if (this.jpegChild === null || this.stopping) return
+      if (this.stopping) return
       const wanted = Number(this.jpegWantedAt) || 0
       if (wanted === 0 || Date.now() - wanted >= (this.idleGrace ?? IDLE_GRACE_MS)) return
+      /* 对象丢了但注册表里还有活进程 = 僵尸解码器：它不会出帧，还会让下面的判死整段跑不到。
+         收掉它，并把节流窗口清掉，让下一次读帧立即重建。 */
+      if (this.jpegChild === null) {
+        if (LiveStream.strayJpeg(this.serial) > 0) {
+          this.jpegOpenAt = 0
+          this.debug('看门狗：收掉一个没有主人的 JPEG 解码器')
+        }
+        return
+      }
       if (this.revivedAt !== 0 && Date.now() - this.revivedAt < WATCH_COOLDOWN_MS) return
       const started = Number(this.jpegStartedAt) || 0
       const lastFrame = Number(this.jpegAt) || 0

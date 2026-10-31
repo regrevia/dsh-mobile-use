@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=228'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=229'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
