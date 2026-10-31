@@ -56,7 +56,7 @@ git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
 | `adb_tap` | 按 `ref` / `text` / `id` / `desc` / `point="x,y"` 点击（`within_ref` 限定在某一行/容器里找，点行内按钮不用先算坐标），`long: true` 长按；可带 `wait_for_text` / `wait_for_id` / `wait_until_gone` / `wait_for_activity` / `wait_activity_gone` 点完直接等结果，或 `wait_stable` 等界面静止再回执「变了没变」；回执里 `changed` 说变没变，`reason` 给原因码（`keyboard-covered` / `obscured` / `unclickable` / `gone` / `page-switched` / `no-response` / `same-screen`），`delta` 直接列出这次多/少了哪几行；没生效还会自动留一张截图（`shot.path`）；点后等待也吃得下 `wait_for_xpath` / `wait_xpath_gone`；`shot: true` 点完留一张截图（省一次 `adb_shot`）；`tree: true` 顺手把点完的新树带回来（判变化时本来就读过，ref 属于新快照，接着点下一项不用再 `adb_ui`） |
 | `adb_input` | `text`（ASCII，空格自动转义）、`key`（ENTER/BACK/DEL…）、`submit`（`enter` / `search`，输完直接提交）、`ime`（`auto` / `clipboard` / `adb`，ADBKeyboard 已装且是当前输入法时中文走广播更快）、`swipe`、`clear`；回执给 `method`（ime/paste/input）、`field`（输入框回读）、`verified`，`verify: true` 时 ASCII 直发也回读一次，不用再补 `adb_ui` |
 | `adb_gesture` | 真人轨迹：`points` 折线逐点 DOWN/MOVE/UP，`duration_ms`、`hold_ms`；曲线拖拽、按住再拖；滑完可等文字或 `wait_for_xpath` / `wait_xpath_gone` |
-| `adb_app` | `info`（versionCode/versionName + 前台）、`install`（`-r -d`）、`start`、`stop`、`clear`、`foreground` |
+| `adb_app` | `list`（42 个可启动应用 + 前台，找包名第一步）、`info`（versionCode/versionName + 前台）、`install`（`-r -d`）、`start`、`stop`、`clear`、`uninstall`、`foreground` |
 | `adb_sh` | 设备端任意命令，输出截断到 20k 字符；日志、`dumpsys` |
 | `adb_shot` | 只在要看颜色/布局/相机画面时截图，默认缩到长边 900 px，返回路径给 `read_image`；`region="x,y,w,h"` 只回一块（看桌宠、小图标时体积降一个量级）；带 `ref` 只截那个控件（实测桌宠页一个图标 126×126 / 1.6 KB，整屏 600×900 / 39 KB） |
 | `adb_look` | 不看图也能看清画面：把屏幕压成颜色网格（每格一个字母）、列出同色块的位置与占比、给出与上一次的差异；`region` 只看一块、`cols`/`rows` 调网格密度。canvas/游戏/自绘界面、文本树没有文字时用它——比 `adb_shot` 快、不花图片 token |

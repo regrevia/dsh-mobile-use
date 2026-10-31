@@ -1395,7 +1395,18 @@ export class LiveStream {
          只在确实还想看帧（宽限内读过）时修，空闲的流不许被修活。 */
       if (this.stopping) return
       const wanted = Number(this.jpegWantedAt) || 0
-      if (wanted === 0 || Date.now() - wanted >= (this.idleGrace ?? IDLE_GRACE_MS)) return
+      if (wanted === 0 || Date.now() - wanted >= (this.idleGrace ?? IDLE_GRACE_MS)) {
+        /* 宽限过了就是彻底没人要帧：解码器如果还在、又确实不出帧，就地收掉。留着的唯一结果
+           是「宿主烧 CPU、设备没在录」，下一次读帧还得先等它自己烂掉。 */
+        const idleStarted = Number(this.jpegStartedAt) || 0
+        const idleLast = Number(this.jpegAt) || 0
+        const idleFor = idleLast > 0 ? Date.now() - idleLast : (idleStarted > 0 ? Date.now() - idleStarted : 0)
+        if (this.jpegChild !== null && idleFor >= JPEG_STALL_MS) {
+          this.guard('reap-idle-jpeg', () => this.closeJpeg())
+          this.guard('reap-idle-stray', () => LiveStream.strayJpeg(this.serial))
+        }
+        return
+      }
       /* 对象丢了但注册表里还有活进程 = 僵尸解码器：它不会出帧，还会让下面的判死整段跑不到。
          收掉它，并把节流窗口清掉，让下一次读帧立即重建。 */
       if (this.jpegChild === null) {
@@ -1769,6 +1780,9 @@ export class LiveStream {
       this.guard('stop-scrcpy', () => this.detachScrcpy())
       this.guard('stop-remuxer', () => this.closeRemuxer())
       this.guard('stop-jpeg', () => this.closeJpeg())
+      /* closeJpeg 只管自己这只子进程；注册表里换代残留的同类进程也要一起收，否则停了流还留着
+         一个空转的 ffmpeg（实测过 6 分钟烧 39 秒 CPU）。这里没有当前子进程，表里剩下的都是遗留。 */
+      this.guard('stop-stray-jpeg', () => LiveStream.strayJpeg(this.serial))
       const child = this.recorder ?? null
       this.recorder = null
       /* 本地杀进程不等于设备端停了：先按自己记下的 pid 收掉设备端录屏，否则下一次开流会撞上。 */

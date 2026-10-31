@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=229'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=230'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
@@ -5053,12 +5053,13 @@ export function apply(ctx, config) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['info', 'install', 'start', 'stop', 'clear', 'foreground', 'open'], description: '要做的操作' },
+        action: { type: 'string', enum: ['list', 'info', 'install', 'start', 'stop', 'clear', 'uninstall', 'foreground', 'open'], description: '要做的操作：list 列可启动的应用（找包名时先用它）' },
         url: { type: 'string', description: 'open 用：深链或网址，例如 "https://example.com" 或 "myapp://detail/3"' },
         wait_activity: { type: 'string', description: 'start/open 后等前台 Activity 匹配这个正则再返回，例如 "MainActivity"' },
         package: { type: 'string', description: '包名，如 com.example.app；install 时可省略（从 APK 里读）' },
         apk: { type: 'string', description: 'install 用的 APK 绝对路径' },
         activity: { type: 'string', description: 'start 时可指定 Activity，例如 .ScanActivity；不写就用启动器入口' },
+        filter: { type: 'string', description: 'list 用：按子串过滤包名，例如 "taobao"' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -5093,7 +5094,32 @@ export function apply(ctx, config) {
         if (!ok) throw new Error(`安装失败：${oneLine(r.out || r.err, 300)}`)
         return { ok: true, action, message: `安装完成（${r.ms}ms）：${oneLine(r.out, 120)}`, elapsed_ms: Date.now() - started }
       }
+      if (action === 'list') {
+        /* 先给「真正能点开的应用」，再退回全部第三方包：命令行的 Launcher 查询在个别 ROM 上会被裁。 */
+        const query = await adb(['-s', device, 'shell', 'cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER'], { timeout: 20_000 })
+        const components = []
+        for (const line of String(query.out).split('\n')) {
+          const hit = /^\s*([A-Za-z0-9_.]+)\/[A-Za-z0-9_.$]+/.exec(line)
+          if (hit) components.push(hit[1])
+        }
+        let packages = [...new Set(components)]
+        if (packages.length === 0) {
+          const r = await adb(['-s', device, 'shell', 'pm list packages -3'], { timeout: 20_000 })
+          packages = String(r.out).split('\n').map((line) => line.replace(/^package:/, '').trim()).filter(Boolean)
+        }
+        const needle = args.filter ? String(args.filter).toLowerCase() : ''
+        const picked = needle ? packages.filter((name) => name.toLowerCase().includes(needle)) : packages
+        const activity = await foregroundActivity(device)
+        const head = `${picked.length}/${packages.length} 个可启动应用 · 前台：${activity || '未知'}`
+        const body = picked.slice(0, 120).join('\n')
+        return { ok: true, action, message: picked.length === 0 ? `没有匹配「${String(args.filter ?? '')}」的应用。` : `${head}\n${body}`, elapsed_ms: Date.now() - started }
+      }
       if (!pkg) throw new Error(`${action} 需要 package。`)
+      if (action === 'uninstall') {
+        const r = await adb(['-s', device, 'shell', `pm uninstall --user 0 ${pkg}`], { timeout: 60_000 })
+        if (!/Success/i.test(String(r.out))) throw new Error(`卸载失败：${oneLine(r.out || r.err, 240)}`)
+        return { ok: true, action, message: `已卸载 ${pkg}（仅当前用户）`, elapsed_ms: Date.now() - started }
+      }
       if (action === 'info') {
         const r = await adb(['-s', device, 'shell', `dumpsys package ${pkg}`], { timeout: 15_000 })
         const versionCode = /versionCode=(\d+)/.exec(r.out)?.[1] ?? '?'
