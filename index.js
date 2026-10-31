@@ -4195,12 +4195,50 @@ function applyXPathStep(pool, step) {
   return left
 }
 
+/**
+ * 设备端的兜底清场：宿主被重载或强杀时，设备上的 scrcpy server 与录屏进程不会跟着退出，
+ * 它们一直占着编码器 / 录屏器，下一次推流就表现为「连上但没帧」。这里只清本插件独占的标记
+ * （自己的 jar 文件名、自己的录屏 marker），不碰别的 scrcpy 会话；本进程正在推的设备跳过。
+ * @returns {Promise<string[]>} 这次清了哪些设备。
+ */
+async function reclaimDeviceLeftovers() {
+  let devices = []
+  try {
+    devices = (await listDevices()).filter((device) => device.state === 'device')
+  } catch {
+    return []
+  }
+  if (devices.length === 0) return []
+  const busy = new Set()
+  const streams = globalThis.__dshAdbLiveStreams
+  if (streams instanceof Set) {
+    for (const item of streams) {
+      const device = item?._options?.serial
+      if (device) busy.add(String(device))
+    }
+  }
+  const cleaned = []
+  for (const device of devices) {
+    const name = String(device.serial)
+    if (busy.has(name)) continue
+    try {
+      const done = await sh(name, "pkill -9 -f 'dsh-mobile-use-scrcpy-server.jar' 2>/dev/null; pkill -9 -f 'dsh-mobile-use-stream-' 2>/dev/null; echo ok", 4000)
+      if (done.ok) cleaned.push(name)
+    } catch { /* 单台清不掉不影响别的设备 */ }
+  }
+  return cleaned
+}
+
 export function apply(ctx, config) {
   const serial = async () => resolveSerial(config)
 
   loadActions()
   /* 每 2 秒对比一次尾部，有变化才落盘：所有记动作的地方都不用改，也不会写爆磁盘。 */
   let savedAt = lastActions.length > 0 ? lastActions[lastActions.length - 1].at : 0
+  /* 上一轮宿主如果是被重载 / 强杀收场的，设备端的 scrcpy server 和录屏进程还活着；
+     等首次调用把 adb 通道热起来之前先扫一遍，不留「老进程占着编码器」的坑。 */
+  const leftoverTimer = setTimeout(() => { void reclaimDeviceLeftovers() }, 2500)
+  leftoverTimer.unref?.()
   const actionSaver = setInterval(() => {
     try {
       const tail = lastActions.length > 0 ? lastActions[lastActions.length - 1].at : 0
@@ -4232,6 +4270,7 @@ export function apply(ctx, config) {
   mirrorRef = mirror
   ctx.effect(() => () => {
     clearInterval(actionSaver)
+    clearTimeout(leftoverTimer)
     void saveActions()
     mirror.stopAll()
     stopOcr()
