@@ -18,7 +18,7 @@ git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
 
 **② 圈选标注，把「这里」说清楚。** 在画面上圈一块，连**圈图 + 圈内控件 + 前 12 秒操作时间线 + 最近 6 秒 6 帧拼图**一起推回当前会话。拼图取自内存最近 40 帧，265 ms 建好、112 KB，不碰设备、不 seek 还在写的录屏文件。
 
-**③ 读界面，不截图。** 设备端常驻 uiautomator2：`adb_ui` 一次 **120 ms** 返回「文字 + 资源 id + 中心坐标 + ref」，压成 200–1300 token 纯文本；同样一次确认，`screencap -p` 要 0.5–3.2 s、0.3–8.9 MB，再花一次带图推理。自绘/Flutter 文本树为空时自动补一层本机 Vision OCR 兜底。
+**③ 读界面，不截图。** 设备端常驻 uiautomator2：`adb_ui` 一次 **120 ms** 返回「文字 + 资源 id + 中心坐标 + ref」，压成 200–1300 token 纯文本；同样一次确认，`screencap -p` 要 0.5–3.2 s、0.3–8.9 MB，再花一次带图推理。自绘/Flutter 文本树为空时自动补一层本机 Vision OCR 兜底。不想走视觉模型时还有两条免视觉通道：`adb_look` 把屏幕压成颜色网格并给出区域差异（热 32–41 ms），`adb_ocr` 直接认右栏直播帧（热 110–116 ms）。
 
 作品牌差异一句话：同类插件多在**让 DSH 的网页适配手机**或**让手机连回电脑**，这个方向相反——**把手机装进 DSH，让 AI 直接操作真机**。
 
@@ -59,8 +59,10 @@ git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
 | `adb_app` | `info`（versionCode/versionName + 前台）、`install`（`-r -d`）、`start`、`stop`、`clear`、`foreground` |
 | `adb_sh` | 设备端任意命令，输出截断到 20k 字符；日志、`dumpsys` |
 | `adb_shot` | 只在要看颜色/布局/相机画面时截图，默认缩到长边 900 px，返回路径给 `read_image`；`region="x,y,w,h"` 只回一块（看桌宠、小图标时体积降一个量级）；带 `ref` 只截那个控件（实测桌宠页一个图标 126×126 / 1.6 KB，整屏 600×900 / 39 KB） |
+| `adb_look` | 不看图也能看清画面：把屏幕压成颜色网格（每格一个字母）、列出同色块的位置与占比、给出与上一次的差异；`region` 只看一块、`cols`/`rows` 调网格密度。canvas/游戏/自绘界面、文本树没有文字时用它——比 `adb_shot` 快、不花图片 token |
+| `adb_ocr` | 直接读屏上的文字，不花图片 token：给 `ref` 或 `region` 只读那一块，回一批带坐标的文字，坐标可直接给 `adb_tap point=`。优先认右栏直播帧（热 110 ms），文本树能读时优先用 `adb_ui` |
 | `adb_device` | 列设备、状态、型号、当前选中设备与分辨率 |
-| `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
+| `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（125–195 ms：七条 dumpsys 并发跑，串行要 371 ms） |
 | `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步；每步可 `retry` 重来注入前的偶发失败；失败时自动留一张截图到 `~/.dsh/adb-evidence/<序列号>/`（只留最近 20 张）；步骤也能带 `until`（等同一控件进入某状态）与 `dismiss`（本步等待时自动点掉挡路弹窗）；步骤也能用 `xpath` 一次定位点掉，`tap`/`id` 步与等待/核对步都可配 `within_ref`（或坐标框 `within_rect`）只在一行里找、只在一行里等「已关注」；找目标也能用 `assert_activity`/`assert_activity_gone`（核对页面）/`desc`/`cls`/`exact`/`regex`/`index`/`long_ms`（长按时长）（同一文字匹配到多个时点第几个，从 0 开始）（和 `adb_tap` 一致，只有描述的图标按钮、半截类名的控件都能点）；输入步可写 `clear: true` 先清空聚焦输入框；某步写 `on_fail: "continue"` 就允许它失败（记一笔跳过，后面照跑）；同一步要连做几次写 `repeat`（1–20，配点击/滑动/按键/系统动作/`scroll_to`，连点「下一集」不用抄十遍）；整串跑完可加 `shot: true` 顺手留一张截图、`tree: true` 顺手把跑完的界面读回来（ref 归新快照）；`scroll_to` 还能写成对象（`text`/`id`/`desc`/`cls`/`xpath` + `direction`/`until`/`dismiss`/`max_swipes`），滑到「真的能点」的那个再动手；每步还能 `wait_for_xpath` / `wait_xpath_gone` / `assert_xpath` / `assert_xpath_gone` / `assert_count_min`（配 `count_xpath`）当条件，收尾 `assert_no_crash` 读 crash 缓冲区跟开始时比，多了就当场报并留证 |
 | `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode`；可带 `wait_for_text` / `wait_until_gone`，动作和确认一次调用做完；等待支持 `wait_for_xpath` / `wait_xpath_gone` |
 | `adb_file` | 设备 ↔ 宿主文件：`action` 给 `ls` / `pull` / `push`，只放开 Download/Pictures/DCIM/Documents/Movies/Music/Android\ media 与 `/data/local/tmp`；`pull` 默认落 `~/.dsh/adb-files/<设备>/`，两次都比对 md5，回执写字节数与是否一致 |
