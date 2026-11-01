@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=234'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=236'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
@@ -1258,7 +1258,7 @@ function describe_device_event(line) {
   const tag = /\b(am_focused_activity|wm_create_activity|am_proc_start|am_proc_died|am_crash|am_anr|am_kill)\b/.exec(text)?.[1] ?? ''
   if (tag === '') return ''
   const body = text.slice(text.indexOf(tag + ':') + tag.length + 1)
-  /* 事件体是 [user,pid,uid,包名,类名,…]：包名总在第 4 个位置，类名第 5 个。 */
+  /* 事件体是 [user,pid,uid,包名，类名，…]：包名总在第 4 个位置，类名第 5 个。 */
   const parts = body.replace(/^\s*\[/, '').replace(/\]\s*$/, '').split(',').map((item) => item.trim())
   /* 切页事件的载荷是 `包名/类名` 一整段，进程事件才是分开的字段：两种都要认。 */
   const pair = parts.find((item) => /^[\w.$]+\/[\w.$]+$/.test(item)) ?? ''
@@ -4171,7 +4171,7 @@ function compileXPathPredicate(source) {
       return value !== '' && value !== 'false'
     } }
   }
-  throw new Error(`xpath 谓词看不懂：[${source}]，支持 @属性、@属性="值"、@属性!="值"、contains(@属性,"值")、starts-with(@属性,"值")、[序号]、[last()]、not(@属性)，以及 and / or 连接`)
+  throw new Error(`xpath 谓词看不懂：[${source}]，支持 @属性、@属性="值"、@属性！="值"、contains(@属性，"值")、starts-with(@属性，"值")、[序号]、[last()]、not(@属性)，以及 and / or 连接`)
 }
 
 /**

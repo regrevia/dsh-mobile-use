@@ -327,6 +327,8 @@ export class Mirror {
     /* 分段录制的收尾：请求停止标记 + 设备端 pid 文件名（只杀自己这一次录屏）。 */
     this.recorderStopRequested = false
     this.recorderPidFile = ''
+    /* 本轮分段录制复用的设备端 pid 文件（定一次，段尾删）。 */
+    this.recorderPidPath = ''
     this.recorderSeq = 0
     this.stopping = false
     this.startedAt = 0
@@ -977,6 +979,7 @@ export class Mirror {
     this.recorderStopRequested = true
     const pidFile = this.recorderPidFile
     this.recorderPidFile = ''
+    this.recorderPidPath = ''
     if (pidFile !== '') void this.killOwnRecorder(pidFile)
   }
 
@@ -1008,10 +1011,19 @@ export class Mirror {
     this.recorderStopRequested = false
     const safeSerial = this.serial.replace(/[^\w.-]/g, '_')
     const remote = `/sdcard/dsh-${safeSerial}.mp4`
+    if (this.recorderPidPath === '') {
+      this.recorderPidPath = `/data/local/tmp/dsh-mobile-use-rec-${safeSerial}-${REC_TAG}.pid`
+      /* 上一个进程被杀时来不及清自己的 pid 文件：pid 已经不在了就删，活着的不碰。 */
+      void this.adb(['-s', this.serial, 'shell',
+        `for f in /data/local/tmp/dsh-mobile-use-rec-${safeSerial}-*.pid; do [ -f "$f" ] || continue; r=$(cat "$f" 2>/dev/null); if [ -z "$r" ] || [ ! -d "/proc/$r" ]; then rm -f "$f"; fi; done`],
+      { timeout: 8000, direct: true }).catch(() => {})
+    }
     while (!this.stopping && !this.recorderStopRequested) {
       const started = Date.now()
       this.recorderSeq += 1
-      const pidFile = `/data/local/tmp/dsh-mobile-use-rec-${safeSerial}-${REC_TAG}-${this.recorderSeq}.pid`
+      /* 每段复用同一个 pid 文件：文件名带段号时每段都会留一个 5 字节文件在设备上，
+         实测看 6 分钟攒 32 个、没人删。段尾 rm 掉，进程也没了，文件不必留。 */
+      const pidFile = this.recorderPidPath
       this.recorderPidFile = pidFile
       /* exec 让 shell 的 pid 就是 screenrecord 的 pid：停的时候按这个 pid 精确 kill。 */
       const command = `sh -c 'echo $$ > ${pidFile}; exec screenrecord --time-limit ${SEGMENT_SECONDS} --bit-rate 2000000 --size ${this.recordSize()} ${remote}'`
@@ -1026,7 +1038,7 @@ export class Mirror {
         continue
       }
       const pulled = await this.adb(['-s', this.serial, 'exec-out', 'cat', remote], { timeout: 60_000, direct: true })
-      await this.adb(['-s', this.serial, 'shell', 'rm', '-f', remote], { timeout: 8000 })
+      await this.adb(['-s', this.serial, 'shell', 'rm', '-f', remote, pidFile], { timeout: 8000 })
       const bytes = pulled.raw
       if (pulled.ok && Buffer.isBuffer(bytes) && bytes.length > 2048) {
         const name = `seg-${started}.mp4`
@@ -1041,6 +1053,11 @@ export class Mirror {
     }
     this.recording = false
     this.recorderStopRequested = false
+    if (this.recorderPidPath !== '') {
+      const pidFile = this.recorderPidPath
+      this.recorderPidPath = ''
+      void this.adb(['-s', this.serial, 'shell', 'rm', '-f', pidFile], { timeout: 8000, direct: true }).catch(() => {})
+    }
   }
 
   /** 本机只留最近 18 段（约 3 分钟）。 @returns {Promise<void>} 删完。 */

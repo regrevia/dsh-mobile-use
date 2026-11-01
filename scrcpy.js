@@ -315,7 +315,7 @@ export class VideoStreamParser {
   constructor(options = {}) {
     const protocol = options.protocol ?? SCRCPY_PROTOCOL.V5
     if (protocol !== SCRCPY_PROTOCOL.V3 && protocol !== SCRCPY_PROTOCOL.V5) {
-      throw new RangeError(`未知协议形态: ${protocol}`)
+      throw new RangeError(`未知协议形态： ${protocol}`)
     }
     const maxPacketSize = options.maxPacketSize ?? MAX_PACKET_SIZE
     if (!Number.isFinite(maxPacketSize) || maxPacketSize <= 0) {
@@ -827,7 +827,7 @@ export class ScrcpyChannel extends EventEmitter {
       protocol: this._options.protocol,
       maxPacketSize: this._options.maxPacketSize ?? MAX_PACKET_SIZE,
     })
-    this._log(`scrcpy 通道启动: scid=${this._scid.toString(16)} port=${this._options.port}`)
+    this._log(`scrcpy 通道启动： scid=${this._scid.toString(16)} port=${this._options.port}`)
 
     try {
       /* 上一轮被丢弃的通道可能把设备端 server 留在那儿占着编码器（新 server 拿到
@@ -851,7 +851,7 @@ export class ScrcpyChannel extends EventEmitter {
       this.emitSafe('ready')
       return true
     } catch (error) {
-      this._log(`start 异常: ${String(error?.stack ?? error).slice(0, 400)}`)
+      this._log(`start 异常： ${String(error?.stack ?? error).slice(0, 400)}`)
       this.stop()
       return false
     }
@@ -894,7 +894,7 @@ export class ScrcpyChannel extends EventEmitter {
     ])
     if (!result.ok) {
       const detail = result.error?.message ?? result.stderr ?? `exit=${result.code}`
-      this._log(`adb push 失败: ${String(detail).trim().slice(0, 200)}`)
+      this._log(`adb push 失败： ${String(detail).trim().slice(0, 200)}`)
       return false
     }
     this._log(`已推送 scrcpy-server → ${this._options.deviceServerPath}`)
@@ -913,7 +913,7 @@ export class ScrcpyChannel extends EventEmitter {
     const result = await this._runCommand([...this._adbBaseArgs(), 'forward', `tcp:${port}`, name])
     if (!result.ok) {
       const detail = result.error?.message ?? result.stderr ?? `exit=${result.code}`
-      this._log(`adb forward 失败: ${String(detail).trim().slice(0, 200)}`)
+      this._log(`adb forward 失败： ${String(detail).trim().slice(0, 200)}`)
       return false
     }
     this._log(`adb forward tcp:${port} → ${name}`)
@@ -959,7 +959,7 @@ export class ScrcpyChannel extends EventEmitter {
         socket.setNoDelay?.(true)
         const bail = (why) => {
           this._guard('dial bail', () => {
-            if (why) this._log(`socket 未就绪: ${why}`)
+            if (why) this._log(`socket 未就绪： ${why}`)
             socket.destroy?.()
             finish(null)
           })
@@ -985,7 +985,7 @@ export class ScrcpyChannel extends EventEmitter {
           })
         })
       } catch (error) {
-        this._log(`socket 连接异常: ${error?.message ?? error}`)
+        this._log(`socket 连接异常： ${error?.message ?? error}`)
         finish(null)
       }
     })
@@ -995,7 +995,7 @@ export class ScrcpyChannel extends EventEmitter {
   _attachSocket(socket) {
     this._sockets.push(socket)
     socket.on('error', (error) => {
-      this._guard('socket error', () => this._log(`socket 错误: ${error?.message ?? error}`))
+      this._guard('socket error', () => this._log(`socket 错误： ${error?.message ?? error}`))
     })
     socket.setNoDelay?.(true)
     if (!this._video) {
@@ -1043,7 +1043,7 @@ export class ScrcpyChannel extends EventEmitter {
           this._guard('server stdout', () => this._log(`server: ${chunk.toString().trim().slice(0, 200)}`))
         })
         child.stdout.on('error', (error) => {
-          this._guard('server stdout error', () => this._log(`server stdout 错误: ${error?.message ?? error}`))
+          this._guard('server stdout error', () => this._log(`server stdout 错误： ${error?.message ?? error}`))
         })
       }
       if (child.stderr) {
@@ -1051,7 +1051,7 @@ export class ScrcpyChannel extends EventEmitter {
           this._guard('server stderr', () => this._log(`server: ${chunk.toString().trim().slice(0, 200)}`))
         })
         child.stderr.on('error', (error) => {
-          this._guard('server stderr error', () => this._log(`server stderr 错误: ${error?.message ?? error}`))
+          this._guard('server stderr error', () => this._log(`server stderr 错误： ${error?.message ?? error}`))
         })
       }
       ok = true
@@ -1064,7 +1064,7 @@ export class ScrcpyChannel extends EventEmitter {
       this._log(`scrcpy-server 已退出（${reason}）`)
       return
     }
-    this._log(`scrcpy-server 意外退出: ${reason}`)
+    this._log(`scrcpy-server 意外退出： ${reason}`)
     this._fail('scrcpy-server 意外退出')
   }
 
@@ -1179,7 +1179,7 @@ export class ScrcpyChannel extends EventEmitter {
       })
       .catch((error) => {
         this._guard('video redial catch', () => {
-          this._fail(`视频 socket 重拨异常: ${error?.message ?? error}`)
+          this._fail(`视频 socket 重拨异常： ${error?.message ?? error}`)
         })
       })
   }
@@ -1203,7 +1203,7 @@ export class ScrcpyChannel extends EventEmitter {
       this.stats.width = events.header.width
       this.stats.height = events.header.height
       this._log(
-        `视频流: device=${events.header.deviceName || '?'} codec=${events.header.codec || '?'} ` +
+        `视频流： device=${events.header.deviceName || '?'} codec=${events.header.codec || '?'} ` +
           `${events.header.width ?? '?'}x${events.header.height ?? '?'}`,
       )
       this.emitSafe('video-header', events.header)
@@ -1243,7 +1243,7 @@ export class ScrcpyChannel extends EventEmitter {
       this.emitSafe('video-packet', packet)
     }
     for (const error of events.errors) {
-      this._log(`视频流异常: ${JSON.stringify(error)}`)
+      this._log(`视频流异常： ${JSON.stringify(error)}`)
     }
   }
 
@@ -1280,7 +1280,7 @@ export class ScrcpyChannel extends EventEmitter {
       const buffer = build()
       socket.write(buffer, (error) => {
         if (error) {
-          this._guard(`${where}:write`, () => this._log(`控制消息写入失败: ${error?.message ?? error}`))
+          this._guard(`${where}:write`, () => this._log(`控制消息写入失败： ${error?.message ?? error}`))
         }
       })
       this.stats.controlSent += 1
