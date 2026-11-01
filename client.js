@@ -1295,12 +1295,11 @@ if (window.__ADBM_LOADED__ !== true) {
             onChange: (event) => setDraft(event.target.value),
             onKeyDown: (event) => { if (event.key === 'Enter') { event.preventDefault(); commitText() } },
           }),
-          h('button', { className: 'adbm-key', disabled: serial === '' || draft === '', onClick: commitText }, L('act.text')),
+          /* 回车已经能提交，单独的「文本」按钮是重复入口，去掉省一行认知成本。 */
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('BACK') }, L('key.back')),
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('HOME') }, L('key.home')),
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('ENTER') }, L('key.enter')),
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('DEL') }, L('key.del')),
-          h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('TAB') }, L('key.tab')),
         ),
         h('div', { className: 'adbm-keys' },
           h('button', { className: 'adbm-key', disabled: serial === '' || zoom === 1, onClick: () => zoomTo(1) }, L('act.fit')),

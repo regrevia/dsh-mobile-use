@@ -245,6 +245,12 @@ const IDLE_GRACE_MS = Math.max(3000, Number(process.env.ADBM_IDLE_GRACE_MS ?? 12
 /* 走过一次视觉读的设备，把宽限拉长：隔几分钟再读一次屏不该再付 0.8–1.1s 的冷启。
    编码器与 ffmpeg 的空转成本是几十毫秒 CPU；ADBM_VISION_KEEPALIVE_MS=0 可关掉。 */
 const VISION_KEEPALIVE_MS = Math.max(0, Number(process.env.ADBM_VISION_KEEPALIVE_MS ?? 600000) || 0)
+/** 镜像观众全部断开后只留这么久：够扛住侧栏刷新/换页重连（实测 0.25 秒就回来了），
+    用户关掉窗口就收掉 recorder/转封装/JPEG 桥，不能拿视觉的 600 秒宽限白占设备。
+    ADBM_MIRROR_LINGER_MS=0 表示断开即收。 */
+const MIRROR_LINGER_MS = Math.max(0, Number(process.env.ADBM_MIRROR_LINGER_MS ?? 2500) || 0)
+/** 关窗口时视觉宽限还剩多少可用：最近这么久内真读过帧才保，否则一并收掉。 */
+const VISION_TAIL_MS = Math.max(0, Number(process.env.ADBM_VISION_TAIL_MS ?? 15000) || 0)
 /** 看门狗节拍、判定阈值、重建冷却：2 秒一拍，8 秒没初始化段就重建，15 秒内不重复重建。 */
 /* 活着的流对象：判断一只 ffmpeg「有没有主人」靠这个集合。模块重载会新建对象，旧对象不在这里，
    它留下的子进程就该被收掉——光看 this.remuxer / this.jpegChild 看不到这一类（实测宿主上留过一只
@@ -683,22 +689,26 @@ export class LiveStream {
       /* 只看帧的人每隔一秒来一次，取帧时间戳会被不断刷新；差多少补多少，不重复排满宽限。 */
       /* 镜像那边还有常连观看者（/live）时不能停：它不走 clients，只靠这个回调说话。 */
       if (typeof this.stillWanted === 'function' && this.stillWanted()) {
-        this.scheduleIdleStop()
+        /* 短探一次：图钉那边「有人看」的宽限是 6 秒，给它一次机会关窗后被看见；
+           以前这里重排满宽限（视觉 keepWarm 下 600 秒），于是关掉镜像窗口后设备还在录。 */
+        this.scheduleIdleStop(Math.max(250, MIRROR_LINGER_MS))
         return
       }
       /* 宽限从「最后一次有人看」起算；jpegWantedAt 只有走 /frame 才会被刷新，
          单靠它会让 left 永远等于满宽限，于是反复重排、空闲流永远不释放（实测 132 秒后还在推）。 */
       const now = Date.now()
-      const lastSeen = Math.max(
-        Number(this.jpegWantedAt) || 0,
-        Number(this.lastViewerAt) || 0,
-        Number(this.idleArmedAt) || 0,
+      /* 两条需求各算各的到期：镜像观众断开只等 MIRROR_LINGER_MS（关窗即收），
+         视觉读帧才吃 keepWarm 抬高的 idleGrace。以前混成一个 lastSeen，
+         结果「关掉镜像窗口后设备和 ffmpeg 还占着 600 秒」。 */
+      const left = Math.max(
+        MIRROR_LINGER_MS - (now - (Number(this.lastViewerAt) || 0)),
+        (this.idleGrace ?? IDLE_GRACE_MS) - (now - (Number(this.jpegWantedAt) || 0)),
       )
-      const left = (this.idleGrace ?? IDLE_GRACE_MS) - (now - lastSeen)
       if (left > 250) {
         this.scheduleIdleStop(left)
         return
       }
+      this.debug('空闲回收 stop（镜像已断 ' + String(Math.round((now - (Number(this.lastViewerAt) || 0)) / 1000)) + 's）')
       this.stop()
     }), Math.max(0, delayMs)))
     this.idleTimer.unref?.()
@@ -1793,6 +1803,21 @@ export class LiveStream {
    * @param {(bytes: Buffer) => void} sink - 写响应的函数。
    * @returns {() => void} 退订函数。
    */
+  /**
+   * 最后一个镜像观众断开。视觉宽限最近没人真用过，就按「关窗」处理：
+   * idleGrace 压回短宽限，2.5 秒后收掉整条采集链，直到用户下次明确要求开镜像。
+   * @returns {void}
+   */
+  noteViewerLeft() {
+    if (this.clients.size > 0 || this.waiting.size > 0) return
+    const visionFresh = Date.now() - (Number(this.jpegWantedAt) || 0) < VISION_TAIL_MS
+    if (!visionFresh && (this.idleGrace ?? IDLE_GRACE_MS) > MIRROR_LINGER_MS) {
+      this.idleGrace = MIRROR_LINGER_MS
+      this.debug('观者走光，按关窗回收（' + String(MIRROR_LINGER_MS) + 'ms）')
+    }
+    this.scheduleIdleStop(MIRROR_LINGER_MS)
+  }
+
   subscribe(sink) {
     if (typeof sink !== 'function') throw new TypeError('subscribe: sink 必须是函数')
     /* 配额：每个流最多 MAX_SUBSCRIBERS 个观众。超了直接拒绝（/stream 那边转成断开），
@@ -1830,7 +1855,7 @@ export class LiveStream {
       this.waiting.delete(sink)
       this.lastViewerAt = Date.now()
       if (gen !== this.generation) return
-      if (this.clients.size === 0 && this.waiting.size === 0) this.scheduleIdleStop()
+      this.noteViewerLeft()
     }
   }
 
