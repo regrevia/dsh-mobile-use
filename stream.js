@@ -1012,6 +1012,14 @@ export class LiveStream {
     this.recorder = child
     /* 新进程意味着读端是新的：上一轮为背压按下的暂停状态必须清掉。 */
     this.recorderPaused = false
+    /* 新录屏的第一个字节就是 SPS/IDR：上一代 JPEG 解码器接在旧流中间，新流的参数集它没见过，
+       实测会一直解不出帧（视觉读白等 1.2 s 再回退截图，甚至误触发重开录屏）。有人要帧时
+       跟着重建一次，让它从新流开头接。 */
+    if (this.jpegChild !== null) {
+      this.closeJpeg()
+      this.jpegOpenAt = 0
+      this.guard('jpeg-follow-recorder', () => { this.enableJpeg() })
+    }
     const gen = this.generation
     this.debug('spawn gen=' + String(gen) + ' session=' + String(this.sessions))
     let stderr = ''
