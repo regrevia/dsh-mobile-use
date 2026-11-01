@@ -1808,8 +1808,19 @@ export class LiveStream {
    * idleGrace 压回短宽限，2.5 秒后收掉整条采集链，直到用户下次明确要求开镜像。
    * @returns {void}
    */
-  noteViewerLeft() {
+  noteViewerLeft(hard = false) {
     if (this.clients.size > 0 || this.waiting.size > 0) return
+    /* 关窗 beacon 是用户明说「不看了」：不用再留 2.5 秒给重开侧栏，直接按空闲收。 */
+    if (hard) {
+      const stream = this
+      this.idleGrace = MIRROR_LINGER_MS
+      this.trackTimer(setTimeout(() => this.guard('close-stop', () => {
+        if (stream.clients.size > 0 || stream.waiting.size > 0) return
+        if (typeof stream.stillWanted === 'function' && stream.stillWanted()) return
+        stream.stop()
+      }), 0))
+      return
+    }
     const visionFresh = Date.now() - (Number(this.jpegWantedAt) || 0) < VISION_TAIL_MS
     if (!visionFresh && (this.idleGrace ?? IDLE_GRACE_MS) > MIRROR_LINGER_MS) {
       this.idleGrace = MIRROR_LINGER_MS

@@ -2232,10 +2232,19 @@ export function setupMirror(ctx, tools) {
         const mirror = mirrorFor(serial)
         mirror.lastWatchAt = 0
         mirror.idleSince = Date.now()
-        if (mirror.watchers.size === 0) mirror.stopRecorder()
-        const stream = streams.get(serial)
-        if (stream !== undefined) stream.noteViewerLeft()
-        return json({ closed: serial })
+        /* 先回话再收尾：收尾里有一条同步 adb（清场/量尺寸，设备忙时要好几秒），
+           放在响应之前会把「关窗」拖成 7 秒——页面早就关了，用户却以为没反应。 */
+        json({ closed: serial })
+        setImmediate(() => {
+          try {
+            if (mirror.watchers.size === 0) mirror.stopRecorder()
+            const stream = streams.get(serial)
+            if (stream !== undefined) stream.noteViewerLeft(true)
+          } catch (error) {
+            mirror.error = String(error?.message ?? error).slice(0, 200)
+          }
+        })
+        return
       }
 
       if (path === '/watching') {
