@@ -22,7 +22,7 @@ import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=218'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
-import { PLAYER_HTML } from './page.js?v=36'
+import { PLAYER_HTML } from './page.js?v=37'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -2225,6 +2225,19 @@ export function setupMirror(ctx, tools) {
         res.end(DEV_MSE_PAGE)
         return
       }
+      /* 浏览器关页/关窗时用 sendBeacon 打这一下：只收这一台，且只在不剩观众时才收，
+         别的会话还在看的镜像不受影响。 */
+      if (path === '/close' && (req.method === 'GET' || req.method === 'POST')) {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        const mirror = mirrorFor(serial)
+        mirror.lastWatchAt = 0
+        mirror.idleSince = Date.now()
+        if (mirror.watchers.size === 0) mirror.stopRecorder()
+        const stream = streams.get(serial)
+        if (stream !== undefined) stream.noteViewerLeft()
+        return json({ closed: serial })
+      }
+
       if (path === '/watching') {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         const mirror = mirrorFor(serial)

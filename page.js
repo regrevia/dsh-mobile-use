@@ -624,10 +624,27 @@ export const PLAYER_HTML = `<!doctype html>
     })
   })
 
+  function tellClosed() {
+    /* 关页/关窗要立刻收工：不等 2.5 秒宽限，也别等心跳超时。beacon 在页面卸载后仍会发出。 */
+    try {
+      var body = 'serial=' + encodeURIComponent(serial)
+      if (navigator.sendBeacon) navigator.sendBeacon(ROUTE + '/close', body)
+      else fetch(ROUTE + '/close', { method: 'POST', body: body, keepalive: true })
+    } catch (error) { /* 关页失败不影响已经关掉的页面 */ }
+  }
+
+  window.addEventListener('pagehide', function () {
+    liveStopped = true
+    clearInterval(stateTimer)
+    if (pollTimer !== null) clearTimeout(pollTimer)
+    tellClosed()
+  })
+
   window.addEventListener('beforeunload', function () {
     liveStopped = true
     clearInterval(stateTimer)
     if (pollTimer !== null) clearTimeout(pollTimer)
+    tellClosed()
   })
 })()
 </script>
