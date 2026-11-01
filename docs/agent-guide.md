@@ -23,6 +23,7 @@
 - 镜像靠宿主侧采集链：设备端一条 `screenrecord`（分段 10 s）+ 本机 ffmpeg remux + JPEG 桥。**没人看就不该有 ffmpeg**；关窗即停。
 - 关窗/关页会发 `/close` beacon，宿主当场按台收尾；还有观众或镜像仍被要求时不停。
 - 同一台设备只允许：1 条推流 `screenrecord`、1 条镜像分段 `screenrecord`（仅在被看时）、1 个 remux、1 个 JPEG 桥、1 个 scrcpy server。看到两条同类进程就是泄漏。
+- scrcpy 通道也按台唯一：关窗后 3 秒没人回来就 `stop`（设备端 server 按 `scid` 一起收），闲置 90 秒自清；下次开栏懒启动。`/want` 带 `closed` 标记，用户亲手关过的请求不会把右栏自己弹回来。
 - 宿主被强杀后设备端进程不会自己退：下次开录前会按本插件 marker 精确清场，不要用 `pkill screenrecord` 这种泛杀。
 
 ## 四、改界面时的规矩

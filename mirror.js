@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=218'
+import { LiveStream, packFrame } from './stream.js?v=220'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
 import { PLAYER_HTML } from './page.js?v=37'
 
@@ -67,6 +67,8 @@ const clients = new Map()
 
 let wantSession = ''
 let wantAt = 0
+/* 用户亲手关窗的时刻：比 wantAt 新就说明「这次请求已经被关掉了」，不再补开右栏。 */
+let wantClosedAt = 0
 let wantTitle = ''
 
 /** 对外报的直播帧率：实测 4–5 帧/秒，够看清操作反馈。 */
@@ -1179,6 +1181,49 @@ export function setupMirror(ctx, tools) {
    * @returns {any | null} 已就绪的通道；没就绪给 null。
    */
   /**
+   * 收掉一台设备的 scrcpy 通道（幂等）：设备端 server 也按 scid 一并收掉。
+   * 通道是常开的编码器，没人看还留着就是白烧设备 CPU。
+   * @param {string} serial - 设备。
+   * @param {string} [why] - 记账用原因。
+   * @returns {boolean} 真收掉了就是 true。
+   */
+  function closeChannel(serial, why = '') {
+    const entry = channels.get(serial)
+    if (entry === undefined) return false
+    channels.delete(serial)
+    const channel = entry.channel
+    entry.channel = null
+    entry.ready = null
+    entry.starting = false
+    if (channel === null || channel === undefined) return true
+    try {
+      channel.stop?.()
+    } catch {
+      /* 已经停了 */
+    }
+    ctx.logger?.debug?.('[scrcpy] 通道关闭 ' + String(serial) + (why === '' ? '' : ' ' + why))
+    return true
+  }
+
+  /**
+   * 关窗后 3 秒内没人回来就收掉通道：别让编码器在后台继续跑。
+   * @param {string} serial - 设备。
+   * @returns {void}
+   */
+  function releaseChannelSoon(serial) {
+    const entry = channels.get(serial)
+    if (entry === undefined || entry.channel === null || entry.channel === undefined) return
+    const timer = setTimeout(() => {
+      const stream = streams.get(serial)
+      const busy = stream !== undefined && ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0)
+      const watched = (mirrors.get(serial)?.watchers?.size ?? 0) > 0
+      if (busy || watched) return
+      closeChannel(serial, 'close')
+    }, 3000)
+    timer.unref?.()
+  }
+
+  /**
    * 最近一次 scrcpy 通道启动失败的原因（没有失败过就是 null）。
    * 回执里带上它，agent 才知道低延迟通道为什么退回了录屏/截图。
    * @param {string} serial - 设备。
@@ -1208,7 +1253,7 @@ export function setupMirror(ctx, tools) {
       entry = undefined
     }
     if (entry === undefined) {
-      entry = { channel: null, ready: null, failed: false, starting: false, failedAt: 0 }
+      entry = { channel: null, ready: null, failed: false, starting: false, failedAt: 0, usedAt: 0 }
       channels.set(serial, entry)
       try {
         channelSeq += 1
@@ -1276,6 +1321,7 @@ export function setupMirror(ctx, tools) {
           ctx.logger?.warn?.('[scrcpy] 通道启动抛错：' + String(error?.message ?? error))
         })
     }
+    entry.usedAt = Date.now()
     return entry.ready
   }
 
@@ -1609,6 +1655,7 @@ export function setupMirror(ctx, tools) {
     if (wanted === '') return 0
     wantSession = wanted
     wantAt = Date.now()
+    wantClosedAt = 0
     wantTitle = ''
     /* 标题只用来兜底认窗口：有些窗口是多栏的，mounted 报的是另一栏的会话。 */
     try {
@@ -2230,6 +2277,8 @@ export function setupMirror(ctx, tools) {
       if (path === '/close' && (req.method === 'GET' || req.method === 'POST')) {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         const mirror = mirrorFor(serial)
+        /* 记下「用户亲手关了」，否则 /want 会把同一个请求再送一遍，右栏自己弹回来。 */
+        wantClosedAt = Date.now()
         mirror.lastWatchAt = 0
         mirror.idleSince = Date.now()
         /* 先回话再收尾：收尾里有一条同步 adb（清场/量尺寸，设备忙时要好几秒），
@@ -2240,6 +2289,7 @@ export function setupMirror(ctx, tools) {
             if (mirror.watchers.size === 0) mirror.stopRecorder()
             const stream = streams.get(serial)
             if (stream !== undefined) stream.noteViewerLeft(true)
+            releaseChannelSoon(serial)
           } catch (error) {
             mirror.error = String(error?.message ?? error).slice(0, 200)
           }
@@ -2351,6 +2401,7 @@ export function setupMirror(ctx, tools) {
           error: mirror.error,
           pages: events.size,
           want: wantSession,
+          channels: channels.size,
           clients: [...clients.values()].map(({ pid, at, mounted, title, beat, lag_ms }) => ({ pid, at, mounted, title, beat, lag_ms })),
           diag,
         })
@@ -2488,7 +2539,8 @@ export function setupMirror(ctx, tools) {
       }
 
       if (path === '/want' && req.method === 'GET') {
-        return json({ session: wantSession, at: wantAt, title: wantTitle, pages: events.size })
+        /* closed：这条请求已经被用户亲手关掉，页面别再把右栏补回来。 */
+        return json({ session: wantSession, at: wantAt, title: wantTitle, pages: events.size, closed: wantClosedAt > 0 && wantClosedAt >= wantAt })
       }
 
       if (path === '/actions') {
@@ -2579,6 +2631,22 @@ export function setupMirror(ctx, tools) {
     await writeFile(file, frame)
     return { ok: true, path: file, bytes: frame.length, at: mirror.latestAt }
   }
+
+  /* 通道空闲回收：没人看、也没人手碰过 90 秒就收，下次开栏再懒启动（约 1~2 秒）。
+     不设这条，一次看镜像就会把设备编码器和一条 adb 进程一直留着。 */
+  const CHANNEL_IDLE_MS = Number(process.env.ADBM_CHANNEL_IDLE_MS ?? 90000)
+  const channelSweep = setInterval(() => {
+    const now = Date.now()
+    for (const [serial, entry] of [...channels]) {
+      if (entry?.channel === null || entry?.channel === undefined) continue
+      if (now - (Number(entry.usedAt) || 0) < CHANNEL_IDLE_MS) continue
+      const stream = streams.get(serial)
+      const busy = stream !== undefined && ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0)
+      if (busy || (mirrors.get(serial)?.watchers?.size ?? 0) > 0) continue
+      closeChannel(serial, 'idle')
+    }
+  }, 30000)
+  channelSweep.unref?.()
 
   return {
     open,
@@ -2677,10 +2745,8 @@ export function setupMirror(ctx, tools) {
         try { stream.stop() } catch { /* 已经停了 */ }
       }
       streams.clear()
-      for (const entry of channels.values()) {
-        try { void entry.channel?.stop?.() } catch { /* 已经停了 */ }
-      }
-      channels.clear()
+      clearInterval(channelSweep)
+      for (const serial of [...channels.keys()]) closeChannel(serial, 'stopAll')
       fastInput.tap = null
       fastInput.swipe = null
       fastInput.gesture = null

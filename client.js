@@ -1461,6 +1461,8 @@ if (window.__ADBM_LOADED__ !== true) {
             try { body = JSON.parse(event?.data ?? '{}') } catch { body = {} }
             const want = body?.sessionId ?? body?.session
             if (typeof want !== 'string' || want === '') return
+            /* 用户已经亲手关掉这次请求：不再把右栏补回来。 */
+            if (body?.closed === true) return
             /* 推送会重连、页面会重载：同一个请求（at 不变或更旧）不再重放一次。 */
             const at = Number(body?.at ?? 0) || 0
             /* 宿主留下的旧请求不补开：页面隔很久才装载时，半小时前的 want 不该再弹一次栏。 */
