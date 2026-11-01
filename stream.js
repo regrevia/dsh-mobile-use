@@ -993,6 +993,9 @@ export class LiveStream {
       } catch (error) {
         this.debug('sweep-screenrecord failed ' + String(error?.message ?? error).slice(0, 80))
       }
+    } else if (!recorderAlive && peerHost !== '') {
+      /* 有个宿主正在用同一台设备：设备端清场归它，这里只留一行日志，方便排查「为什么没清」。 */
+      this.debug('sweep skipped: peer host ' + peerHost)
     }
     this.ensureSize()
     const source = this.pickSource()
