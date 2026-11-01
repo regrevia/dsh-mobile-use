@@ -1985,9 +1985,12 @@ export class LiveStream {
       closedAt: this.closedAt,
       /* 最近一片的解码时间与它距现在的秒数：两个数一起看就是整条链路的延迟。 */
       lastPts: this.lastPts ?? null,
-      /* 端到端延迟的测量口径：Date.now() - (ptsOriginMs + mediaTime*1000)。 */
       ptsOriginMs: this.ptsOriginMs ?? null,
-      ptsAgeMs: this.lastPts === null || this.lastPts === undefined ? null : Math.round(Date.now() - this.startedAt - this.lastPts * 1000),
+      /* 推流侧能测的只有「最后一帧到达距今多久」：它反映采集/推送有没有卡住，
+         不是画面上屏的延迟（那一段在浏览器里，页面自己报 lag_ms）。以前拿
+         startedAt 去减分片 PTS，两个原点不同，读出来动辄 7 秒，纯属误报。 */
+      frameAgeMs: this.lastAt === 0 ? null : Math.round(Date.now() - this.lastAt),
+      ptsAgeMs: this.lastAt === 0 ? null : Math.round(Date.now() - this.lastAt),
       capture: this.scrcpy !== null ? 'scrcpy' : (this.recorder !== null ? 'screenrecord' : 'idle'),
     }
   }
