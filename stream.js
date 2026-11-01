@@ -1340,6 +1340,12 @@ export class LiveStream {
     if (this.recorderPaused) return
     const recorder = this.recorder
     if (recorder === null) return
+    /* 没有观众要 mp4：录屏 stdout 是 JPEG 支路和转封装共用的，pause 它等于把视觉读也饿死。
+       直接丢转封装（观众来了会重建并重新要 IDR），绝不为了没人看的输出掐采集链。 */
+    if (this.clients.size === 0 && this.waiting.size === 0) {
+      this.closeRemuxer()
+      return
+    }
     this.recorderPaused = true
     this.queueStalls += 1
     this.debug('remux-backpressure pause')
@@ -1393,6 +1399,10 @@ export class LiveStream {
    */
   ensureRemuxer() {
     if (this.remuxer !== null) return
+    /* 没有镜像观众就根本不需要转封装：只是视觉读（adb_look/adb_ocr）时 clients/waiting 恒为 0，
+       起的 ffmpeg 没人读它的 mp4，它的 stdin 一背压就会 pause 录屏 stdout，
+       同一条管道的 JPEG 支路跟着断帧 → 看门狗以为流坏了 → 杀录屏重开，形成周期性空窗。 */
+    if (this.clients.size === 0 && this.waiting.size === 0) return
     this.error = ''
     const child = spawn('ffmpeg', [
       '-hide_banner', '-loglevel', 'error',
