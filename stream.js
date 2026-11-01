@@ -987,8 +987,7 @@ export class LiveStream {
     const peerHost = typeof globalThis.__dshAdbPeerHostPid === 'function' ? String(globalThis.__dshAdbPeerHostPid() ?? '') : ''
     if (!recorderAlive && peerHost === '' && process.env.ADBM_STREAM_SWEEP !== '0') {
       const tag = this.serial.replace(/[^\w.-]/g, '_')
-      /* 顺手把上一代的 pid 标记文件删掉：进程明天会被日清扫带走，但文件不该在原地攒一整天。 */
-      const sweep = `rm -f /data/local/tmp/dsh-mobile-use-stream-${tag}-*.pid /data/local/tmp/dsh-mobile-use-rec-${tag}-*.pid 2>/dev/null; pkill -f 'dsh-mobile-use-stream-${tag}-' 2>/dev/null; pkill -f 'dsh-mobile-use-rec-${tag}-' 2>/dev/null; echo ok`
+      const sweep = `pkill -f 'dsh-mobile-use-stream-${tag}-' 2>/dev/null; pkill -f 'dsh-mobile-use-rec-${tag}-' 2>/dev/null; echo ok`
       try {
         execFileSync(this.adbPath, ['-s', this.serial, 'shell', sweep], { timeout: 4000, stdio: 'ignore' })
       } catch (error) {
