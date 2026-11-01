@@ -1019,6 +1019,11 @@ export class Mirror {
       { timeout: 8000, direct: true }).catch(() => {})
     }
     while (!this.stopping && !this.recorderStopRequested) {
+      /* 观众走干净（含宽限）就不再开新的一段：即使 stopRecorder 的调用漏了，也不会白录。 */
+      if (!this.anyoneWatching()) {
+        this.recorderStopRequested = true
+        break
+      }
       const started = Date.now()
       this.recorderSeq += 1
       /* 每段复用同一个 pid 文件：文件名带段号时每段都会留一个 5 字节文件在设备上，
@@ -2223,9 +2228,14 @@ export function setupMirror(ctx, tools) {
       if (path === '/watching') {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         const mirror = mirrorFor(serial)
-        mirror.lastWatchAt = Date.now()
-        void mirror.start()
-        return json({ watching: true })
+        /* 纯状态查询不要动采集链：以前任何一次探测都会把 lastWatchAt 顶到现在，
+           于是「关掉窗口」之后只要还有进程在轮询状态，镜像就永远不会被判空闲。
+           只有带 watch=1 的调用才算「有人真的在看」。 */
+        if (url.searchParams.get('watch') === '1') {
+          mirror.lastWatchAt = Date.now()
+          void mirror.start()
+        }
+        return json({ watching: mirror.anyoneWatching() })
       }
 
       if (path === '/frame' && req.method === 'GET') {
