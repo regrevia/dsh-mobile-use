@@ -166,6 +166,11 @@ node selftest.mjs --serial emulator-5554
 
 ### 更新日志
 
+### 1.4.28（操作手册 + 转发口随设备清理）
+
+- 新增 [docs/agent-guide.md](docs/agent-guide.md)：判定顺序、镜像生命周期、资源不变量、延时口径、排障入口。
+- `pruneGoneDevices` 一并清掉自己建过、设备已不在的 adb 转发口。
+
 ### 1.4.27（关窗先回话，再收尾）
 
 - **`/close` 先应答再收尾**：收尾里有一条同步 adb（清场/量尺寸），设备忙时能把「关窗」拖到 7 秒。现在先返回 `{"closed":…}`，收尾放到下一拍。

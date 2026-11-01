@@ -4278,6 +4278,9 @@ async function pruneGoneDevices() {
   /* 转发口与 WebView 调试口是按 `serial/xxx` 拼的复合键，前缀就是设备。 */
   const forwardSerials = new Set()
   for (const key of webPorts.keys()) forwardSerials.add(String(key).split('/')[0])
+  /* 自己建的转发口也要跟着设备一起清：设备拔了 adb 那边已失效，本机这张表却会一直留着，
+     插回来时还按旧端口算，容易撞到别人的端口。 */
+  for (const entry of ownedForwards.values()) forwardSerials.add(String(entry.serial))
   for (const serial of forwardSerials) keys.add(serial)
   let dropped = 0
   for (const serial of goneSerials(keys, online, busy)) {
@@ -4292,6 +4295,11 @@ async function pruneGoneDevices() {
     rootCache.delete(serial)
     shellQueues.delete(serial)
     for (const key of webPorts.keys()) if (String(key).startsWith(`${serial}/`)) webPorts.delete(key)
+    for (const [key, entry] of [...ownedForwards]) {
+      if (entry.serial !== serial) continue
+      ownedForwards.delete(key)
+      void adb(['-s', serial, 'forward', '--remove', entry.local], { timeout: 4000 }).catch(() => {})
+    }
     dropped += 1
   }
   return dropped
