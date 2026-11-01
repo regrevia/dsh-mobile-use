@@ -4248,6 +4248,75 @@ function auditProcessCounts(lines) {
 }
 
 /**
+ * 按设备序列号存下来的那些缓存（树快照、屏尺寸、dump 队列、常驻 shell、转发口、u2 服务状态）
+ * 从来不会自己消失：换一台机器、重启模拟器、插拔 USB 都会留下上一台的一份，几十次之后就是
+ * 几十份树占着宿主堆。这里定期核对 adb 列表，只清「已经不在列表里、也没有活跃推流」的设备；
+ * 在线设备一个字节都不动，所以不会影响正在用的那台。
+ * @returns {Promise<number>} 这次清掉了几台。
+ */
+async function pruneGoneDevices() {
+  let online
+  try {
+    online = new Set((await listDevices()).map((device) => device.serial))
+  } catch {
+    return 0
+  }
+  /* adb 自己抽风时会返回空表：这时候清等于把正在用的缓存全删一遍，宁可这轮不清。 */
+  if (online.size === 0) return 0
+  const live = globalThis.__dshAdbLiveStreams
+  const busy = new Set()
+  if (live instanceof Set) {
+    for (const stream of live) {
+      const liveSerial = String(stream?.serial ?? '')
+      if (liveSerial !== '') busy.add(liveSerial)
+    }
+  }
+  const keys = new Set()
+  for (const map of [lastTrees, lastSparseTrees, lastUiLines, screenSizes, dumpQueues, dumpPending, u2Cache, rootCache, shellQueues, shellChannels]) {
+    for (const key of map.keys()) keys.add(String(key))
+  }
+  /* 转发口与 WebView 调试口是按 `serial/xxx` 拼的复合键，前缀就是设备。 */
+  const forwardSerials = new Set()
+  for (const key of webPorts.keys()) forwardSerials.add(String(key).split('/')[0])
+  for (const serial of forwardSerials) keys.add(serial)
+  let dropped = 0
+  for (const serial of goneSerials(keys, online, busy)) {
+    killShell(serial)
+    lastTrees.delete(serial)
+    lastSparseTrees.delete(serial)
+    lastUiLines.delete(serial)
+    screenSizes.delete(serial)
+    dumpQueues.delete(serial)
+    dumpPending.delete(serial)
+    u2Cache.delete(serial)
+    rootCache.delete(serial)
+    shellQueues.delete(serial)
+    for (const key of webPorts.keys()) if (String(key).startsWith(`${serial}/`)) webPorts.delete(key)
+    dropped += 1
+  }
+  return dropped
+}
+
+/**
+ * 从缓存键里挑出「设备已经不在了」的那些：不在 adb 列表里，也不在推流注册表里。
+ * 纯函数，单测锁住；真正的删除动作由调用方做。
+ * @param {Iterable<string>} keys - 缓存里出现过的设备序列号。
+ * @param {Set<string>} online - 当前 adb 列表里的序列号。
+ * @param {Set<string>} busy - 正在推流的序列号。
+ * @returns {string[]} 可以清掉的序列号。
+ */
+function goneSerials(keys, online, busy) {
+  const gone = []
+  for (const key of keys) {
+    const serial = String(key ?? '')
+    if (serial === '') continue
+    if (online.has(serial) || busy.has(serial)) continue
+    if (!gone.includes(serial)) gone.push(serial)
+  }
+  return gone
+}
+
+/**
  * 设备端的兜底清场：宿主被重载或强杀时，设备上的 scrcpy server 与录屏进程不会跟着退出，
  * 它们一直占着编码器 / 录屏器，下一次推流就表现为「连上但没帧」。这里只清本插件独占的标记
  * （自己的 jar 文件名、自己的录屏 marker、隔夜 pid 文件），不碰别的 scrcpy 会话；
@@ -4312,6 +4381,9 @@ export function apply(ctx, config) {
     } catch { /* 定时器是独立故障域 */ }
   }, 2000)
   actionSaver.unref?.()
+  /* 拔掉的设备留下的树快照/屏尺寸/队列没有别的时机能清：每 5 分钟对一次 adb 列表。 */
+  const staleSweep = setInterval(() => { void pruneGoneDevices() }, 5 * 60_000)
+  staleSweep.unref?.()
 
   /* 实时镜像：侧栏直播 + 标注回传 + 本机 3 分钟环形缓冲。 */
   const mirror = setupMirror(ctx, {
@@ -4333,6 +4405,7 @@ export function apply(ctx, config) {
   mirrorRef = mirror
   ctx.effect(() => () => {
     clearInterval(actionSaver)
+    clearInterval(staleSweep)
     clearTimeout(leftoverTimer)
     if (globalThis.__dshAdbPeerHostPid === peerHostPid) delete globalThis.__dshAdbPeerHostPid
     if (lockOwned) {
@@ -8216,6 +8289,8 @@ export const __internals = {
   mirrorStatus: async (serial) => (mirrorRef === null ? null : mirrorRef.status(serial)),
   channelFailure: (serial) => (mirrorRef === null ? null : mirrorRef.channelFailure?.(serial) ?? null),
   leftoverBusySerials,
+  goneSerials,
+  pruneGoneDevices,
   auditProcessCounts,
   visionFrame: (serial) => (mirrorRef === null ? null : mirrorRef.visionFrame(serial)),
   selectNodes,

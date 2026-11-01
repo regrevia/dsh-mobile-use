@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { __internals } from '../index.js'
 
-const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, spotCandidates, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs, leftoverBusySerials, auditProcessCounts } = __internals
+const { selectNodes, nearMiss, matches, nodeStateOk, withinBox, inWithinBox, findBlocker, failureSuffix, selectXPath, elementRegion, collapseSameSpot, spotList, displaySizeFrom, scrollFrames, swipeLine, guardOutput, tapMissReason, describeTapMiss, diffLines, digestLine, validateSteps, retryBudget, parseNodes, compactTree, crashHint, crashLineAgeMs, spotCandidates, dezero, pollGap, awaitStable, stableFailure, acquireDirect, DIRECT_GATE, pinchArgs, leftoverBusySerials, auditProcessCounts, goneSerials } = __internals
 
 let pass = 0
 const it = (label, run) => {
@@ -910,6 +910,17 @@ it('清场跳过正在用的设备：serial 挂在实例上也算', () => {
     { },
   ])
   assert.deepEqual([...leftoverBusySerials(live)].sort(), ['A1', 'B2'])
+})
+
+it('拔掉的设备留下的缓存能被认出来：在线的不动、推流中的不动', () => {
+  const online = new Set(['15ca9736'])
+  const busy = new Set(['emulator-5554'])
+  const gone = goneSerials(['15ca9736', 'emulator-5554', '0123456789ABCDEF', '0123456789ABCDEF', ''], online, busy)
+  const want = ['0123456789ABCDEF']
+  if (gone.join(',') !== want.join(',')) throw new Error(`应只挑出已消失的设备，实际 ${JSON.stringify(gone)}`)
+  if (goneSerials([], online, busy).length !== 0) throw new Error('没有缓存键时不该有输出')
+  if (goneSerials(['15ca9736'], online, busy).length !== 0) throw new Error('在线设备不能被清')
+  if (goneSerials([undefined, null], online, busy).length !== 0) throw new Error('空键要被忽略')
 })
 
 console.log(`\n${pass} 项通过\n`)
