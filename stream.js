@@ -1226,17 +1226,31 @@ export class LiveStream {
     })
   }
 
+  /**
+   * 宽限内还有人在看帧（含「只听 JPEG、不进 clients/waiting」的视觉读）。
+   * @returns {boolean} 还想看帧就是 true。
+   */
+  visionWanted() {
+    const wanted = Number(this.jpegWantedAt) || 0
+    if (wanted === 0) return false
+    const last = Math.max(wanted, Number(this.lastViewerAt) || 0)
+    return Date.now() - last < (this.idleGrace ?? IDLE_GRACE_MS)
+  }
+
   /** 到点自动续上，避免中断超过半秒。 @returns {void} */
   scheduleRestart() {
     if (this.stopping || this.restartTimer !== null) return
-    if (this.clients.size === 0 && this.waiting.size === 0) return
+    /* 视觉读（adb_look/adb_ocr）不进 clients/waiting：只判观众数的话，录满 175 s 正常退出后
+       没人续录，免截图快路径最多活 175 s，之后的视觉读又全程掉回 screencap（实测 619–1096 ms）。
+       宽限内还有人看帧就照样续。 */
+    if (this.clients.size === 0 && this.waiting.size === 0 && !this.visionWanted()) return
     const gen = this.generation
     this.restartTimer = this.trackTimer(setTimeout(() => this.guard('restart', () => {
       this.forgetTimer(this.restartTimer)
       this.restartTimer = null
       /* 代际校验：换成这一代的 stop() 已经跑过后，这个迟到回调不许再起新录屏。 */
       if (gen !== this.generation) return
-      if (!this.stopping && (this.clients.size > 0 || this.waiting.size > 0)) {
+      if (!this.stopping && (this.clients.size > 0 || this.waiting.size > 0 || this.visionWanted())) {
         /* 上一轮可能是被 SIGKILL 的 adb：先按自己的 pid 清掉设备端残留，再开新录屏。 */
         this.killOwnRecorder()
         this.spawnRecorder()
