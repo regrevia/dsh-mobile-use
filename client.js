@@ -256,11 +256,13 @@ if (window.__ADBM_LOADED__ !== true) {
             if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) {
               const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
               const start = sourceBuffer.buffered.start(0)
-              /* 追到直播边缘：落后 0.6 s 直接跳到尾部，落后一点用 1.25 倍速追
-                 （小漂移不会自己收敛，不追就一直落后）；顺手扔掉 4 s 之前的。 */
+              /* 追到直播边缘：落后 0.45 s 直接跳到尾部；小幅漂移用 1.25 倍速追，
+                 追进 60 ms 再放回 1×。加回差是为了别每帧在 1×/1.25× 之间来回切——
+                 切一次就要停一下，反而更卡。顺手扔掉 4 s 之前的。 */
               const lag = end - video.currentTime
               if (lag > 0.45) video.currentTime = Math.max(start, end - 0.06)
-              else video.playbackRate = lag > 0.12 ? 1.2 : 1
+              else if (lag > 0.14 && video.playbackRate < 1.2) video.playbackRate = 1.25
+              else if (lag < 0.06 && video.playbackRate > 1) video.playbackRate = 1
               if (end - start > 8 && sourceBuffer.updating === false) sourceBuffer.remove(start, end - 4)
               /* 延迟的唯一可观测口径：把落后直播边缘多少报给宿主，/state 里看得到。 */
               if (Date.now() - lastLagAt > 2000) {
@@ -1302,9 +1304,13 @@ if (window.__ADBM_LOADED__ !== true) {
           h('button', { className: 'adbm-key', disabled: serial === '', onClick: () => sendKey('DEL') }, L('key.del')),
         ),
         h('div', { className: 'adbm-keys' },
-          h('button', { className: 'adbm-key', disabled: serial === '' || zoom === 1, onClick: () => zoomTo(1) }, L('act.fit')),
-          h('button', { className: 'adbm-key', disabled: serial === '', 'data-on': zoom >= 2 ? '1' : '0', onClick: () => zoomTo(2) }, '2×'),
-          h('button', { className: 'adbm-key', disabled: serial === '', 'data-on': zoom >= 3 ? '1' : '0', onClick: () => zoomTo(3) }, '3×'),
+          /* 一个按钮轮着放大：标签写「按下会变成什么」，比并排三个尺寸按钮少两行认知。 */
+          h('button', {
+            className: 'adbm-key',
+            disabled: serial === '',
+            'data-on': zoom > 1 ? '1' : '0',
+            onClick: () => zoomTo(zoom >= 3 ? 1 : zoom + 1),
+          }, zoom >= 3 ? L('act.fit') : (zoom === 2 ? '3×' : '2×')),
         ),
         ops.length === 0 ? null : h('div', { className: 'adbm-log' }, ops.slice(-2).join(' · ')),
         ...marks.map((mark) => h('span', {
