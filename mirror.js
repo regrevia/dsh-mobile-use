@@ -2741,7 +2741,12 @@ export function setupMirror(ctx, tools) {
   const channelSweep = setInterval(() => {
     const now = Date.now()
     for (const [serial, entry] of [...channels]) {
-      if (entry?.channel === null || entry?.channel === undefined) continue
+      /* 通道对象已经被 closed 回调清掉、只剩一个壳：设备上早没进程了，留着会让
+         /state 一直报「有通道」，排查时看不出真假。放过一个空闲窗口就把它删掉。 */
+      if (entry?.channel === null || entry?.channel === undefined) {
+        if (now - (Number(entry.usedAt) || 0) > CHANNEL_IDLE_MS) channels.delete(serial)
+        continue
+      }
       if (now - (Number(entry.usedAt) || 0) < CHANNEL_IDLE_MS) continue
       const stream = streams.get(serial)
       const busy = stream !== undefined && ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0)
