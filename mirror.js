@@ -1172,6 +1172,8 @@ export function setupMirror(ctx, tools) {
   /* 低延迟通道：一台设备一条 scrcpy 连接，懒启动，失败就永久退回 adb。
      host 不能因为它崩：起停全在 guard 里，启动 Promise 失败也只记一个 failed。 */
   const channels = new Map()
+  /* WebCodecs 直连的观众：它们同样占着编码器，回收扫描要把它们算成「有人在看」。 */
+  const avcClients = new Set()
   let channelSeq = 0
 
   /**
@@ -2227,6 +2229,69 @@ export function setupMirror(ctx, tools) {
         return
       }
 
+      /* 裸 H.264 直供：给 WebCodecs 用，省掉 ffmpeg 转封装那一跳。
+         帧格式 [u32 BE len][u8 类型 0=参数集 1=样本][f64 BE pts 毫秒][负载]，与 /stream 的
+         分片 fMP4 完全独立：老前端照旧走 /stream，谁也不会因为这条实验通道没数据而黑屏。 */
+      if (path === '/stream/avc' && req.method === 'GET') {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        if (liveSubscribers >= MAX_LIVE_SUBSCRIBERS) {
+          res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: '推流连接数已达上限' }))
+          return
+        }
+        let entry = null
+        try { entry = await channelFor(serial) } catch { entry = null }
+        const channel = entry ?? null
+        if (channel === null || typeof channel.on !== 'function') {
+          res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: '设备编码通道未就绪' }))
+          return
+        }
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'cache-control': 'no-store, no-transform',
+          'x-accel-buffering': 'no',
+          'access-control-allow-origin': '*',
+          connection: 'keep-alive',
+        })
+        res.flushHeaders()
+        liveSubscribers += 1
+        avcClients.add(res)
+        let closed = false
+        const writeAvc = (type, ptsMs, payload) => {
+          if (closed || !Buffer.isBuffer(payload) || payload.length === 0) return
+          const head = Buffer.allocUnsafe(13)
+          head.writeUInt32BE(payload.length + 9, 0)
+          head.writeUInt8(type, 4)
+          head.writeDoubleBE(Number(ptsMs) || 0, 5)
+          try { res.write(head); res.write(payload) } catch { cleanup() }
+        }
+        const onPacket = (packet) => {
+          if (closed) return
+          const data = packet?.data
+          if (!Buffer.isBuffer(data) || data.length === 0) return
+          const ptsMs = typeof packet?.pts === 'number' ? packet.pts / 1000 : Date.now()
+          writeAvc(packet?.config === true ? 0 : 1, ptsMs, data)
+        }
+        function cleanup() {
+          if (closed) return
+          closed = true
+          avcClients.delete(res)
+          liveSubscribers = Math.max(0, liveSubscribers - 1)
+          try { channel.off?.('video-packet', onPacket) } catch { /* 已断 */ }
+          try { res.end() } catch { /* 已断 */ }
+        }
+        /* 先补一份参数集 + 当前 GOP：后接上的解码器不用干等下一个关键帧。 */
+        try {
+          const prelude = channel.prelude
+          if (Buffer.isBuffer(prelude) && prelude.length > 0) writeAvc(0, Date.now(), prelude)
+        } catch { /* 没有热身数据就等下一包 */ }
+        channel.on('video-packet', onPacket)
+        req.on('close', cleanup)
+        res.on('error', cleanup)
+        return
+      }
+
       if (path === '/stream/info' && req.method === 'GET') {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         return json(streamFor(serial).info())
@@ -2642,7 +2707,7 @@ export function setupMirror(ctx, tools) {
       if (now - (Number(entry.usedAt) || 0) < CHANNEL_IDLE_MS) continue
       const stream = streams.get(serial)
       const busy = stream !== undefined && ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0)
-      if (busy || (mirrors.get(serial)?.watchers?.size ?? 0) > 0) continue
+      if (busy || avcClients.size > 0 || (mirrors.get(serial)?.watchers?.size ?? 0) > 0) continue
       closeChannel(serial, 'idle')
     }
   }, 30000)
@@ -2746,6 +2811,8 @@ export function setupMirror(ctx, tools) {
       }
       streams.clear()
       clearInterval(channelSweep)
+      for (const res of avcClients) { try { res.end() } catch { /* 已断 */ } }
+      avcClients.clear()
       for (const serial of [...channels.keys()]) closeChannel(serial, 'stopAll')
       fastInput.tap = null
       fastInput.swipe = null
