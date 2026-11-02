@@ -368,7 +368,265 @@ export const PLAYER_HTML = `<!doctype html>
     ctx.restore()
   }
 
-  pumpStream()
+  /* ---- 低延迟路径（?avc=1）：裸 H.264 直接喂 VideoDecoder，解出来当场画到 canvas。
+     少掉 ffmpeg 装箱和 MediaSource 缓冲两跳，代价是丢帧靠自己的小队列兜。 ---- */
+  /* avc=1 强制走裸流通道，avc=0 关掉；不写就是「能走就走，走不通自己退回 MSE」。 */
+  var avcPref = (function () {
+    var m = /(?:^|[?&])avc=([0-9])/.exec(window.location.search)
+    if (m === null) return 'auto'
+    return m[1] === '0' ? 'off' : 'on'
+  })()
+  var useAvc = avcPref !== 'off' && typeof window.VideoDecoder === 'function'
+  var avcDecoder = null
+  var avcCtx = null
+  var avcCodec = ''
+  var avcQueue = []
+  var avcCfgBytes = null
+  var avcPumping = false
+  var avcStats = { cfg: 0, samples: 0, decoded: 0, dropped: 0, err: '', queueMax: 0, lat: [] }
+  /* 解码器 configure 之后必须先吃一个关键帧，之前来的 delta 直接丢，不然每段开头都报错。 */
+  var avcGotKey = false
+  stats.avc = avcStats
+
+  function avcHex(n) { var s = (n & 255).toString(16); return s.length < 2 ? '0' + s : s }
+
+  /* 没有 moov 可读，编码串只能从 Annex-B 的 SPS 里拼：profile/constraint/level 三个字节。 */
+  function avcCodecOf(bytes) {
+    for (var i = 0; i + 6 < bytes.length; i += 1) {
+      if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1 && bytes[i + 3] === 0x67) {
+        return 'avc1.' + avcHex(bytes[i + 4]) + avcHex(bytes[i + 5]) + avcHex(bytes[i + 6])
+      }
+    }
+    return ''
+  }
+
+  /* Annex-B 的 NAL 切开：起头 00 00 01 或 00 00 00 01。 */
+  function avcNals(bytes) {
+    var out = []
+    var start = -1
+    for (var i = 0; i + 3 < bytes.length; i += 1) {
+      if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
+        if (start >= 0) out.push(bytes.subarray(start, i))
+        start = i + 3
+        i += 2
+      }
+    }
+    if (start >= 0 && start < bytes.length) out.push(bytes.subarray(start))
+    return out
+  }
+
+  /* 有 description（avcC）走标准模式：Chrome 这边最稳，代价是每帧改成 4 字节长度前缀。 */
+  function avcAvcC(nals) {
+    var sps = null
+    var pps = null
+    for (var i = 0; i < nals.length; i += 1) {
+      var t = nals[i][0] & 0x1f
+      if (t === 7 && sps === null) sps = nals[i]
+      if (t === 8 && pps === null) pps = nals[i]
+    }
+    if (sps === null || sps.length < 4) return null
+    var parts = [new Uint8Array([1, sps[1], sps[2], sps[3], 0xff, 0xe1, (sps.length >> 8) & 0xff, sps.length & 0xff]), sps]
+    if (pps !== null) parts.push(new Uint8Array([1, (pps.length >> 8) & 0xff, pps.length & 0xff]), pps)
+    var total = 0
+    for (var j = 0; j < parts.length; j += 1) total += parts[j].length
+    var out = new Uint8Array(total)
+    var at = 0
+    for (var k = 0; k < parts.length; k += 1) { out.set(parts[k], at); at += parts[k].length }
+    return out
+  }
+
+  function avcLengthPrefixed(bytes) {
+    var nals = avcNals(bytes)
+    if (nals.length === 0) return bytes
+    var total = 0
+    for (var i = 0; i < nals.length; i += 1) total += 4 + nals[i].length
+    var out = new Uint8Array(total)
+    var at = 0
+    for (var j = 0; j < nals.length; j += 1) {
+      var len = nals[j].length
+      out[at] = (len >>> 24) & 0xff
+      out[at + 1] = (len >>> 16) & 0xff
+      out[at + 2] = (len >>> 8) & 0xff
+      out[at + 3] = len & 0xff
+      out.set(nals[j], at + 4)
+      at += 4 + len
+    }
+    return out
+  }
+
+  function avcDraw(frame) {
+    try {
+      var w = frame.displayWidth || frame.codedWidth
+      var h = frame.displayHeight || frame.codedHeight
+      if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
+      if (avcCtx === null) avcCtx = canvas.getContext('2d', { alpha: false })
+      avcCtx.drawImage(frame, 0, 0, w, h)
+      video.style.visibility = 'hidden'
+      canvas.classList.add('on')
+      frameAt = Date.now()
+    } catch (error) { reportError('avc-draw', error) }
+  }
+
+  function avcConfigure(cfgBytes) {
+    var codec = avcCodecOf(cfgBytes)
+    if (codec === '') return
+    avcCfgBytes = cfgBytes
+    avcCodec = codec
+    try { if (avcDecoder !== null) avcDecoder.close() } catch (error) { /* 忽略 */ }
+    avcDecoder = new window.VideoDecoder({
+      output: function (frame) {
+        avcStats.decoded += 1
+        if (avcStats.lat.length < 400) avcStats.lat.push(Date.now() - frame.timestamp)
+        avcDraw(frame)
+        try { frame.close() } catch (error) { /* 忽略 */ }
+        avcPumpQueue()
+      },
+      error: function (error) {
+        avcStats.err = String((error && error.message) || error).slice(0, 160)
+        /* 自动模式解不动就退回 MSE；强制模式留错误信息给探针看。 */
+        if (avcPref === 'auto') avcFallback('decode-error')
+      },
+    })
+    var boxed = avcAvcC(avcNals(cfgBytes))
+    var conf = { codec: codec, optimizeForLatency: true }
+    if (boxed !== null) conf.description = boxed
+    avcDecoder.configure(conf)
+    avcStats.cfg += 1
+    avcGotKey = false
+    avcQueue = []
+  }
+
+  function avcPumpQueue() {
+    if (avcDecoder === null || avcPumping) return
+    avcPumping = true
+    try {
+      while (avcQueue.length > 0 && avcDecoder.decodeQueueSize < 3) {
+        var item = avcQueue.shift()
+        avcDecoder.decode(new window.EncodedVideoChunk({ type: item.key ? 'key' : 'delta', timestamp: item.pts, data: item.data }))
+      }
+    } catch (error) {
+      avcStats.err = String((error && error.message) || error).slice(0, 160)
+      avcGotKey = false
+      avcQueue = []
+    } finally { avcPumping = false }
+  }
+
+  function avcOnMessage(type, pts, data) {
+    if (type === 0) {
+      if (avcDecoder !== null && avcCfgBytes !== null && sameBytes(avcCfgBytes, data)) return
+      avcConfigure(data)
+      return
+    }
+    avcStats.samples += 1
+    if (type !== 2 && !avcGotKey) {
+      avcStats.dropped += 1
+      return
+    }
+    if (type === 2) avcGotKey = true
+    avcQueue.push({ key: type === 2, pts: pts, data: avcLengthPrefixed(data) })
+    if (avcQueue.length > 30) { avcQueue = avcQueue.slice(-6); avcStats.dropped += 1 }
+    if (avcQueue.length > avcStats.queueMax) avcStats.queueMax = avcQueue.length
+    avcPumpQueue()
+  }
+
+  function avcReadStream() {
+    if (liveStopped) return Promise.resolve()
+    avcAbort = typeof AbortController === 'function' ? new AbortController() : null
+    return fetch(ROUTE + '/stream/avc?serial=' + encodeURIComponent(serial) + '&t=' + Date.now(), { cache: 'no-store', signal: avcAbort === null ? undefined : avcAbort.signal })
+      .then(function (res) {
+        if (!res.ok || !res.body) throw new Error('avc ' + res.status)
+        stats.connects += 1
+        var reader = res.body.getReader()
+        var buf = new Uint8Array(0)
+        currentReader = reader
+        connectedAt = Date.now()
+        function step() {
+          return reader.read().then(function (part) {
+            if (part.done) return null
+            var value = part.value
+            if (buf.length === 0) { buf = value } else {
+              var merged = new Uint8Array(buf.length + value.length)
+              merged.set(buf)
+              merged.set(value, buf.length)
+              buf = merged
+            }
+            var off = 0
+            while (buf.length - off >= 13) {
+              var total = (buf[off] * 16777216) + (buf[off + 1] << 16) + (buf[off + 2] << 8) + buf[off + 3]
+              if (buf.length - off < 4 + total) break
+              var type = buf[off + 4]
+              var pts = new DataView(buf.buffer, buf.byteOffset + off + 5, 8).getFloat64(0)
+              avcOnMessage(type, pts, buf.subarray(off + 13, off + 4 + total))
+              off += 4 + total
+            }
+            if (off > 0) buf = buf.subarray(off)
+            return step()
+          })
+        }
+        return step()
+      })
+  }
+
+  var avcAbort = null
+  var avcDead = false
+  var avcTries = 0
+  function avcFallback(why) {
+    if (avcDead) return
+    avcDead = true
+    if (avcStats.err === '') avcStats.err = why
+    try { if (avcDecoder !== null) avcDecoder.close() } catch (error) { /* 已关 */ }
+    avcDecoder = null
+    avcQueue = []
+    try { if (avcAbort !== null) avcAbort.abort() } catch (error) { /* 已断 */ }
+    if (liveStopped) return
+    pumpStream()
+  }
+
+  function avcStart() {
+    if (liveStopped || avcDead) return
+    avcReadStream().then(function () {
+      avcTries = 0
+    }).catch(function () {
+      /* 通道冷启动 / 刚失败过一次会有几秒冷却：连着试几次再判死刑，别一 503 就退回慢路径。 */
+      avcTries += 1
+      if (avcPref === 'auto' && avcTries >= 8) avcFallback('no-channel')
+    }).then(function () {
+      if (liveStopped || avcDead) return
+      setTimeout(avcStart, avcTries === 0 ? 400 : 700)
+    })
+  }
+
+  if (useAvc) {
+    avcStart()
+    /* 自动模式的两道保险：5 秒还没参数集、或参数集有了却解不出画面，就退回 MSE。 */
+    setTimeout(function () {
+      if (avcDead || liveStopped) return
+      if (avcStats.cfg === 0) avcFallback('no-config')
+    }, 5000)
+    setTimeout(function () {
+      if (avcDead || liveStopped) return
+      if (avcStats.decoded === 0) avcFallback('no-output')
+    }, 8000)
+  } else {
+    pumpStream()
+  }
+
+  /* 量延迟用：只在 ?probe=1 时开，正常页面不打日志。 */
+  if (/(?:^|[?&])probe=1(?:&|$)/.test(window.location.search)) {
+    setInterval(function () {
+      var lat = avcStats.lat.slice(-80).sort(function (a, b) { return a - b })
+      var at = function (q) { return lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * q))] : null }
+      var bufEnd = video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0
+      var px = null
+      try {
+        if (avcCtx !== null && canvas.width > 8) {
+          var d = avcCtx.getImageData(canvas.width >> 1, canvas.height >> 1, 1, 1).data
+          px = [d[0], d[1], d[2]]
+        }
+      } catch (error) { /* 跨域画布不可读时忽略 */ }
+      console.log('AVCPROBE ' + JSON.stringify({ mode: !useAvc ? 'mse' : (avcDead ? 'fallback-mse' : 'avc'), vw: video.videoWidth || 0, vh: video.videoHeight || 0, behindS: +(bufEnd - video.currentTime).toFixed(3), px: px, canvas: [canvas.width, canvas.height], codec: avcCodec, cfg: avcStats.cfg, samples: avcStats.samples, decoded: avcStats.decoded, dropped: avcStats.dropped, queueMax: avcStats.queueMax, err: avcStats.err, n: lat.length, p50: at(0.5), p90: at(0.9), max: lat.length ? lat[lat.length - 1] : null }))
+    }, 2000)
+  }
 
   /* 页面自身的异常也上报：黑屏时先看这里，不要靠猜。 */
   function report(body) {

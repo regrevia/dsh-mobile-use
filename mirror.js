@@ -22,7 +22,7 @@ import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=220'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
-import { PLAYER_HTML } from './page.js?v=37'
+import { PLAYER_HTML } from './page.js?v=43'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -255,6 +255,25 @@ const CLIENT_BUILD = (() => {
  * @param {Buffer} png - PNG 数据。
  * @returns {Promise<Buffer | null>} JPEG，失败时 null。
  */
+/* Annex-B 起始码切分：热身数据里 SPS/PPS 与 IDR 混在一起，得拆开发。 */
+function splitNals(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 4) return []
+  const marks = []
+  for (let i = 0; i + 3 <= buf.length; i += 1) {
+    if (buf[i] !== 0 || buf[i + 1] !== 0) continue
+    if (buf[i + 2] === 1) { marks.push({ code: i, data: i + 3 }); i += 3; continue }
+    if (buf[i + 2] === 0 && i + 3 < buf.length && buf[i + 3] === 1) { marks.push({ code: i, data: i + 4 }); i += 4 }
+  }
+  if (marks.length === 0) return [buf]
+  const units = []
+  for (let k = 0; k < marks.length; k += 1) {
+    const from = marks[k].data
+    const to = k + 1 < marks.length ? marks[k + 1].code : buf.length
+    if (to > from) units.push(buf.subarray(from, to))
+  }
+  return units
+}
+
 function pngToJpeg(png) {
   /* 输入可能是 PNG 也可能是设备端直出的 JPEG（`screencap -j`）：按头判断，别写死。 */
   const isJpeg = png.subarray(0, 3).equals(JPEG_SIG)
@@ -2239,8 +2258,16 @@ export function setupMirror(ctx, tools) {
           res.end(JSON.stringify({ error: '推流连接数已达上限' }))
           return
         }
+        /* 冷启动时通道还在起来（scrcpy 握手 1–3 秒），这里等一会儿再判失败：
+           页面首帧就当 503 处理会白退回 MSE，用户看到的是「明明能用却走了慢路径」。 */
         let entry = null
-        try { entry = await channelFor(serial) } catch { entry = null }
+        const deadline = Date.now() + 8000
+        for (;;) {
+          try { entry = await channelFor(serial) } catch { entry = null }
+          if (entry !== null && typeof entry.on === 'function') break
+          if (Date.now() >= deadline) break
+          await new Promise((done) => setTimeout(done, 200))
+        }
         const channel = entry ?? null
         if (channel === null || typeof channel.on !== 'function') {
           res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
@@ -2270,8 +2297,9 @@ export function setupMirror(ctx, tools) {
           if (closed) return
           const data = packet?.data
           if (!Buffer.isBuffer(data) || data.length === 0) return
-          const ptsMs = typeof packet?.pts === 'number' ? packet.pts / 1000 : Date.now()
-          writeAvc(packet?.config === true ? 0 : 1, ptsMs, data)
+          /* 时间戳用宿主收包的墙钟：解码端算「写出去→解出来」用了多久，设备时钟没法直接比。 */
+          const type = packet?.config === true ? 0 : (packet?.keyFrame === true ? 2 : 1)
+          writeAvc(type, Date.now(), data)
         }
         function cleanup() {
           if (closed) return
@@ -2281,12 +2309,22 @@ export function setupMirror(ctx, tools) {
           try { channel.off?.('video-packet', onPacket) } catch { /* 已断 */ }
           try { res.end() } catch { /* 已断 */ }
         }
-        /* 先补一份参数集 + 当前 GOP：后接上的解码器不用干等下一个关键帧。 */
+        /* 先补参数集（SPS/PPS）和当前关键帧：后接上的解码器不用干等下一个关键帧。
+           参数集必须单独成包，混进 IDR 会让解码端把整段当配置。 */
         try {
           const prelude = channel.prelude
-          if (Buffer.isBuffer(prelude) && prelude.length > 0) writeAvc(0, Date.now(), prelude)
+          if (Buffer.isBuffer(prelude) && prelude.length > 0) {
+            const units = splitNals(prelude)
+            const cfg = units.filter((unit) => unit.length > 0 && [6, 7, 8].includes(unit[0] & 0x1f)).slice(0, 3)
+            const idr = units.filter((unit) => unit.length > 0 && (unit[0] & 0x1f) === 5)
+            if (cfg.length > 0) writeAvc(0, Date.now(), Buffer.concat(cfg))
+            if (idr.length > 0) writeAvc(2, Date.now(), Buffer.concat(idr))
+            if (cfg.length === 0 && idr.length === 0) writeAvc(0, Date.now(), prelude)
+          }
         } catch { /* 没有热身数据就等下一包 */ }
         channel.on('video-packet', onPacket)
+        /* 让设备马上编一个关键帧：新解码器配置完必须有 IDR，靠等自然 GOP 可能要好几秒。 */
+        try { channel.requestKeyFrame?.() } catch { /* 控制通道没开就等自然关键帧 */ }
         req.on('close', cleanup)
         res.on('error', cleanup)
         return
