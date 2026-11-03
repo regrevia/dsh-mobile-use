@@ -685,6 +685,9 @@ export const PLAYER_HTML = `<!doctype html>
   setInterval(function () {
     try {
       if (liveStopped) return
+      /* 裸流直通时不喂 MSE：这里所有判据（meta/init/currentTime）都只对 fMP4 成立，
+         照原样跑会每 3 秒把直通连接当成「连上了没数据」掐掉，解码器跟着反复重配。 */
+      if (useAvc && !avcDead) return
       var now = Date.now()
       var t = video.currentTime
       if (t !== lastTimeSeen) { lastTimeSeen = t; lastTimeAt = now }

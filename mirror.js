@@ -22,7 +22,7 @@ import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=220'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
-import { PLAYER_HTML } from './page.js?v=47'
+import { PLAYER_HTML } from './page.js?v=48'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
