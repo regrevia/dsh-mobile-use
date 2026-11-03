@@ -36,6 +36,10 @@ await it('模板字符串没有吞掉反斜杠转义', () => {
   assert.ok(!/\\[a-zA-Z]/.test(PLAYER_HTML), 'PLAYER_HTML 里出现 \\d 一类被吞的转义')
 })
 
+await it('直通模式跳过 MSE 卡死看门狗', () => {
+  assert.ok(/if \(useAvc && !avcDead\) return/.test(PLAYER_HTML), '直通不喂 MSE，meta/init/currentTime 判据会误判成卡死并重连')
+})
+
 await it('avc 参数解析认 0/1/缺省', () => {
   const body = match?.[1] ?? ''
   const at = body.indexOf('var avcPref = (function () {')
