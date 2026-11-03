@@ -634,7 +634,8 @@ function shellQuote(value) {
  * scrcpy-server 的启动参数（`com.genymobile.scrcpy.Server` 之后的那串）。
  * @param {{ version?: string, scid?: number, logLevel?: string, tunnelForward?: boolean,
  *           video?: boolean, audio?: boolean, control?: boolean, maxSize?: number,
- *           maxFps?: number, videoBitRate?: number }} [options]
+ *           maxFps?: number, videoBitRate?: number, audioCodec?: string,
+ *           audioSource?: string }} [options]
  * @returns {string[]}
  */
 export function buildServerArgs(options = {}) {
@@ -649,6 +650,9 @@ export function buildServerArgs(options = {}) {
     maxSize = 0,
     maxFps = 0,
     videoBitRate = 0,
+    /* 音频默认 raw：设备端给 PCM s16le，本机不用解码器，直接进浏览器 WebAudio。 */
+    audioCodec = 'raw',
+    audioSource = 'output',
   } = options
 
   const args = [
@@ -663,6 +667,10 @@ export function buildServerArgs(options = {}) {
   if (maxSize > 0) args.push(`max_size=${Math.floor(maxSize)}`)
   if (maxFps > 0) args.push(`max_fps=${maxFps}`)
   if (videoBitRate > 0) args.push(`video_bit_rate=${Math.floor(videoBitRate)}`)
+  if (audio) {
+    /* audio_codec/audio_source 只在开音频时出现：audio=false 时 server 不建音频采集。 */
+    args.push(`audio_codec=${String(audioCodec)}`, `audio_source=${String(audioSource)}`)
+  }
   return args
 }
 
@@ -694,6 +702,11 @@ const DEFAULT_OPTIONS = {
   port: 27183,
   pushServer: true,
   video: true,
+  /* 音频采集默认关：开关在侧栏，按序列号记住；关着时 server 不建音频通道，
+     延迟和 CPU 与旧版完全一致。 */
+  audio: false,
+  audioCodec: 'raw',
+  audioSource: 'output',
   control: true,
   /* 编码分辨率与帧率：不改时按设备原生分辨率 + 不限帧，3200x2136 一帧 6.8 MP，
      设备编码器忙不过来就直接变成操作延迟。侧栏画布只有几百像素宽，压到长边 1600 足够清晰。 */
@@ -747,6 +760,12 @@ export class ScrcpyChannel extends EventEmitter {
     this._sockets = []
     this._video = null
     this._control = null
+    this._audio = null
+    this._audioBytes = 0
+    this._audioCodec = 0
+    this._audioPending = Buffer.alloc(0)
+    this._audioNamed = false
+    this._audioHeader = null
     this._child = null
     this._timers = new Set()
     this._parser = null
@@ -754,6 +773,8 @@ export class ScrcpyChannel extends EventEmitter {
     this._headerEmitted = false
 
     this.stats = {
+      audioBytes: 0,
+      audioPackets: 0,
       videoBytes: 0,
       packets: 0,
       configPackets: 0,
@@ -924,7 +945,11 @@ export class ScrcpyChannel extends EventEmitter {
   async _connectBoth() {
     const timeoutMs = Number(this._options.readyTimeoutMs) > 0 ? Number(this._options.readyTimeoutMs) : 10000
     const deadline = Date.now() + timeoutMs
-    const wanted = this._options.control ? 2 : 1
+    /* socket 顺序由 server 决定：video（先 64 字节设备名）→ audio（先 4 字节 codec）→ control。
+       音频只在用户开着开关时才连。 */
+    const wanted = (this._options.video !== false ? 1 : 0)
+      + (this._options.audio === true ? 1 : 0)
+      + (this._options.control ? 1 : 0)
     for (let index = 0; index < wanted; index += 1) {
       let socket = null
       let lastError = ''
@@ -998,8 +1023,12 @@ export class ScrcpyChannel extends EventEmitter {
       this._guard('socket error', () => this._log(`socket 错误： ${error?.message ?? error}`))
     })
     socket.setNoDelay?.(true)
-    if (!this._video) {
+    /* 三个通道按 server 的 accept 顺序认领：video → audio → control。
+       音频开关关掉时 server 根本不建音频通道，这里也不会走到 audio 分支。 */
+    if (this._options.video !== false && !this._video) {
       this._attachVideo(socket)
+    } else if (this._options.audio === true && !this._audio) {
+      this._attachAudio(socket)
     } else if (this._options.control && !this._control) {
       this._attachControl(socket)
     } else {
@@ -1020,7 +1049,9 @@ export class ScrcpyChannel extends EventEmitter {
         logLevel: this._options.logLevel,
         tunnelForward: true, // forward 拓扑：本机 adb forward 监听，设备连回本机
         video: this._options.video,
-        audio: false,
+        audio: this._options.audio === true,
+        audioCodec: this._options.audioCodec,
+        audioSource: this._options.audioSource,
         control: this._options.control,
         /* 这三项必须显式传：漏传时 buildServerArgs 用默认 0，等于按原生分辨率不限帧编码，
            3200x2136 每帧 6.8 MP 把设备编码器压满，操作延迟直接翻倍。 */
@@ -1182,6 +1213,80 @@ export class ScrcpyChannel extends EventEmitter {
           this._fail(`视频 socket 重拨异常： ${error?.message ?? error}`)
         })
       })
+  }
+
+  /**
+   * 音频 socket：server 先写 4 字节 codec id（`\0raw`=PCM s16le），之后是
+   * 12 字节包头（u64 BE pts 微秒 + u32 BE payload 长度）+ payload。
+   * 音频出问题只影响声音本身：把 `_audio` 置空、上报一次 'audio-failed'，视频照旧。
+   */
+  _attachAudio(socket) {
+    this._audio = socket
+    this._audioBytes = 0
+    this._audioCodec = 0
+    this._audioPending = Buffer.alloc(0)
+    this._audioNamed = false
+    this._audioHeader = { name: '', codec: '' }
+    this._log('音频 socket 已连接')
+    socket.on('data', (chunk) => {
+      this._audioBytes += chunk.length
+      this._guard('audio data', () => this._onAudioData(chunk))
+    })
+    socket.on('close', () => {
+      this._guard('audio close', () => {
+        if (this._audio !== socket) return
+        this._audio = null
+        this._audioPending = Buffer.alloc(0)
+        if (this._stopped) return
+        this._log('音频 socket 已关闭')
+        this.emitSafe('audio-failed', 'closed')
+      })
+    })
+  }
+
+  /** 音频 socket 的字节流解析：codec id → 12 字节包头 + payload。 */
+  _onAudioData(chunk) {
+    let buf = this._audioPending.length ? Buffer.concat([this._audioPending, chunk]) : chunk
+    if (this._audioCodec === 0) {
+      /* 若音频是第一路 socket（video=false），server 会先发 1 字节探活 + 64 字节设备名。 */
+      if (!this._audioNamed) {
+        if (buf.length >= 65 && buf[0] === 0) {
+          this._audioHeader.name = buf.subarray(1, 65).toString('utf8').replace(/\0+$/, '')
+          buf = buf.subarray(65)
+        }
+        this._audioNamed = true
+      }
+      if (buf.length < 4) {
+        this._audioPending = buf
+        return
+      }
+      this._audioCodec = buf.readUInt32BE(0)
+      this._audioHeader.codec = Buffer.from(buf.subarray(0, 4)).toString('latin1').replace(/\0+$/, '')
+      buf = buf.subarray(4)
+      this._log(`音频 codec=${JSON.stringify(this._audioHeader.codec)} id=0x${this._audioCodec.toString(16)}`)
+      this.emitSafe('audio-header', { name: this._audioHeader.name, codec: this._audioHeader.codec, codecId: this._audioCodec })
+    }
+    /* 12 字节包头 + payload；长度不合理说明流已失步，直接放弃音频不拖累视频。 */
+    while (buf.length >= 12) {
+      const pts = Number(buf.readBigUInt64BE(0) & 0x1fffffffffffffffn)
+      const size = buf.readUInt32BE(8)
+      if (size === 0 || size > 1048576) {
+        this._log(`音频包长度不合理（${size}），关闭音频通道`)
+        const bad = this._audio
+        this._audio = null
+        this._audioPending = Buffer.alloc(0)
+        this._guard('audio bad size', () => bad?.destroy?.())
+        this.emitSafe('audio-failed', `bad-size:${size}`)
+        return
+      }
+      if (buf.length < 12 + size) break
+      const data = Buffer.from(buf.subarray(12, 12 + size))
+      buf = buf.subarray(12 + size)
+      this.stats.audioPackets += 1
+      this.stats.audioBytes += size
+      this.emitSafe('audio-packet', { data, size, pts })
+    }
+    this._audioPending = buf.length ? Buffer.from(buf) : Buffer.alloc(0)
   }
 
   _attachControl(socket) {
@@ -1494,6 +1599,8 @@ export class ScrcpyChannel extends EventEmitter {
     this._sockets = []
     this._video = null
     this._control = null
+    this._audio = null
+    this._audioPending = Buffer.alloc(0)
     for (const socket of sockets) {
       this._guard('dispose socket', () => {
         socket?.removeAllListeners?.()

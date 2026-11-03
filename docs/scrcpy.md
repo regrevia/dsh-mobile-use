@@ -24,6 +24,8 @@ adb -s <serial> shell \
 `<args>` 由 `buildServerArgs()` 生成，形如
 `5.0.1 scid=0000abcd log_level=info tunnel_forward=false video=true audio=false control=true`。
 
+开音频时多两个参数：`audio=true audio_codec=raw audio_source=output`，设备端按 48 kHz 立体声 s16le 裸 PCM 推流（本机不解码，直接喂 WebAudio）。音频是**第二个** socket：没有 dummy 字节、没有 64 字节设备名，socket 一接通就是 4 字节 codec id（`\0raw`），之后每包 `[u64 flags|PTS][u32 长度][负载]`，4108 字节一包、约 46.9 包/秒。本 ROM 上音频首包可能比视频晚 12 秒左右，属服务端预热，故接口就绪判定只看视频/控制。
+
 **版本必须与客户端匹配**：v5.0.1 走 protocol 4.x，包头/字段布局与 2.x–3.x 不同（见第 3 节）。
 
 ## 2. 连接拓扑（默认 forward：设备端监听，本机连过去）
@@ -253,7 +255,7 @@ new ScrcpyChannel({ serial, adbPath, serverPath, deviceServerPath, serverVersion
 
 仍然没做或没测的：
 
-- 音频（`audio=true`）、H.265/AV1/VP8/VP9 码流。
+- H.265/AV1/VP8/VP9 码流（音频已做：`/audio` 开关 + `/stream/audio` 裸 PCM）。
 - 多指并发（多个 pointerId 同时按下）。
 - 开流之后再转屏：`video-session` 事件会作废设备尺寸缓存，下一帧起按新尺寸重新换算；
   转屏瞬间已经在路上的那一下触控可能被 server 丢弃（尺寸不匹配），属预期。

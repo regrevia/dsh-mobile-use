@@ -627,6 +627,17 @@ it('buildServerArgs 支持关视频 / 开 tunnel_forward', () => {
   assert.ok(args.includes('log_level=debug'))
 })
 
+it('buildServerArgs 开音频时带 audio_codec / audio_source', () => {
+  const args = buildServerArgs({ audio: true })
+  assert.equal(args.includes('audio=true'), true)
+  assert.equal(args.includes('audio_codec=raw'), true)
+  assert.equal(args.includes('audio_source=output'), true)
+  /* 关着的时候一个音频参数都不许出现：开机参数多一项都可能让老设备起不来。 */
+  const off = buildServerArgs()
+  assert.equal(off.some((arg) => arg.startsWith('audio_codec=')), false)
+  assert.equal(off.some((arg) => arg.startsWith('audio_source=')), false)
+})
+
 it('buildServerShellCommand 用 CLASSPATH + app_process 启动', () => {
   const command = buildServerShellCommand({ scid: 1 })
   assert.equal(

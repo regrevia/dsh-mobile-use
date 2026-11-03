@@ -21,8 +21,8 @@ import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=220'
-import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
-import { PLAYER_HTML } from './page.js?v=50'
+import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=16'
+import { PLAYER_HTML } from './page.js?v=51'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -1205,6 +1205,10 @@ export function setupMirror(ctx, tools) {
 const avcEndLog = []
   /* WebCodecs 直连的观众：它们同样占着编码器，回收扫描要把它们算成「有人在看」。 */
   const avcClients = new Set()
+  /* 音频是用户级开关：按序列号记在内存里，页面每次打开先 POST 一次自己的偏好。
+     默认关，关着时 scrcpy-server 不建音频采集，延迟与旧版完全一致。 */
+  const audioPrefs = new Map()
+  const audioClients = new Set()
   let channelSeq = 0
 
   /**
@@ -1297,6 +1301,7 @@ const avcEndLog = []
           maxSize: Number(process.env.ADBM_MAX_SIZE ?? 1600),
           maxFps: Number(process.env.ADBM_MAX_FPS ?? 0),
           videoBitRate: Number(process.env.ADBM_BITRATE ?? 8_000_000),
+          audio: audioPrefs.get(serial) === true,
           log: (note) => ctx.logger?.debug?.(`[scrcpy] ${String(note)}`),
         })
         entry.channel = channel
@@ -2676,6 +2681,99 @@ const avcEndLog = []
         return json({ at: Date.now(), actions: ops.slice(-5) })
       }
 
+      /* 音频开关：页面点一下就是一次 POST。开关变了要重起通道（server 的音频参数是启动参数），
+         视频观众会短暂断一下再自连，这条路径一天也用不了几次。 */
+      if (path === '/audio' && req.method === 'POST') {
+        const body = await readJson(req)
+        const serial = String(body?.serial ?? '') || await tools.resolveSerial().catch(() => '')
+        const on = body?.on === true
+        const was = audioPrefs.get(serial) === true
+        audioPrefs.set(serial, on)
+        if (!on) {
+          for (const res of audioClients) { try { res.end() } catch { /* 已断 */ } }
+          audioClients.clear()
+        }
+        if (was !== on) closeChannel(serial, on ? '开音频' : '关音频')
+        return json({ ok: true, serial, on })
+      }
+
+      /* 裸 PCM：给 WebAudio 直接喂，本机不解码。包格式与 /stream/avc 同族：
+         [u32 BE len][u8 类型 0][f64 BE 宿主收包毫秒][payload s16le 48k 立体声]。 */
+      if (path === '/stream/audio' && req.method === 'GET') {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        if (audioPrefs.get(serial) !== true) {
+          res.writeHead(409, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: '音频未开启' }))
+          return
+        }
+        if (liveSubscribers >= MAX_LIVE_SUBSCRIBERS) {
+          res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: '推流连接数已达上限' }))
+          return
+        }
+        let entry = null
+        const deadline = Date.now() + 8000
+        for (;;) {
+          try { entry = await channelFor(serial) } catch { entry = null }
+          if (entry !== null && typeof entry.on === 'function') break
+          if (Date.now() >= deadline) break
+          await new Promise((done) => setTimeout(done, 200))
+        }
+        const channel = entry ?? null
+        if (channel === null || typeof channel.on !== 'function') {
+          res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: '设备编码通道未就绪' }))
+          return
+        }
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'cache-control': 'no-store, no-transform',
+          'x-accel-buffering': 'no',
+          'access-control-allow-origin': '*',
+          connection: 'keep-alive',
+        })
+        res.flushHeaders()
+        liveSubscribers += 1
+        audioClients.add(res)
+        let closed = false
+        const writeAudio = (ptsMs, payload) => {
+          if (closed || !Buffer.isBuffer(payload) || payload.length === 0) return
+          const head = Buffer.allocUnsafe(13)
+          head.writeUInt32BE(payload.length + 9, 0)
+          head.writeUInt8(0, 4)
+          head.writeDoubleBE(Number(ptsMs) || 0, 5)
+          try { res.write(head); res.write(payload) } catch { cleanup('write-throw') }
+        }
+        const onPacket = (packet) => {
+          if (closed) return
+          const data = packet?.data
+          if (!Buffer.isBuffer(data) || data.length === 0) return
+          /* 宿主收包时刻：页面只测「写到播放」这一段，设备时钟不参与。 */
+          writeAudio(Date.now(), data)
+        }
+        const onFail = (why) => cleanup('audio-failed:' + String(why ?? ''))
+        function cleanup(why) {
+          if (closed) return
+          closed = true
+          audioClients.delete(res)
+          liveSubscribers = Math.max(0, liveSubscribers - 1)
+          try { channel.off?.('audio-packet', onPacket) } catch { /* 已断 */ }
+          try { channel.off?.('audio-failed', onFail) } catch { /* 已断 */ }
+          try { res.end() } catch { /* 已断 */ }
+          if (String(why).startsWith('audio-failed')) {
+            /* 设备端音频真不可用（采不到 / 被占）就把开关回关，页面据此把按钮置灰。 */
+            audioPrefs.set(serial, false)
+            ctx.logger?.debug?.('[scrcpy] 音频通道失败：' + String(why))
+          }
+        }
+        req.on('close', () => cleanup('req-close'))
+        res.on('close', () => cleanup('res-close'))
+        res.on('error', () => cleanup('res-error'))
+        channel.on('audio-packet', onPacket)
+        channel.on('audio-failed', onFail)
+        return
+      }
+
       if (path === '/diag' && req.method === 'GET') {
         /* 页面报上来的现场：没有 CDP 也能看见它看到的构建号、渲染异常、交互结果。 */
         return json({
@@ -2775,7 +2873,7 @@ const avcEndLog = []
       if (now - (Number(entry.usedAt) || 0) < CHANNEL_IDLE_MS) continue
       const stream = streams.get(serial)
       const busy = stream !== undefined && ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0)
-      if (busy || avcClients.size > 0 || (mirrors.get(serial)?.watchers?.size ?? 0) > 0) continue
+      if (busy || avcClients.size > 0 || audioClients.size > 0 || (mirrors.get(serial)?.watchers?.size ?? 0) > 0) continue
       closeChannel(serial, 'idle')
     }
     /* 兜底回收：最后一位观众是裸流直连时，stream 的空闲计时器不会被排上，
@@ -2784,7 +2882,7 @@ const avcEndLog = []
       if (stream === undefined || stream === null || typeof stream.stop !== 'function') continue
       if (stream.stopping === true) continue
       if ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0) continue
-      if (avcClients.size > 0) continue
+      if (avcClients.size > 0 || audioClients.size > 0) continue
       if (mirrors.get(serial)?.anyoneWatching?.() === true) continue
       if (typeof stream.visionWanted === 'function' && stream.visionWanted()) continue
       const last = Math.max(Number(stream.lastViewerAt) || 0, Number(stream.jpegWantedAt) || 0)
@@ -2894,6 +2992,8 @@ const avcEndLog = []
       clearInterval(channelSweep)
       for (const res of avcClients) { try { res.end() } catch { /* 已断 */ } }
       avcClients.clear()
+      for (const res of audioClients) { try { res.end() } catch { /* 已断 */ } }
+      audioClients.clear()
       for (const serial of [...channels.keys()]) closeChannel(serial, 'stopAll')
       fastInput.tap = null
       fastInput.swipe = null

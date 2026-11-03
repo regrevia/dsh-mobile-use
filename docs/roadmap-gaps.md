@@ -57,10 +57,10 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 现状 | 完全没有；`screenrecord` 只出视频裸流。 |
+| 现状 | 已实现（1.4.32）：播放器一个「声音」开关，默认关；开了走 scrcpy-server 的音频 socket（`audio_codec=raw`、`audio_source=output`、48 kHz 立体声），宿主不解码，页面用 WebAudio 环形缓冲播。关着时启动参数里不出现任何音频项。 |
 | 竞品做法 | scrcpy `--audio`（Android 11+，需设备端 server 用 AudioRecord 采集，[audio.md](https://github.com/Genymobile/scrcpy/blob/master/doc/audio.md)）；WSA 有系统级音频。 |
 | 实现要点 | 先做可行性验证再排期：`adb shell screenrecord --audio` 在多数 ROM 不可用，现实路径是复用 scrcpy-server 的音频通道或 `AudioPlaybackCapture`（需应用配合）。本仓库定位是零外设、不装 App，因此**优先评估「只做音量/静音控制」是否够用**，不够再引入设备端进程。 |
-| 预估 | 调研 0.5 人日；若要做真音频 3 人日以上，且会破坏「不装 App」卖点。 |
+| 预估 | 已完成：设备端 server 本就自带音频栈，开关只是把 `audio=true` 及其编码参数加进启动命令，未引入新进程、未引入第三方依赖。 |
 | 验收 | 调研结论先落地成文档：三种方案的 ROM 覆盖率与是否需要设备端进程；若实现，则 48 kHz 立体声、端到端延迟 ≤200 ms、与画面偏差 ≤100 ms。 |
 
 ## 7. 无头/CI 与可脚本化流程

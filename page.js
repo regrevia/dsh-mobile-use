@@ -47,6 +47,7 @@ export const PLAYER_HTML = `<!doctype html>
 <div id="bar">
   <button id="mark" aria-pressed="false" title="拖一个框，把这块发给会话">圈选</button>
   <button id="send" disabled>发到对话</button>
+  <button id="sound" aria-pressed="false" title="听设备的声音">声音</button>
   <span id="status">连接中</span>
 </div>
 <div id="hint" class="on">点一下＝点按，按住拖动＝滑动，滚轮＝上下滑。</div>
@@ -63,6 +64,7 @@ export const PLAYER_HTML = `<!doctype html>
   var canvas = document.getElementById('canvas')
   var markBtn = document.getElementById('mark')
   var send = document.getElementById('send')
+  var soundBtn = document.getElementById('sound')
   var status = document.getElementById('status')
   var hint = document.getElementById('hint')
 
@@ -903,6 +905,128 @@ export const PLAYER_HTML = `<!doctype html>
     })
   })
 
+  /* ---- 声音：默认关，按序列号记住；开一次只多一条音频通道，画面参数不变 ---- */
+  var AUDIO_KEY = 'adb-audio'
+  var audio = null
+  var audioTried = false
+
+  function audioStored() {
+    if (params.get('audio') === '1') return true
+    if (params.get('audio') === '0') return false
+    try { return localStorage.getItem(AUDIO_KEY + ':' + serial) === '1' } catch (error) { return false }
+  }
+
+  function audioRemember(on) {
+    try { localStorage.setItem(AUDIO_KEY + ':' + serial, on ? '1' : '0') } catch (error) { /* 隐私模式写不进去 */ }
+  }
+
+  function audioPaint() {
+    var on = audio !== null
+    soundBtn.setAttribute('aria-pressed', on ? 'true' : 'false')
+    soundBtn.textContent = on ? '静音' : '声音'
+    if (on) soundBtn.title = '关掉声音并释放音频通道'
+    else if (audioTried) soundBtn.title = '这台设备现在给不了声音'
+    else soundBtn.title = '听设备的声音'
+    soundBtn.disabled = !on && audioTried
+  }
+
+  function stopAudio() {
+    var current = audio
+    audio = null
+    if (current === null) return
+    try { current.reader.cancel() } catch (error) { /* 已断 */ }
+    try { current.ctx.close() } catch (error) { /* 已关 */ }
+    audioPaint()
+  }
+
+  function audioFail() {
+    audioTried = true
+    stopAudio()
+    audioRemember(false)
+    /* 通道参数要重起才生效：让画面自己重连，别让用户看到「点了没反应」。 */
+    say('这台设备现在给不了声音')
+  }
+
+  function playPcm(ctx, pcm) {
+    /* s16le 立体声 48 kHz：一帧 4 字节。落单的半个帧丢掉，别让左右声道错位。 */
+    var frames = Math.floor(pcm.length / 4)
+    if (frames === 0) return
+    var buffer = ctx.createBuffer(2, frames, 48000)
+    var left = buffer.getChannelData(0)
+    var right = buffer.getChannelData(1)
+    var view = new DataView(pcm.buffer, pcm.byteOffset, frames * 4)
+    for (var i = 0; i < frames; i += 1) {
+      left[i] = view.getInt16(i * 4, true) / 32768
+      right[i] = view.getInt16(i * 4 + 2, true) / 32768
+    }
+    var state = audio
+    if (state === null) return
+    var now = ctx.currentTime
+    /* 落后就重新起播（宁可丢一拍也不要越拖越远），超前太多同样重置。 */
+    if (state.nextAt < now + 0.02 || state.nextAt > now + 0.6) state.nextAt = now + 0.12
+    var source = ctx.createBufferSource()
+    source.buffer = buffer
+    source.connect(ctx.destination)
+    source.start(state.nextAt)
+    state.nextAt += buffer.duration
+  }
+
+  function startAudio() {
+    if (serial === '' || audio !== null) return
+    var Ctx = window.AudioContext || window.webkitAudioContext
+    if (typeof Ctx !== 'function') { audioFail(); return }
+    var ctx = null
+    try { ctx = new Ctx({ sampleRate: 48000 }) } catch (error) { try { ctx = new Ctx() } catch (second) { audioFail(); return } }
+    try { if (ctx.state === 'suspended') ctx.resume() } catch (error) { /* 已经被手点醒了 */ }
+    var state = { ctx: ctx, nextAt: 0, reader: null, stopped: false }
+    audio = state
+    audioPaint()
+    post('/audio', { serial: serial, on: true }).then(function () {
+      return fetch(ROUTE + '/stream/audio?serial=' + encodeURIComponent(serial) + '&t=' + Date.now(), { cache: 'no-store' })
+    }).then(function (res) {
+      if (!res.ok || !res.body) throw new Error('audio ' + res.status)
+      audioTried = false
+      var reader = res.body.getReader()
+      state.reader = reader
+      var pending = new Uint8Array(0)
+      function step() {
+        return reader.read().then(function (part) {
+          if (part.done || audio !== state) return null
+          var value = part.value
+          var merged = new Uint8Array(pending.length + value.length)
+          merged.set(pending, 0)
+          merged.set(value, pending.length)
+          var at = 0
+          while (merged.length - at >= 13) {
+            var view = new DataView(merged.buffer, merged.byteOffset + at, merged.length - at)
+            var size = view.getUint32(0)
+            if (size < 9 || size > 1048576) { at = merged.length; break }
+            if (merged.length - at < 4 + size) break
+            var payload = merged.slice(at + 13, at + 4 + size)
+            playPcm(ctx, payload)
+            at += 4 + size
+          }
+          pending = merged.slice(at)
+          return step()
+        })
+      }
+      return step()
+    }).catch(function () { if (audio === state) audioFail() })
+  }
+
+  soundBtn.addEventListener('click', function () {
+    if (audio !== null) {
+      audioRemember(false)
+      stopAudio()
+      post('/audio', { serial: serial, on: false }).catch(function () { /* 关不掉也就是多一条通道 */ })
+      say('已静音')
+      return
+    }
+    audioRemember(true)
+    startAudio()
+    say('接声音中')
+  })
+
   function tellClosed() {
     /* 关页/关窗要立刻收工：不等 2.5 秒宽限，也别等心跳超时。beacon 在页面卸载后仍会发出。 */
     try {
@@ -914,6 +1038,7 @@ export const PLAYER_HTML = `<!doctype html>
 
   window.addEventListener('pagehide', function () {
     liveStopped = true
+    stopAudio()
     clearInterval(stateTimer)
     if (pollTimer !== null) clearTimeout(pollTimer)
     tellClosed()
@@ -921,6 +1046,7 @@ export const PLAYER_HTML = `<!doctype html>
 
   window.addEventListener('beforeunload', function () {
     liveStopped = true
+    stopAudio()
     clearInterval(stateTimer)
     if (pollTimer !== null) clearTimeout(pollTimer)
     tellClosed()
