@@ -675,7 +675,7 @@ export const PLAYER_HTML = `<!doctype html>
       fetch(ROUTE + '/diag', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ pid: 'player', stream: { meta: stats.meta, init: stats.init, media: stats.media, appends: stats.appends, stalls: stats.stalls, connects: stats.connects, ct: video.currentTime, rs: video.readyState, elBuf: video.buffered.length, paused: video.paused, end: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0, start: video.buffered.length > 0 ? video.buffered.start(0) : 0, ms: mediaSource ? mediaSource.readyState : 'null', q: queue.length, err: stats.appendErr, buf: stats.buf || null, ev: stats.events || null } }),
+        body: JSON.stringify({ pid: 'player', stream: { meta: stats.meta, init: stats.init, media: stats.media, appends: stats.appends, stalls: stats.stalls, connects: stats.connects, ct: video.currentTime, rs: video.readyState, elBuf: video.buffered.length, paused: video.paused, end: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0, start: video.buffered.length > 0 ? video.buffered.start(0) : 0, ms: mediaSource ? mediaSource.readyState : 'null', q: queue.length, err: stats.appendErr, buf: stats.buf || null, ev: stats.events || null, avc: { on: useAvc ? 1 : 0, dead: avcDead ? 1 : 0, c: stats.connects, cfg: avcStats.cfg, samples: avcStats.samples, decoded: avcStats.decoded, dropped: avcStats.dropped, qmax: avcStats.queueMax, err: avcStats.err } } }),
       }).catch(function () { /* 上报失败不影响播放 */ })
     } catch (error) { /* 同上 */ }
   }, 3000)
