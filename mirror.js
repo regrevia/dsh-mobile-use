@@ -1202,6 +1202,7 @@ export function setupMirror(ctx, tools) {
   /* 低延迟通道：一台设备一条 scrcpy 连接，懒启动，失败就永久退回 adb。
      host 不能因为它崩：起停全在 guard 里，启动 Promise 失败也只记一个 failed。 */
   const channels = new Map()
+const avcEndLog = []
   /* WebCodecs 直连的观众：它们同样占着编码器，回收扫描要把它们算成「有人在看」。 */
   const avcClients = new Set()
   let channelSeq = 0
@@ -2302,7 +2303,7 @@ export function setupMirror(ctx, tools) {
           head.writeUInt32BE(payload.length + 9, 0)
           head.writeUInt8(type, 4)
           head.writeDoubleBE(Number(ptsMs) || 0, 5)
-          try { res.write(head); res.write(payload) } catch { cleanup() }
+          try { res.write(head); res.write(payload) } catch { cleanup('write-throw') }
         }
         const onPacket = (packet) => {
           if (closed) return
@@ -2312,9 +2313,11 @@ export function setupMirror(ctx, tools) {
           const type = packet?.config === true ? 0 : (packet?.keyFrame === true ? 2 : 1)
           writeAvc(type, Date.now(), data)
         }
-        function cleanup() {
+        function cleanup(why) {
           if (closed) return
           closed = true
+          try { avcEndLog.push({ at: Date.now(), why: String(why || ''), len: res.writableLength }) } catch { /* 忽略 */ }
+          if (avcEndLog.length > 20) avcEndLog.shift()
           avcClients.delete(res)
           liveSubscribers = Math.max(0, liveSubscribers - 1)
           try { channel.off?.('video-packet', onPacket) } catch { /* 已断 */ }
@@ -2336,8 +2339,9 @@ export function setupMirror(ctx, tools) {
         channel.on('video-packet', onPacket)
         /* 让设备马上编一个关键帧：新解码器配置完必须有 IDR，靠等自然 GOP 可能要好几秒。 */
         try { channel.requestKeyFrame?.() } catch { /* 控制通道没开就等自然关键帧 */ }
-        req.on('close', cleanup)
-        res.on('error', cleanup)
+        req.on('close', () => cleanup('req-close'))
+        res.on('close', () => cleanup('res-close'))
+        res.on('error', (error) => cleanup('res-error:' + String(error?.message ?? error).slice(0, 60)))
         return
       }
 
@@ -2516,6 +2520,7 @@ export function setupMirror(ctx, tools) {
           pages: events.size,
           want: wantSession,
           channels: channels.size,
+          avcEnds: avcEndLog.slice(-8),
           clients: [...clients.values()].map(({ pid, at, mounted, title, beat, lag_ms }) => ({ pid, at, mounted, title, beat, lag_ms })),
           diag,
         })
