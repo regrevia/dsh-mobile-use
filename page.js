@@ -908,6 +908,7 @@ export const PLAYER_HTML = `<!doctype html>
   /* ---- 声音：默认关，按序列号记住；开一次只多一条音频通道，画面参数不变 ---- */
   var AUDIO_KEY = 'adb-audio'
   var audio = null
+  var audioWanted = false
   var audioTried = false
 
   function audioStored() {
@@ -921,10 +922,11 @@ export const PLAYER_HTML = `<!doctype html>
   }
 
   function audioPaint() {
-    var on = audio !== null
+    var on = audio !== null || audioWanted
     soundBtn.setAttribute('aria-pressed', on ? 'true' : 'false')
     soundBtn.textContent = on ? '静音' : '声音'
-    if (on) soundBtn.title = '关掉声音并释放音频通道'
+    if (audio !== null) soundBtn.title = '关掉声音并释放音频通道'
+    else if (audioWanted) soundBtn.title = '点一下开始播放'
     else if (audioTried) soundBtn.title = '这台设备现在给不了声音'
     else soundBtn.title = '听设备的声音'
     soundBtn.disabled = !on && audioTried
@@ -941,8 +943,10 @@ export const PLAYER_HTML = `<!doctype html>
 
   function audioFail() {
     audioTried = true
-    stopAudio()
+    audioWanted = false
     audioRemember(false)
+    stopAudio()
+    audioPaint()
     /* 通道参数要重起才生效：让画面自己重连，别让用户看到「点了没反应」。 */
     say('这台设备现在给不了声音')
   }
@@ -1015,17 +1019,29 @@ export const PLAYER_HTML = `<!doctype html>
   }
 
   soundBtn.addEventListener('click', function () {
-    if (audio !== null) {
+    if (audioWanted) {
+      var wasPlaying = audio !== null
+      audioWanted = false
       audioRemember(false)
+      audioPaint()
       stopAudio()
       post('/audio', { serial: serial, on: false }).catch(function () { /* 关不掉也就是多一条通道 */ })
-      say('已静音')
+      if (wasPlaying) say('已静音')
       return
     }
+    audioWanted = true
     audioRemember(true)
+    audioTried = false
     startAudio()
     say('接声音中')
   })
+
+  /* 记住过的设备：刷新后先把偏好告诉宿主（通道按需带上音频），真正出声要等这一下手势。 */
+  if (audioStored()) {
+    audioWanted = true
+    audioPaint()
+    post('/audio', { serial: serial, on: true }).catch(function () { audioWanted = false; audioPaint() })
+  }
 
   function tellClosed() {
     /* 关页/关窗要立刻收工：不等 2.5 秒宽限，也别等心跳超时。beacon 在页面卸载后仍会发出。 */
