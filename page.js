@@ -382,6 +382,7 @@ export const PLAYER_HTML = `<!doctype html>
   var avcCodec = ''
   var avcQueue = []
   var avcCfgBytes = null
+  var avcCfgBuf = null
   var avcPumping = false
   var avcStats = { cfg: 0, samples: 0, decoded: 0, dropped: 0, err: '', queueMax: 0, lat: [] }
   /* 解码器 configure 之后必须先吃一个关键帧，之前来的 delta 直接丢，不然每段开头都报错。 */
@@ -513,6 +514,17 @@ export const PLAYER_HTML = `<!doctype html>
 
   function avcOnMessage(type, pts, data) {
     if (type === 0) {
+      /* 参数集可能分几包来（SPS、PPS 各一片）：攒到能读出 codec 再 configure，
+         否则只有 SPS 那包会被拒，整条直通白白退回复用转码。 */
+      if (avcCfgBuf !== null) {
+        var merged = new Uint8Array(avcCfgBuf.length + data.length)
+        merged.set(avcCfgBuf, 0)
+        merged.set(data, avcCfgBuf.length)
+        avcCfgBuf = merged.length > 65536 ? data : merged
+      } else avcCfgBuf = data
+      if (avcCodecOf(avcCfgBuf) === '') return
+      data = avcCfgBuf
+      avcCfgBuf = null
       if (avcDecoder !== null && avcCfgBytes !== null && sameBytes(avcCfgBytes, data)) return
       avcConfigure(data)
       return

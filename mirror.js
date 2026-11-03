@@ -22,7 +22,7 @@ import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=220'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
-import { PLAYER_HTML } from './page.js?v=43'
+import { PLAYER_HTML } from './page.js?v=44'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -272,6 +272,17 @@ function splitNals(buf) {
     if (to > from) units.push(buf.subarray(from, to))
   }
   return units
+}
+
+/* 拆出来的 NAL 单元不带起始码；重新组装成 Annex-B 时必须补回去，
+   否则解码端扫不到起始码，整包会被当成「没有参数集」。 */
+function annexB(units) {
+  const parts = []
+  for (const unit of units) {
+    if (!Buffer.isBuffer(unit) || unit.length === 0) continue
+    parts.push(Buffer.from([0, 0, 0, 1]), unit)
+  }
+  return Buffer.concat(parts)
 }
 
 function pngToJpeg(png) {
@@ -2317,8 +2328,8 @@ export function setupMirror(ctx, tools) {
             const units = splitNals(prelude)
             const cfg = units.filter((unit) => unit.length > 0 && [6, 7, 8].includes(unit[0] & 0x1f)).slice(0, 3)
             const idr = units.filter((unit) => unit.length > 0 && (unit[0] & 0x1f) === 5)
-            if (cfg.length > 0) writeAvc(0, Date.now(), Buffer.concat(cfg))
-            if (idr.length > 0) writeAvc(2, Date.now(), Buffer.concat(idr))
+            if (cfg.length > 0) writeAvc(0, Date.now(), annexB(cfg))
+            if (idr.length > 0) writeAvc(2, Date.now(), annexB(idr))
             if (cfg.length === 0 && idr.length === 0) writeAvc(0, Date.now(), prelude)
           }
         } catch { /* 没有热身数据就等下一包 */ }
