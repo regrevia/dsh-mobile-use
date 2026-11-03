@@ -2778,6 +2778,19 @@ const avcEndLog = []
       if (busy || avcClients.size > 0 || (mirrors.get(serial)?.watchers?.size ?? 0) > 0) continue
       closeChannel(serial, 'idle')
     }
+    /* 兜底回收：最后一位观众是裸流直连时，stream 的空闲计时器不会被排上，
+       于是没人看之后 screenrecord + ffmpeg 一直留着（实测关页十分钟还在）。每 30 秒对一次账。 */
+    for (const [serial, stream] of [...streams]) {
+      if (stream === undefined || stream === null || typeof stream.stop !== 'function') continue
+      if (stream.stopping === true) continue
+      if ((stream.clients?.size ?? 0) > 0 || (stream.waiting?.size ?? 0) > 0) continue
+      if (avcClients.size > 0) continue
+      if (mirrors.get(serial)?.anyoneWatching?.() === true) continue
+      if (typeof stream.visionWanted === 'function' && stream.visionWanted()) continue
+      const last = Math.max(Number(stream.lastViewerAt) || 0, Number(stream.jpegWantedAt) || 0)
+      if (last !== 0 && now - last < 5000) continue
+      stream.stop()
+    }
   }, 30000)
   channelSweep.unref?.()
 
