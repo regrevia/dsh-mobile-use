@@ -22,7 +22,7 @@ import { homedir } from 'node:os'
 
 import { LiveStream, packFrame } from './stream.js?v=220'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=15'
-import { PLAYER_HTML } from './page.js?v=46'
+import { PLAYER_HTML } from './page.js?v=47'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-mobile-use'
@@ -2336,9 +2336,18 @@ const avcEndLog = []
             if (cfg.length === 0 && idr.length === 0) writeAvc(0, Date.now(), prelude)
           }
         } catch { /* 没有热身数据就等下一包 */ }
-        channel.on('video-packet', onPacket)
-        /* 让设备马上编一个关键帧：新解码器配置完必须有 IDR，靠等自然 GOP 可能要好几秒。 */
-        try { channel.requestKeyFrame?.() } catch { /* 控制通道没开就等自然关键帧 */ }
+        let firstPacketAt = 0
+        const seedKeyFrame = () => {
+          if (closed) return
+          try { channel.requestKeyFrame?.() } catch { /* 控制通道没开就再试 */ }
+        }
+        channel.on('video-packet', (packet) => { if (!firstPacketAt) firstPacketAt = Date.now(); onPacket(packet) })
+        /* 让设备马上编一个关键帧：新解码器配置完必须有 IDR，靠等自然 GOP 可能要好几秒。
+           静态画面下没有新帧可发，第一次请求可能撞上控制通道还没开，补几次。 */
+        seedKeyFrame()
+        const seedTimers = [400, 1200, 2500].map((ms) => setTimeout(() => { if (!firstPacketAt) seedKeyFrame() }, ms))
+        const clearSeeds = () => { for (const timer of seedTimers) clearTimeout(timer) }
+        res.on('close', clearSeeds)
         req.on('close', () => cleanup('req-close'))
         res.on('close', () => cleanup('res-close'))
         res.on('error', (error) => cleanup('res-error:' + String(error?.message ?? error).slice(0, 60)))

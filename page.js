@@ -616,11 +616,11 @@ export const PLAYER_HTML = `<!doctype html>
     setTimeout(function () {
       if (avcDead || liveStopped) return
       if (avcStats.cfg === 0) avcFallback('no-config')
-    }, 5000)
+    }, 12000)
     setTimeout(function () {
       if (avcDead || liveStopped) return
       if (avcStats.decoded === 0) avcFallback('no-output')
-    }, 8000)
+    }, 15000)
   } else {
     pumpStream()
   }
