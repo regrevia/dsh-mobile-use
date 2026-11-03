@@ -582,6 +582,7 @@ export const PLAYER_HTML = `<!doctype html>
   var avcAbort = null
   var avcDead = false
   var avcTries = 0
+  var avcFailSince = 0
   function avcFallback(why) {
     if (avcDead) return
     avcDead = true
@@ -598,12 +599,15 @@ export const PLAYER_HTML = `<!doctype html>
     if (liveStopped || avcDead) return
     avcReadStream().then(function () {
       avcTries = 0
+      avcFailSince = 0
       avcStats.ends = (avcStats.ends || 0) + 1
     }).catch(function (error) {
       avcStats.endErr = String((error && error.message) || error).slice(0, 120)
       /* 通道冷启动 / 刚失败过一次会有几秒冷却：连着试几次再判死刑，别一 503 就退回慢路径。 */
       avcTries += 1
-      if (avcPref === 'auto' && avcTries >= 8) avcFallback('no-channel')
+      if (avcFailSince === 0) avcFailSince = Date.now()
+      /* 冷启动/失败冷却之外没有「连上」这个选项：等太久不如先给画面，慢路径至少能看。 */
+      if (avcPref === 'auto' && (avcTries >= 8 || Date.now() - avcFailSince > 10000)) avcFallback('no-channel')
     }).then(function () {
       if (liveStopped || avcDead) return
       setTimeout(avcStart, avcTries === 0 ? 400 : 700)
