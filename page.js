@@ -598,7 +598,9 @@ export const PLAYER_HTML = `<!doctype html>
     if (liveStopped || avcDead) return
     avcReadStream().then(function () {
       avcTries = 0
-    }).catch(function () {
+      avcStats.ends = (avcStats.ends || 0) + 1
+    }).catch(function (error) {
+      avcStats.endErr = String((error && error.message) || error).slice(0, 120)
       /* 通道冷启动 / 刚失败过一次会有几秒冷却：连着试几次再判死刑，别一 503 就退回慢路径。 */
       avcTries += 1
       if (avcPref === 'auto' && avcTries >= 8) avcFallback('no-channel')
@@ -636,7 +638,7 @@ export const PLAYER_HTML = `<!doctype html>
           px = [d[0], d[1], d[2]]
         }
       } catch (error) { /* 跨域画布不可读时忽略 */ }
-      console.log('AVCPROBE ' + JSON.stringify({ mode: !useAvc ? 'mse' : (avcDead ? 'fallback-mse' : 'avc'), vw: video.videoWidth || 0, vh: video.videoHeight || 0, behindS: +(bufEnd - video.currentTime).toFixed(3), px: px, canvas: [canvas.width, canvas.height], codec: avcCodec, c: stats.connects, cfg: avcStats.cfg, samples: avcStats.samples, decoded: avcStats.decoded, dropped: avcStats.dropped, queueMax: avcStats.queueMax, err: avcStats.err, n: lat.length, p50: at(0.5), p90: at(0.9), max: lat.length ? lat[lat.length - 1] : null }))
+      console.log('AVCPROBE ' + JSON.stringify({ mode: !useAvc ? 'mse' : (avcDead ? 'fallback-mse' : 'avc'), vw: video.videoWidth || 0, vh: video.videoHeight || 0, behindS: +(bufEnd - video.currentTime).toFixed(3), px: px, canvas: [canvas.width, canvas.height], codec: avcCodec, c: stats.connects, ends: avcStats.ends || 0, endErr: avcStats.endErr || '', cfg: avcStats.cfg, samples: avcStats.samples, decoded: avcStats.decoded, dropped: avcStats.dropped, queueMax: avcStats.queueMax, err: avcStats.err, n: lat.length, p50: at(0.5), p90: at(0.9), max: lat.length ? lat[lat.length - 1] : null }))
     }, 2000)
   }
 
