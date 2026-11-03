@@ -636,7 +636,7 @@ export const PLAYER_HTML = `<!doctype html>
           px = [d[0], d[1], d[2]]
         }
       } catch (error) { /* 跨域画布不可读时忽略 */ }
-      console.log('AVCPROBE ' + JSON.stringify({ mode: !useAvc ? 'mse' : (avcDead ? 'fallback-mse' : 'avc'), vw: video.videoWidth || 0, vh: video.videoHeight || 0, behindS: +(bufEnd - video.currentTime).toFixed(3), px: px, canvas: [canvas.width, canvas.height], codec: avcCodec, cfg: avcStats.cfg, samples: avcStats.samples, decoded: avcStats.decoded, dropped: avcStats.dropped, queueMax: avcStats.queueMax, err: avcStats.err, n: lat.length, p50: at(0.5), p90: at(0.9), max: lat.length ? lat[lat.length - 1] : null }))
+      console.log('AVCPROBE ' + JSON.stringify({ mode: !useAvc ? 'mse' : (avcDead ? 'fallback-mse' : 'avc'), vw: video.videoWidth || 0, vh: video.videoHeight || 0, behindS: +(bufEnd - video.currentTime).toFixed(3), px: px, canvas: [canvas.width, canvas.height], codec: avcCodec, c: stats.connects, cfg: avcStats.cfg, samples: avcStats.samples, decoded: avcStats.decoded, dropped: avcStats.dropped, queueMax: avcStats.queueMax, err: avcStats.err, n: lat.length, p50: at(0.5), p90: at(0.9), max: lat.length ? lat[lat.length - 1] : null }))
     }, 2000)
   }
 
