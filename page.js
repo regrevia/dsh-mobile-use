@@ -21,7 +21,8 @@ export const PLAYER_HTML = `<!doctype html>
   body { display: flex; flex-direction: column; }
   #stage { position: relative; flex: 1 1 auto; min-height: 0; display: flex;
     align-items: center; justify-content: center; overflow: hidden; }
-  #video { max-width: 100%; max-height: 100%; display: block; background: #000; }
+  #video { width: 100%; height: 100%; max-width: 100%; max-height: 100%; object-fit: contain;
+    display: block; background: #000; }
   #canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair;
     touch-action: none; display: none; }
   #canvas.on { display: block; }

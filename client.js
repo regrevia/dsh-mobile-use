@@ -107,7 +107,7 @@ if (window.__ADBM_LOADED__ !== true) {
   '.adbm-btn[data-primary="1"]:hover:not([disabled]){background:var(--dsw-alias-button-primary-hover);border-color:transparent}',
       '.adbm-said{flex:1 1 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}',
       '.adbm-stage{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}',
-      '.adbm-frame{position:relative;flex:none;display:block;line-height:0;transform-origin:0 0}',
+      '.adbm-frame{position:relative;flex:none;display:block;line-height:0;transform-origin:0 0;overflow:hidden;max-width:100%;max-height:100%}',
       '.adbm-keys{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-top:4px}',
       '.adbm-key{font:inherit;font-size:12px;padding:2px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:inherit;cursor:pointer}',
       '.adbm-key:disabled{opacity:.4;cursor:default}',
@@ -115,8 +115,8 @@ if (window.__ADBM_LOADED__ !== true) {
       '.adbm-log{flex:none;font-size:12px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.adbm-mark{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:999px;border:2px solid var(--dsw-alias-state-success-primary);pointer-events:none;animation:adbm-ping .9s ease-out forwards}',
       '@keyframes adbm-ping{from{transform:scale(.5);opacity:1}to{transform:scale(2.4);opacity:0}}',
-      '.adbm-img{display:block;width:100%;height:100%;object-fit:contain;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
-      '.adbm-video{display:block;width:100%;height:100%;background:#000;border-radius:6px;object-fit:contain}',
+      '.adbm-img{display:block;position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
+      '.adbm-video{display:block;position:absolute;inset:0;width:100%;height:100%;background:#000;border-radius:6px;object-fit:contain}',
       '.adbm-ink{position:absolute;inset:0;touch-action:none}',
       '.adbm-live{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}',
       '.adbm-ink[data-mode="mark"]{cursor:crosshair}',
@@ -505,7 +505,10 @@ if (window.__ADBM_LOADED__ !== true) {
           const knows = screen.w > 0 && screen.h > 0
           const aw = knows ? screen.w : 9
           const ah = knows ? screen.h : 16
-          if (rect.width < 2 || rect.height < 2 || aw < 2 || ah < 2) return
+          if (rect.width < 2 || rect.height < 2 || aw < 2 || ah < 2) {
+            if (boxAt.current.w !== 0) { boxAt.current = { w: 0, h: 0 }; setBox({ w: 0, h: 0 }); paint() }
+            return
+          }
           const k = Math.min(rect.width / aw, rect.height / ah)
           const next = { w: Math.max(2, Math.round(aw * k)), h: Math.max(2, Math.round(ah * k)) }
           if (boxAt.current.w === next.w && boxAt.current.h === next.h) return
@@ -615,7 +618,11 @@ if (window.__ADBM_LOADED__ !== true) {
         let painted = false
         /* 2.5 s 还没出画面就退回抓帧，别让人对着黑屏等。 */
         const watchdog = window.setTimeout(() => {
-          if (alive && !painted) setEngine('jpeg')
+          /* 超时没画面：先把这条 MSE 连接停掉，再切抓帧，别让两条路同时拉流。 */
+          if (!alive || painted) return
+          alive = false
+          stop()
+          setEngine('jpeg')
         }, 2500)
         const stop = startLiveVideo({
           serial,
@@ -634,7 +641,8 @@ if (window.__ADBM_LOADED__ !== true) {
           onStall: (reason) => {
             if (!alive) return
             if (reason === '') { if (!ready) return; setStatus('') };
-            if (reason === 'no-init') setStatus('画面没有响应，正在重新连接')
+            /* 解码起点一直没来：别在这一栏反复重连，停掉这条连接改抓帧把画面接上。 */
+            if (reason === 'no-init') { alive = false; stop(); setEngine('jpeg') }
           },
           onFail: () => {
             fails += 1
@@ -1248,6 +1256,11 @@ if (window.__ADBM_LOADED__ !== true) {
               if (box.w > 0) {
                 frameStyle.width = `${box.w}px`
                 frameStyle.height = `${box.h}px`
+              } else {
+                /* 还没算出比例（窄栏、首帧未到）：先铺满这一栏交给 object-fit 留边，
+                   绝不能按图片原始像素铺开再被裁掉。 */
+                frameStyle.width = '100%'
+                frameStyle.height = '100%'
               }
               if (zoom !== 1) frameStyle.transform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`
               return frameStyle

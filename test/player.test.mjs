@@ -4,6 +4,7 @@
  * 这类错误只能靠编译一次内联脚本来拦。
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { PLAYER_HTML } from '../page.js'
 
 let pass = 0
@@ -51,6 +52,14 @@ await it('avc 参数解析认 0/1/缺省', () => {
   assert.equal(pick('?serial=x'), 'auto', '不写 avc 时应为 auto')
   assert.equal(pick('?serial=x&avc=0'), 'off', 'avc=0 应关掉裸流')
   assert.equal(pick('?serial=x&avc=1'), 'on', 'avc=1 应强制裸流')
+})
+
+await it('画面按容器缩放，不按原始像素铺开', () => {
+  const videoRule = (PLAYER_HTML.match(/#video\s*\{[^}]*\}/) ?? [''])[0]
+  assert.ok(videoRule.includes('object-fit: contain'), '#video 缺少 object-fit: contain，窄栏会裁掉画面')
+  const client = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  assert.ok(/\.adbm-frame\{[^}]*max-width:100%/.test(client), '侧栏画框缺少 max-width 钳制')
+  assert.ok(/\.adbm-img\{[^}]*position:absolute[^}]*object-fit:contain/.test(client), '侧栏图片缺少铺满+留边')
 })
 
 if (failures.length > 0) {
