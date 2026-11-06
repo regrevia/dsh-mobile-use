@@ -217,5 +217,22 @@ await it('工具 schema 只用宿主支持的 JSON Schema 子集', () => {
   expect(problems.length === 0, problems.slice(0, 8).join('\n'))
 })
 
+await it('enum 值都是字符串（Gemini / Vertex 只接受 string enum）', () => {
+  const bad = []
+  const walk = (node, path) => {
+    if (node === null || typeof node !== 'object') return
+    if (Array.isArray(node.enum)) {
+      for (const value of node.enum) {
+        if (typeof value !== 'string') bad.push(`${path}.enum 含非字符串值 ${JSON.stringify(value)}`)
+      }
+    }
+    for (const [key, child] of Object.entries(node)) walk(child, `${path}.${key}`)
+  }
+  for (const def of tools) {
+    for (const [where, schema] of schemasOf(def)) walk(schema, `${def.name}.${where}`)
+  }
+  expect(bad.length === 0, bad.slice(0, 8).join('\n'))
+})
+
 console.log(`\n${pass} 项通过\n`)
 process.exit(failures.length === 0 ? 0 : 1)
