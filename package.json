@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-use",
-  "version": "1.4.35",
+  "version": "1.4.36",
   "private": false,
   "description": "把真手机装进 DSH 右栏：实时镜像可以直接点、圈一处标注回传会话，模型不截图也能读界面文本树。只走本机回环，不上传画面。",
   "type": "module",
@@ -42,6 +42,7 @@
     "icon.svg",
     "vendor",
     "README.md",
+    "doctor.mjs",
     "selftest.mjs",
     "ocr.js",
     "look.js",
@@ -71,6 +72,10 @@
     "debugging"
   ],
   "scripts": {
-    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs && node test/selector.test.mjs && node test/tools.test.mjs && node test/params.test.mjs && node test/shellchannel.test.mjs && node test/pack.test.mjs && node test/player.test.mjs"
+    "test": "node test/coords.test.mjs && node test/symbols.test.mjs && node test/timers.test.mjs && node test/classifier.test.mjs && node test/lifecycle.test.mjs && node test/scrcpy.test.mjs && node test/selector.test.mjs && node test/tools.test.mjs && node test/params.test.mjs && node test/shellchannel.test.mjs && node test/pack.test.mjs && node test/player.test.mjs && node test/doctor.test.mjs",
+    "doctor": "node doctor.mjs"
+  },
+  "bin": {
+    "dsh-mobile-use-doctor": "./doctor.mjs"
   }
 }

@@ -140,6 +140,23 @@ git clone https://github.com/regrevia/dsh-mobile-use.git dsh-mobile-use
 
 卸载：`plugin_manager action=set_plugin, target=adb, enabled=false`，或移除 bundle。
 
+### 工具不出现（`unknown tool "adb_sh"`）
+
+装完看不到 `adb_*` 工具时先跑自检，它会点名是哪一步没生效：
+
+```bash
+npx dsh-mobile-use-doctor            # 默认查当前 profile
+node doctor.mjs --profile ~/.dsh/profiles/desktop --json
+```
+
+自检覆盖三种静默失败——它们都不会在启动日志里留痕迹：
+
+- 包只写进了 profile 的 `dependencies`，没进 `dsh.profile.bundles`：本包的 `cordis.patch.yml` 不会被应用，profile patch 里写 `- id: adb` 也落在一个不存在的行上，Loader 安静跳过；
+- `node_modules/dsh-mobile-use` 是 `link:` 且源码目录移动/改名，入口解析不到；
+- 改了 `package.json` 只重开会话没重启宿主。
+
+配置正常时自检给出 `结论：配置没问题`，并提示重启宿主；1.4.36 起加载成功会在启动日志里留一行 `[dsh-mobile-use] 已加载`，工具再消失就能直接分清「没加载」还是「加载了没注册」。
+
 ## 自测
 
 ```bash
@@ -165,6 +182,12 @@ node selftest.mjs --serial emulator-5554
 **右栏归属**：右栏是全局唯一可见栏，插件只在「右栏正挂着你发起的那个会话」时才占它；屏幕上是别的会话时改用定向接口只往发起会话自己的布局里建页签，不展开、不切页签、不碰别人正在看的那一栏。
 
 ### 更新日志
+
+### 1.4.36（工具不出现时能自己查出来）
+
+- 新增 `doctor.mjs`（`npm run doctor` / `npx dsh-mobile-use-doctor`）：逐项检查 profile 依赖、`dsh.profile.bundles`、`node_modules` 入口、包内 bundle patch、宿主加载锁（`/tmp/dsh-mobile-use-host.lock` 的 pid 是否还活着）、adb 与在线设备，失败的项直接给修复命令。issue #1 那种「依赖在、bundles 里没有，patch 落空」会被点名。
+- `apply()` 遇到没有 `tools` 注册表时不再把异常抛给 Loader（过去会被吞掉、启动日志全空），改为写一行可搜到原因后返回；加载成功也会留一行 `[dsh-mobile-use] 已加载`。
+- 新增 `test/doctor.test.mjs`：11 项判据，覆盖未安装 / 未进 bundles / 断链 / 配置齐全四种 profile。
 
 ### 1.4.35（Gemini 下工具不再被整包拒绝）
 

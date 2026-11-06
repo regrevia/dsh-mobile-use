@@ -23,7 +23,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=259'
+import { setupMirror, frameSize as jpegSize, fastInput } from './mirror.js?v=260'
 
 /** 工具层内部自检用：镜像实例在 apply 之后才有。 */
 let mirrorRef = null
@@ -4361,6 +4361,14 @@ async function reclaimDeviceLeftovers() {
 export function apply(ctx, config) {
   const serial = async () => resolveSerial(config)
 
+  /* 没有 tools 注册表时整个插件等于没装：过去是让 ctx.tools.register 抛出去，
+     Loader 把异常吞掉，启动日志里一个字都没有，排查只能靠猜。这里改成留一行
+     能搜到的原因再退出，至少 plugin 侧看起来是「明确说缺什么」。 */
+  if (typeof ctx?.tools?.register !== 'function') {
+    ctx?.logger?.error?.('[dsh-mobile-use] 没有 tools 注册表，adb_* 工具不会注册：检查 inject: [\'tools\'] 是否被满足、DSH 版本是否过老')
+    return
+  }
+
   loadActions()
   /* 每 2 秒对比一次尾部，有变化才落盘：所有记动作的地方都不用改，也不会写爆磁盘。 */
   let savedAt = lastActions.length > 0 ? lastActions[lastActions.length - 1].at : 0
@@ -4411,6 +4419,8 @@ export function apply(ctx, config) {
     typeText: typeViaClipboard,
   })
   mirrorRef = mirror
+  /* 启动日志里留一行：工具不出现时，先看这行在不在，就能分清「没加载」还是「加载了但没注册」。 */
+  ctx.logger?.info?.('[dsh-mobile-use] 已加载：adb_* 工具与侧栏镜像就绪')
   ctx.effect(() => () => {
     clearInterval(actionSaver)
     clearInterval(staleSweep)
