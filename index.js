@@ -7082,7 +7082,8 @@ ctx.effect(() => ctx.tools.register({
           enum: ['home', 'back', 'recents', 'lock', 'wake', 'rotate', 'notifications', 'quick_settings', 'night_mode'],
           description: '要执行的系统动作',
         },
-        degrees: { type: 'integer', enum: [0, 90, 180, 270], description: 'rotate 用：指定方向；不写就转到下一个方向' },
+        // Gemini/Vertex 的函数 schema 只接受字符串枚举；数值方向用字符串给，执行时转回数字
+        degrees: { type: 'string', enum: ['0', '90', '180', '270'], description: 'rotate 用：指定方向（0/90/180/270）；不写就转到下一个方向' },
         enable: { type: 'boolean', description: 'night_mode 用：true 开夜间模式，false 关' },
         wait_for_text: { type: 'string', description: '动作之后等这段文字出现再返回（比如按返回后确认回到了列表页）' },
         wait_until_gone: { type: 'string', description: '动作之后等这段文字消失再返回（比如关掉弹窗确认它真没了）' },
@@ -7125,7 +7126,9 @@ ctx.effect(() => ctx.tools.register({
         const current = await sh(device, 'settings get system user_rotation', 8000)
         const now = Number(String(current.out ?? '').trim())
         const order = [0, 90, 180, 270]
-        const degrees = args.degrees ?? order[(order.indexOf(Number.isFinite(now) ? now * 90 : 0) + 1) % 4]
+        const degrees = args.degrees === undefined || args.degrees === null
+          ? order[(order.indexOf(Number.isFinite(now) ? now * 90 : 0) + 1) % 4]
+          : Number(args.degrees)
         const value = order.indexOf(degrees)
         cmd = `settings put system accelerometer_rotation 0; settings put system user_rotation ${value < 0 ? 0 : value}`
         label = `转到 ${degrees}°`
