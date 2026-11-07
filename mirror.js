@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=221'
+import { LiveStream, packFrame } from './stream.js?v=222'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=17'
 import { PLAYER_HTML } from './page.js?v=54'
 
@@ -2500,10 +2500,11 @@ const avcEndLog = []
         const mirror = mirrorFor(serial)
         void mirror.start()
         const segments = await mirror.segments()
+        const streamInfo = (streams.get(serial) ?? null)?.info() ?? null
         return json({
           serial,
           build: CLIENT_BUILD,
-          stream: (streams.get(serial) ?? null)?.info() ?? null,
+          stream: streamInfo,
           /* 低延迟通道状态：ready 就代表注入走 socket 写，不再吃 adb 往返。 */
           fastInput: (() => {
             const entry = channels.get(serial)
@@ -2515,7 +2516,9 @@ const avcEndLog = []
           started: mirror.startedAt,
           frames: mirror.frames,
           fps: mirror.measuredFps(),
-          live: mirror.latest !== null,
+          /* 「在动」= 有最新帧，且推流那条支路没有明确死掉。JPEG 桥接 EPIPE/退出后
+             alive=false，这里就不再报 live:true（旧帧还在 mirror 里，但画面已经不动了）。 */
+          live: mirror.latest !== null && streamInfo?.alive !== false,
           watchers: mirror.watchers.size,
           /* 录制是后台行为：状态里如实报，别让人以为没人看时也在录。 */
           recording: mirror.recording,

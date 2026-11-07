@@ -612,6 +612,8 @@ export class LiveStream {
         if (start > 0) this.jpegPending = this.jpegPending.subarray(start)
         return
       }
+      /* 真收到帧就说明这条支路又活了：把上一代的 JPEG 故障记录清掉，别让 /state 一直挂着旧错。 */
+      if (String(this.error).startsWith('JPEG')) this.error = ''
       const frame = this.jpegPending.subarray(start, end + 2)
       this.jpegPending = this.jpegPending.subarray(end + 2)
       this.jpeg = Buffer.from(frame)
@@ -1948,7 +1950,22 @@ export class LiveStream {
 
   /** 给 /state 用的快照。 @returns {any} 状态。 */
   info() {
+    /* 观众看到的那块画面有没有真的在动，只能按 JPEG 这条支路判：管道断了 / 解码器退了之后
+       jpegChild 是 null，但旧帧、旧 error 还留在对象上，/state 光看 mirror.latest 会一直报
+       live:true（实测：live:true、jpegLive:false、err:"JPEG 管道断开：write EPIPE"，宿主上没有
+       任何 ffmpeg/scrcpy）。这里给出三态，让上层能分开「没开」「在动」「死了」。 */
+    const jpegChild = this.jpegChild
+    const jpegAge = this.jpegAt > 0 ? Date.now() - this.jpegAt : 0
+    const jpegBootAge = this.jpegStartedAt > 0 ? Date.now() - this.jpegStartedAt : 0
+    const jpegState = jpegChild === null
+      ? (String(this.error).startsWith('JPEG') ? 'dead' : 'off')
+      : (this.jpegAt > 0 && jpegAge < JPEG_STALL_MS
+        ? 'live'
+        : (jpegBootAge < JPEG_INIT_STALL_MS ? 'starting' : 'stalled'))
     return {
+      /* 死掉的流不许报活：dead/off 一律 false，只有真在出帧或正在起的时候才算活。 */
+      alive: jpegState === 'live' || jpegState === 'starting',
+      jpegState,
       serial: this.serial,
       clients: this.clients.size,
       codec: this.config?.codec ?? '',

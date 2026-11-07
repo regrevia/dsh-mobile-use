@@ -183,6 +183,12 @@ node selftest.mjs --serial emulator-5554
 
 ### 更新日志
 
+### 1.4.37（死掉的镜像不再假装在动）
+
+- `/state` 增 `alive` 与 `jpegState`（`off` / `starting` / `live` / `stalled` / `dead`）：JPEG 桥接 EPIPE 或退出后 `jpegChild` 是 null、旧帧和旧错误还留着，以前 `/state` 一直报 `live:true` + `err:"JPEG 管道断开"`，宿主机上却没有任何 ffmpeg/scrcpy，排查时分不清「在动」和「早就死了」。现在死流一律 `alive:false`，`live` 也跟着变 false。
+- 自愈：真收到帧就把上一代的 `JPEG ...` 故障记录清掉，不留旧错；设备类故障（`adb: device offline`）不动。
+- `test/liveness.test.mjs`：8 项判据覆盖 dead/off/live/starting/stalled 与错误清理。
+
 ### 1.4.36（工具不出现时能自己查出来）
 
 - 新增 `doctor.mjs`（`npm run doctor` / `npx dsh-mobile-use-doctor`）：逐项检查 profile 依赖、`dsh.profile.bundles`、`node_modules` 入口、包内 bundle patch、宿主加载锁（`/tmp/dsh-mobile-use-host.lock` 的 pid 是否还活着）、adb 与在线设备，失败的项直接给修复命令。issue #1 那种「依赖在、bundles 里没有，patch 落空」会被点名。
