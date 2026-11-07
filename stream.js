@@ -540,11 +540,28 @@ export class LiveStream {
     return killed
   }
 
+  /**
+   * JPEG 解码子进程是不是真的还活着。exit 事件偶尔晚到（进程被 kill -9 时 stdio 已断、
+   * exit 还没派发），只看 `jpegChild !== null` 会把已经死掉的子进程当成在跑。
+   * @returns {boolean} 子进程可用。
+   */
+  jpegChildAlive() {
+    const child = this.jpegChild
+    if (child === null) return false
+    if (child.exitCode != null || child.signalCode != null || child.destroyed === true) return false
+    return true
+  }
+
   /** 有人要看 JPEG 帧时才起解码器：不看不花 CPU。 @returns {boolean} 是否可用（解码器起来后 300 ms 内有帧）。 */
   enableJpeg() {
     this.jpegWantedAt = Date.now()
     /* 只看帧（/frame 轮询）也会起录屏：没人再来取帧就按同一套宽限停掉，否则设备一直在录。
        必须排在这里之后：start() 会清掉空闲定时器（它以为有人回来了）。 */
+    /* 死掉的子进程不能当成「还在跑」：以前这里直接 return true，等于永远不重建，
+       画面死了只能等下一次有人重启整个宿主。收掉它再往下走，重建受下面 2 秒节流约束，
+       所以死得快也只会在 2 秒后重试一次，不会打成死循环。 */
+    const rebuilt = this.jpegChild !== null && !this.jpegChildAlive()
+    if (rebuilt) this.closeJpeg()
     if (this.jpegChild !== null) {
       this.scheduleIdleStop()
       return true
@@ -594,6 +611,9 @@ export class LiveStream {
       if (this.jpegChild === child) this.jpegChild = null
       if (code !== 0 && code !== null && !this.stopping) this.error = 'JPEG 桥接退出码 ' + String(code)
     })
+    /* 重建的解码器是从 GOP 中间接进来的：没有 SPS/PPS 会一直报 non-existing PPS，永远不出帧。
+       重封一次并回放参数集，让新子进程从关键帧起步。 */
+    if (rebuilt) this.guard('jpeg-rekey', () => this.rekey())
     return true
   }
 
@@ -1473,6 +1493,9 @@ export class LiveStream {
     this.jpegChild = null
     this.jpeg = null
     this.jpegAt = 0
+    /* 起来时间要清掉：留着会让 info() 把「上一代刚起 8 秒内」算成 starting。
+       开桥时间（jpegOpenAt）不能清，它是重建节流：清掉后死一帧就重开一次，会打成死循环。 */
+    this.jpegStartedAt = 0
     this.jpegPending = Buffer.alloc(0)
     for (const waiter of [...this.jpegWaiters]) waiter(null)
     this.jpegWaiters.clear()

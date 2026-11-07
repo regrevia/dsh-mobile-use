@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame, frameFresh } from './stream.js?v=224'
+import { LiveStream, packFrame, frameFresh } from './stream.js?v=226'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=17'
 import { PLAYER_HTML } from './page.js?v=54'
 

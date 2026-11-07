@@ -183,6 +183,13 @@ node selftest.mjs --serial emulator-5554
 
 ### 更新日志
 
+### 1.4.38（死掉的 JPEG 桥接会自己重建）
+
+- `enableJpeg()` 以前只看 `jpegChild !== null` 就当作解码器还在跑。子进程被 `kill -9` 时 `exit` 事件偶尔晚到（stdio 已断、exit 还没派发），这一支就永远短路返回 `true`：桥接再也起不来，只能重启整个宿主。
+- 现在先看子进程真的死没死（`exitCode` / `signalCode` / `destroyed`），死了就 `closeJpeg()` 再走重建；重建沿用 2 秒节流，死得快也只是每 2 秒重试一次，不会打成死循环。
+- `closeJpeg()` 清掉 `jpegStartedAt`，避免 `info()` 把上一代刚起 8 秒内算成 `starting`；`jpegOpenAt` 保留作节流。
+- `test/liveness.test.mjs` 增两项：死子进程被摘掉、活子进程不被误杀。
+
 ### 1.4.37（死掉的镜像不再假装在动）
 
 - `/state.live` 改成看**最新一帧的年龄**（2.5s 内），不再「手里有过帧就一直算活」。JPEG 桥接 EPIPE 或退出后旧帧和旧错误还留着，以前 `/state` 一直报 `live:true` + `err:"JPEG 管道断开"`，宿主机上却没有任何 ffmpeg/scrcpy，排查时分不清「在动」和「早就死了」。AVC 直连没有 JPEG 子进程，所以判据不能看子进程在不在，只看帧新不新。

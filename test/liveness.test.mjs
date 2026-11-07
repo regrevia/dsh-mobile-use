@@ -127,5 +127,30 @@ check('AVC 直连时没有 JPEG 子进程，也不会被 live 判死', () => {
   assert(frameLive(Buffer.from([1]), Date.now() - 50) === true, 'AVC 帧在动时必须报 live:true')
 })
 
+check('死掉的 JPEG 子进程会被收掉，不再被当成「还在跑」', () => {
+  const stream = fresh()
+  /* 模拟 exit 事件晚到：子进程已经死了，但 jpegChild 还挂着。 */
+  const dead = { stdin: { end() {} }, kill() {}, exitCode: 1, signalCode: null, destroyed: false }
+  stream.jpegChild = dead
+  stream.jpegStartedAt = Date.now() - 30_000
+  stream.jpegOpenAt = Date.now()
+  assert(stream.jpegChildAlive() === false, 'exitCode 非 null 就该算死')
+  const ok = stream.enableJpeg()
+  assert(ok === false, '两秒节流窗口内先不重开')
+  assert(stream.jpegChild === null, '死掉的子进程必须被摘掉')
+  assert(stream.jpegStartedAt === 0, 'closeJpeg 要清掉起来时间')
+  assert(stream.jpegOpenAt > 0, '开桥时间要留着当重建节流，不能清成 0')
+})
+
+check('还活着的 JPEG 子进程不会被误杀', () => {
+  const stream = fresh()
+  const live = { stdin: { end() {} }, kill() {} }
+  stream.jpegChild = live
+  stream.jpegOpenAt = Date.now()
+  assert(stream.jpegChildAlive() === true, '没退出就该算活')
+  assert(stream.enableJpeg() === true, '活着的子进程直接复用')
+  assert(stream.jpegChild === live, '不能把活的重建掉')
+})
+
 console.log(`\nliveness 自检：${pass} 项通过，${fail} 项失败`)
 if (fail > 0) process.exitCode = 1
