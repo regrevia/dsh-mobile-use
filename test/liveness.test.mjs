@@ -10,7 +10,7 @@
  *   4. 真收到帧会把上一代的 JPEG 故障记录清掉（自愈），不留旧错。
  */
 
-import { LiveStream } from '../stream.js'
+import { LiveStream, frameLive, frameFresh, LIVE_STALE_MS } from '../stream.js'
 
 let pass = 0
 let fail = 0
@@ -106,6 +106,25 @@ check('closeJpeg 之后立刻是 off/dead，不再假装在线', () => {
   const info = stream.info()
   assert(info.jpegLive === false, 'closeJpeg 之后 jpegLive 应为 false')
   assert(info.alive === false, 'closeJpeg 之后不能报 alive=true')
+})
+
+check('/state 的 live 判据：最近一帧够新才算在动', () => {
+  const now = 10_000_000
+  const frame = Buffer.from([1])
+  assert(frameLive(frame, now - 100, now) === true, '刚出的帧要算活')
+  assert(frameLive(frame, now - LIVE_STALE_MS - 1, now) === false, '超过 2.5s 没新帧要算死')
+  assert(frameLive(null, now - 100, now) === false, '没帧不能算活')
+  assert(frameLive(frame, 0, now) === false, '没有时间戳不能算活')
+  assert(frameFresh(now - 100, now) === true, 'JPEG 桥接帧新鲜也算活')
+  assert(frameFresh(now - LIVE_STALE_MS - 1, now) === false, 'JPEG 桥接也按 2.5s 判死')
+  assert(frameFresh(0, now) === false, '从没出过帧不能算活')
+})
+
+check('AVC 直连时没有 JPEG 子进程，也不会被 live 判死', () => {
+  /* AVC 模式下 jpegState 一直是 off，但 mirror 每帧都在更新；live 只看帧的年龄。 */
+  const stream = fresh()
+  assert(stream.info().jpegState === 'off', 'AVC 模式 jpegState 应为 off')
+  assert(frameLive(Buffer.from([1]), Date.now() - 50) === true, 'AVC 帧在动时必须报 live:true')
 })
 
 console.log(`\nliveness 自检：${pass} 项通过，${fail} 项失败`)

@@ -2012,3 +2012,29 @@ export class LiveStream {
     }
   }
 }
+
+/**
+ * 「画面在动」的唯一判据：最近一帧有多新。JPEG 桥接和 AVC 直连都往同一个时间戳上记，
+ * 所以不看某个解码子进程还在不在（AVC 模式下根本没有 JPEG 子进程）。
+ * @param {number} latestAt 最近一帧的时间戳（ms）。
+ * @param {number} [now] 当前时间。
+ * @returns {boolean} 是否在动。
+ */
+export function frameFresh(latestAt, now = Date.now()) {
+  if (!latestAt) return false
+  return now - latestAt < LIVE_STALE_MS
+}
+
+/**
+ * 同上，但要求手里真有帧（mirror.latest 可能是 null）。
+ * @param {Buffer|null} latest 最近一帧。
+ * @param {number} latestAt 最近一帧的时间戳（ms）。
+ * @param {number} [now] 当前时间。
+ * @returns {boolean} 是否在动。
+ */
+export function frameLive(latest, latestAt, now = Date.now()) {
+  return latest !== null && frameFresh(latestAt, now)
+}
+
+/** 超过这么久没有新帧，就算画面停了。 */
+export const LIVE_STALE_MS = 2500

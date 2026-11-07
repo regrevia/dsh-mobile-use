@@ -20,7 +20,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { LiveStream, packFrame } from './stream.js?v=222'
+import { LiveStream, packFrame, frameFresh } from './stream.js?v=224'
 import { KEY_ACTION, ScrcpyChannel, TOUCH_ACTION, deviceToVideoPoint } from './scrcpy.js?v=17'
 import { PLAYER_HTML } from './page.js?v=54'
 
@@ -2516,9 +2516,11 @@ const avcEndLog = []
           started: mirror.startedAt,
           frames: mirror.frames,
           fps: mirror.measuredFps(),
-          /* 「在动」= 有最新帧，且推流那条支路没有明确死掉。JPEG 桥接 EPIPE/退出后
-             alive=false，这里就不再报 live:true（旧帧还在 mirror 里，但画面已经不动了）。 */
-          live: mirror.latest !== null && streamInfo?.alive !== false,
+          /* 「在动」只看最近一帧有多新：JPEG 桥接 EPIPE 之后旧帧还留在 mirror 里，
+             以前一直报 live:true；反过来 AVC 直连时根本没有 JPEG 子进程，也不能因此判死。
+             mirror.latestAt 是 AVC 解码帧的时间，stream.jpegAt 是 JPEG 桥接帧的时间，
+             两条支路取较新的那个。 */
+          live: frameFresh(Math.max(mirror.latestAt, streamInfo?.jpegAt ?? 0)),
           watchers: mirror.watchers.size,
           /* 录制是后台行为：状态里如实报，别让人以为没人看时也在录。 */
           recording: mirror.recording,
@@ -2970,9 +2972,10 @@ const avcEndLog = []
       const mirror = mirrors.get(chosen)
       if (mirror === undefined) return { serial: chosen, live: false, frames: 0, segments: 0 }
       const segments = await mirror.segments()
+      const streamInfo = (streams.get(chosen) ?? null)?.info() ?? null
       return {
         serial: chosen,
-        live: mirror.latest !== null,
+        live: frameFresh(Math.max(mirror.latestAt, streamInfo?.jpegAt ?? 0)),
         recording: mirror.recording,
         frames: mirror.frames,
         fps: mirror.measuredFps(),

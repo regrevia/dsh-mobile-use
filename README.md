@@ -185,9 +185,10 @@ node selftest.mjs --serial emulator-5554
 
 ### 1.4.37（死掉的镜像不再假装在动）
 
-- `/state` 增 `alive` 与 `jpegState`（`off` / `starting` / `live` / `stalled` / `dead`）：JPEG 桥接 EPIPE 或退出后 `jpegChild` 是 null、旧帧和旧错误还留着，以前 `/state` 一直报 `live:true` + `err:"JPEG 管道断开"`，宿主机上却没有任何 ffmpeg/scrcpy，排查时分不清「在动」和「早就死了」。现在死流一律 `alive:false`，`live` 也跟着变 false。
+- `/state.live` 改成看**最新一帧的年龄**（2.5s 内），不再「手里有过帧就一直算活」。JPEG 桥接 EPIPE 或退出后旧帧和旧错误还留着，以前 `/state` 一直报 `live:true` + `err:"JPEG 管道断开"`，宿主机上却没有任何 ffmpeg/scrcpy，排查时分不清「在动」和「早就死了」。AVC 直连没有 JPEG 子进程，所以判据不能看子进程在不在，只看帧新不新。
+- 多两个诊断字段：`alive` 与 `jpegState`（`off` / `starting` / `live` / `stalled` / `dead`）。
 - 自愈：真收到帧就把上一代的 `JPEG ...` 故障记录清掉，不留旧错；设备类故障（`adb: device offline`）不动。
-- `test/liveness.test.mjs`：8 项判据覆盖 dead/off/live/starting/stalled 与错误清理。
+- `test/liveness.test.mjs`：10 项判据覆盖 dead/off/live/starting/stalled、帧年龄判定与错误清理。
 
 ### 1.4.36（工具不出现时能自己查出来）
 
